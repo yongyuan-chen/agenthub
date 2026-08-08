@@ -1,0 +1,9 @@
+node_modules/
+dist/
+vendor/
+deploy/.env
+executor.config.json
+wrangler.generated.jsonc
+.wrangler/
+*.log
+.DS_Store

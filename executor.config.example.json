@@ -1,0 +1,15 @@
+{
+  "cloudUrl": "wss://agenthub.win",
+  "nodeId": "my-server",
+  "nodeToken": "<generated node token, see deploy/setup-node.sh>",
+  "anthropic": {
+    "baseUrl": "https://<your-relay-host>:<port>",
+    "apiKey": "<relay api key>",
+    "model": "gpt-5.6"
+  },
+  "claudeBin": "claude",
+  "maxParallel": 3,
+  "maxTurnsPerRun": 100,
+  "maxCostUsd": 10,
+  "workRoot": "~/agenthub"
+}

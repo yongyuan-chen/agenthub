@@ -1,0 +1,30 @@
+{
+  // AgentHub worker: API + Hub DO + static frontend, one deploy unit.
+  "name": "agenthub",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-06-01",
+  "routes": [
+    { "pattern": "agenthub.win", "custom_domain": true }
+  ],
+  "assets": {
+    "directory": "../web/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "HUB", "class_name": "Hub" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Hub"] }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agenthub",
+      "database_id": "__D1_DATABASE_ID__"
+    }
+  ],
+  "observability": { "enabled": true }
+}

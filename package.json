@@ -1,0 +1,13 @@
+{
+  "name": "agenthub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "自托管 AI 编码 Agent 任务中枢:Cloudflare 看板 + 常驻 executor daemon",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "smoke": "node packages/executor/scripts/smoke.mjs",
+    "build:web": "cd packages/web && node build.mjs",
+    "deploy": "bash deploy/setup-all.sh"
+  }
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=AgentHub executor daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+ExecStart=__NODE__ __ROOT__/packages/executor/src/index.mjs
+Restart=always
+RestartSec=5
+Environment=HOME=/home/__USER__
+
+[Install]
+WantedBy=multi-user.target

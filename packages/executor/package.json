@@ -1,0 +1,13 @@
+{
+  "name": "@agenthub/executor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AgentHub executor daemon: zero-dependency Node >= 22 (uses node:sqlite, global WebSocket, claude CLI)",
+  "bin": { "agenthub-executor": "src/index.mjs" },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "engines": { "node": ">=22.5" }
+}
