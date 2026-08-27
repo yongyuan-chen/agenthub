@@ -9,5 +9,13 @@
     "smoke": "node packages/executor/scripts/smoke.mjs",
     "build:web": "cd packages/web && node build.mjs",
     "deploy": "bash deploy/setup-all.sh"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "4.0.44",
+    "@ai-sdk/react": "4.0.86",
+    "@cloudflare/ai-chat": "0.10.2",
+    "agents": "0.21.0",
+    "ai": "7.0.83",
+    "zod": "4.4.3"
   }
 }

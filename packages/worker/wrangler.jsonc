@@ -3,6 +3,10 @@
   "name": "agenthub",
   "main": "src/index.mjs",
   "compatibility_date": "2026-06-01",
+  // Required by the agents SDK: parts of it (observability, the email helper's
+  // mimetext dependency) import node: built-ins. Additive — it only makes Node
+  // APIs available, it doesn't change existing Hub/D1 behaviour.
+  "compatibility_flags": ["nodejs_compat"],
   "routes": [
     // Primary domain (2026-08-20 迁移). The old agenthub.win stays
     // attached in parallel until the user confirms stability and shuts it
@@ -18,11 +22,16 @@
   },
   "durable_objects": {
     "bindings": [
-      { "name": "HUB", "class_name": "Hub" }
+      { "name": "HUB", "class_name": "Hub" },
+      // One instance per user, named by user id (see index.mjs's /supervisor
+      // route). Holds that user's supervisor chat history, auto-approval
+      // setting and audit log in its own SQLite storage.
+      { "name": "SUPERVISOR", "class_name": "SupervisorAgent" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["Hub"] }
+    { "tag": "v1", "new_sqlite_classes": ["Hub"] },
+    { "tag": "v2", "new_sqlite_classes": ["SupervisorAgent"] }
   ],
   "d1_databases": [
     {

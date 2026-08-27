@@ -498,3 +498,38 @@ a { color: var(--accent); text-decoration: none; }
 }
 .node-repair-guide button { margin-top: 4px; }
 .repair-toggle { font-size: 12px; white-space: nowrap; }
+
+/* ---- supervisor (总控 agent) ---- */
+.supervisor-link {
+  display: block; margin-top: 8px; padding: 8px 10px; border-radius: 10px;
+  background: var(--bg2); color: var(--fg); text-decoration: none; font-size: 14px; text-align: center;
+}
+.supervisor-link:hover { background: var(--border); }
+.sv-page { display: flex; flex-direction: column; height: 100vh; max-width: 980px; margin: 0 auto; }
+.sv-header {
+  display: flex; align-items: center; gap: 14px; padding: 12px 16px;
+  border-bottom: 1px solid var(--border); flex-wrap: wrap;
+}
+.sv-header h1 { font-size: 17px; margin: 0; flex: 1; }
+.sv-header-right { display: flex; align-items: center; gap: 12px; }
+.sv-level { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); white-space: nowrap; }
+.sv-level select { padding: 4px 6px; }
+.sv-banner { padding: 8px 16px; font-size: 13px; border-bottom: 1px solid var(--border); }
+.sv-notices { border-bottom: 1px solid var(--border); padding: 6px 16px; }
+.sv-notices-toggle { background: none; border: none; color: var(--fg); cursor: pointer; padding: 4px 0; font-size: 13px; }
+.sv-notices ul { list-style: none; margin: 0; padding: 0 0 8px; }
+.sv-notice { padding: 6px 0; border-top: 1px solid var(--border); font-size: 13px; }
+.sv-notice > span.muted { font-size: 11px; }
+.sv-notice-needs-you { border-left: 3px solid var(--warn, #d97706); padding-left: 8px; }
+.sv-notice-attention { border-left: 3px solid var(--err, #dc2626); padding-left: 8px; }
+.sv-chat { padding-bottom: 8px; }
+.sv-suggestions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 14px; }
+.sv-tool { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; margin: 8px 0; }
+.sv-tool.pending { border-color: var(--accent); }
+.sv-tool-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.sv-tool-input {
+  margin: 6px 0 0; padding: 6px 8px; background: var(--bg2); border-radius: 8px;
+  font-size: 12px; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+}
+.sv-tool-actions { display: flex; gap: 8px; margin-top: 8px; }
+.sv-composer { margin: 0 16px 16px; }

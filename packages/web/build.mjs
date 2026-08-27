@@ -33,12 +33,22 @@ const outdir = 'dist';
 fs.rmSync(outdir, { recursive: true, force: true });
 fs.mkdirSync(outdir, { recursive: true });
 
+// The agents SDK and its React hooks live in the repo-root node_modules while
+// the app's own React lives here, so npm resolved a second React copy up there
+// as a peer. Two copies means two hook dispatchers, and every SDK hook throws
+// "Cannot read properties of null (reading 'useMemo')" at runtime. Pinning
+// both packages to this one copy is the standard dedupe; esbuild rewrites
+// subpaths (react/jsx-runtime) along with the bare package name.
+const dedupe = ['react', 'react-dom'];
+const alias = Object.fromEntries(dedupe.map(pkg => [pkg, path.resolve('node_modules', pkg)]));
+
 await build({
   entryPoints: ['src/main.jsx'],
   bundle: true,
   minify: true,
   format: 'iife',
   jsx: 'automatic',
+  alias,
   outfile: path.join(outdir, 'app.js'),
   define: { 'process.env.NODE_ENV': '"production"' },
   loader: { '.js': 'jsx' },

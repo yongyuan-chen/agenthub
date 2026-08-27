@@ -114,6 +114,7 @@ export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect,
       <div className="sidebar-top">
         <div className="brand">AgentHub</div>
         <button className="new-chat-btn" onClick={onNewDraft}>+ 新对话</button>
+        <a className="supervisor-link" href="#/supervisor">🧭 总控 agent</a>
       </div>
       <TeamSwitcher onSwitchTeam={onSwitchTeam} onManageMembers={setManageMembersTeam} onCreateProject={() => setShowCreateProject(true)} />
 

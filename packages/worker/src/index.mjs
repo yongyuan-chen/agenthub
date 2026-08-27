@@ -1,6 +1,8 @@
 // Worker entry: auth gate + routing. All /api and /ws traffic funnels into the
 // single Hub Durable Object; everything else is served from static assets.
 export { Hub } from './hub.mjs';
+export { SupervisorAgent } from './supervisor.mjs';
+import { getAgentByName } from 'agents';
 import * as accounts from './accounts.mjs';
 
 async function resolveUser(request, url, env) {
@@ -72,6 +74,18 @@ export default {
       const userId = await resolveUser(request, url, env);
       if (!userId) return new Response('unauthorized', { status: 401 });
       return hub().fetch(withUser(request, userId));
+    }
+
+    // Supervisor agent. Routed by hand rather than with routeAgentRequest so
+    // the Durable Object instance name is ALWAYS the authenticated user id —
+    // the agents SDK's default /agents/:agent/:instance routing would let a
+    // client name any instance it likes, i.e. read someone else's supervisor.
+    // The client connects to this fixed path via useAgent({ basePath }).
+    if (pathname === '/supervisor' || pathname.startsWith('/supervisor/')) {
+      const userId = await resolveUser(request, url, env);
+      if (!userId) return new Response('unauthorized', { status: 401 });
+      const agent = await getAgentByName(env.SUPERVISOR, userId);
+      return agent.fetch(request);
     }
 
     if (pathname.startsWith('/api/')) {

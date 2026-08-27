@@ -5,6 +5,7 @@ import { state, subscribe, getVersion, applyWsMessage, bump, scopeKeyOf, resetUs
 import { AuthScreen } from './login.jsx';
 import { SettingsModal } from './settings.jsx';
 import { AppShell } from './shell.jsx';
+import { SupervisorPage } from './supervisor.jsx';
 
 function useStore() {
   return useSyncExternalStore(subscribe, getVersion);
@@ -189,6 +190,10 @@ function App() {
   };
 
   if (!authed) return <AuthScreen onOk={(u) => { setUser(u); setAuthed(true); }} />;
+
+  // The supervisor spans every project at once, so it deliberately renders
+  // outside AppShell's per-scope board rather than as another pane inside it.
+  if (hash.startsWith('#/supervisor')) return <SupervisorPage />;
 
   const m = hash.match(/^#\/task\/([A-Za-z0-9]+)$/);
   return (
