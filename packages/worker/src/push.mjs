@@ -91,9 +91,9 @@ export async function sendWebPush(subscription, payload, vapid) {
   return res.status;
 }
 
-export async function pushAll(db, payloadObj, vapid) {
-  if (!vapid?.privateJwk) return;
-  const rows = await db.prepare('SELECT id, subscription FROM push_subscriptions').bind().all();
+export async function pushAll(db, payloadObj, vapid, ownerId) {
+  if (!vapid?.privateJwk || !ownerId) return;
+  const rows = await db.prepare('SELECT id, subscription FROM push_subscriptions WHERE owner_user_id = ?').bind(ownerId).all();
   for (const row of rows.results ?? rows) {
     try {
       const sub = JSON.parse(row.subscription);

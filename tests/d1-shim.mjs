@@ -6,6 +6,18 @@ export function makeD1(schemaPath) {
   const db = new DatabaseSync(':memory:');
   db.exec(fs.readFileSync(schemaPath, 'utf8'));
   return {
+    async batch(statements) {
+      db.exec('BEGIN');
+      try {
+        const results = [];
+        for (const statement of statements) results.push(await statement.run());
+        db.exec('COMMIT');
+        return results;
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    },
     prepare(sql) {
       return {
         bind(...params) {

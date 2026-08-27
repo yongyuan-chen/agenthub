@@ -12,32 +12,33 @@
 
 ## 部署(一条命令)
 
-前提:本机装有 Node ≥ 22、git、claude CLI;`deploy/.env` 已填好(Cloudflare token、中转站 key —— 该文件已 gitignore)。
+前提:本机装有 Node ≥ 22、git、claude CLI;`deploy/.env` 已填好(Cloudflare token —— 该文件已 gitignore)。
 
 ```bash
 bash deploy/setup-all.sh
 ```
 
-脚本会依次:构建前端 → 创建 D1 并建表 → 写入 secrets(访问令牌 / VAPID)→ 部署 Worker 到 `agenthub.win`(token 权限不足时自动回退 workers.dev)→ 注册本机为执行节点 → 写 `~/.agenthub/executor.config.json` → 安装 launchd/systemd 常驻服务 → 验证节点在线,最后打印**访问地址和访问令牌**。
+脚本会依次:构建前端 → 创建 D1 并建表 → 部署 Worker 到 `agenthub.win`(token 权限不足时自动回退 workers.dev)→ 引导创建管理员账号 → 注册本机为执行节点 → 写 `~/.agenthub/executor.config.json` → 安装 launchd/systemd 常驻服务 → 验证节点在线,最后打印**访问地址和管理员账号密码**。
 
-手机打开地址 → 输入令牌 → 建议「添加到主屏幕」并点 🔔 开启推送。
+手机打开地址 → 用管理员账号登录 → 在「设置」里保存一次模型中转站 Base URL / API Key(登录后会自动下发到你名下所有节点,以后新增节点无需再填)→ 建议「添加到主屏幕」并点 🔔 开启推送。
 
 ### 加更多服务器(M3)
 
-在新机器上 clone 本仓库后:
+在新机器上 clone 本仓库后,用你的账号登录网页版拿到会话 token(或直接在网页「添加节点」对话框里复制现成的一行命令,已经带好 token):
 
 ```bash
-APP_URL=https://agenthub.win ACCESS_TOKEN=<你的令牌> \
-ANTHROPIC_BASE_URL=https://claudecode.yun:8081 ANTHROPIC_API_KEY=<key> \
+APP_URL=https://agenthub.win USER_TOKEN=<你的会话 token> \
 bash deploy/setup-node.sh my-h100-box
 ```
+
+无需再传中转站地址 / API Key —— 只要这台服务器和第一台属于同一个账号,登录后保存过的模型配置会自动同步过来。
 
 ## 使用
 
 - **新建任务**:标题 + 任务描述(首条 prompt)+ 选节点,可选 repo(自动 clone + `git worktree add -b task/<id>`)。
 - **状态机**:`queued → starting → running → waiting_human ⇄ running → review → done`;失败 `failed`、节点失联 `unknown`、随时可取消。
 - **审批流**:agent 要跑未授权的 Bash 等操作时任务进入「等待决策」,手机收到推送,点开允许/拒绝(4 小时超时自动拒绝)。
-- **Review**:每轮结束自动生成完整 diff(「变更」标签页),可继续对话或标记完成;每张卡显示累计参考成本,超过 $10 熔断转人工。
+- **Review**:每轮结束自动生成完整 diff(「变更」标签页),可继续对话或标记完成;每张卡持续显示累计参考成本,AgentHub 不按轮数或累计成本中断对话。
 - **IDE 接力**:任务详情「信息」→「在 IDE 中接管」,然后在节点上 `claude --resume <session_id>`(注意 IDE 侧也要配置同样的 `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`);完事点「归还」。
 - **断网**:executor 断网期间任务照跑、事件本地排队(outbox),重连后按 seq 幂等补齐;心跳超时 60s 节点标离线并推送。
 

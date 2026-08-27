@@ -1,8 +1,52 @@
 // Unit tests: state machine, ulid, web push crypto round-trip.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { ulid, userCanTransition, sha256Hex } from '../packages/shared/protocol.mjs';
 import { sendWebPush } from '../packages/worker/src/push.mjs';
+import { listDirs } from '../packages/executor/src/cloudlink.mjs';
+import { buildClaudeArgs } from '../packages/executor/src/session.mjs';
+
+test('Claude CLI arguments never impose AgentHub turn or cost limits', () => {
+  const base = [
+    '-p',
+    '--input-format', 'stream-json',
+    '--output-format', 'stream-json',
+    '--verbose',
+    '--permission-mode', 'bypassPermissions',
+    '--permission-prompt-tool', 'stdio',
+  ];
+  assert.deepEqual(buildClaudeArgs({ permissionMode: 'bypassPermissions' }), base);
+  assert.deepEqual(
+    buildClaudeArgs({ permissionMode: 'bypassPermissions', resumeSessionId: 'session-123' }),
+    [...base, '--resume', 'session-123'],
+  );
+  for (const args of [buildClaudeArgs(), buildClaudeArgs({ resumeSessionId: 'session-123' })]) {
+    assert.ok(!args.includes('--max-turns'));
+    assert.ok(!args.includes('--max-budget-usd'));
+    assert.ok(!args.includes('100'));
+  }
+});
+
+test('listDirs: prefix-completes into matching subdirectories', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-listdirs-'));
+  fs.mkdirSync(path.join(root, 'home'));
+  fs.mkdirSync(path.join(root, 'hostgroup'));
+  fs.mkdirSync(path.join(root, 'var'));
+  fs.mkdirSync(path.join(root, '.hidden'));
+  fs.writeFileSync(path.join(root, 'home-file.txt'), ''); // not a directory
+
+  assert.deepEqual(listDirs(path.join(root, 'ho')), [path.join(root, 'home'), path.join(root, 'hostgroup')]);
+  assert.deepEqual(listDirs(path.join(root, 'nope-xyz')), []);
+  assert.deepEqual(listDirs('/definitely/does/not/exist/anywhere'), []);
+
+  // an exact, already-complete directory lists its own children rather than
+  // being treated as a partial prefix of its parent's siblings
+  fs.mkdirSync(path.join(root, 'home', 'inner'));
+  assert.deepEqual(listDirs(path.join(root, 'home')), [path.join(root, 'home', 'inner')]);
+});
 
 test('ulid: sortable, 26 chars, unique', () => {
   const a = ulid(1000);

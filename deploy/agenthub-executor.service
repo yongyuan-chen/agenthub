@@ -9,7 +9,7 @@ User=__USER__
 ExecStart=__NODE__ __ROOT__/packages/executor/src/index.mjs
 Restart=always
 RestartSec=5
-Environment=HOME=/home/__USER__
+Environment=HOME=__HOME__
 
 [Install]
 WantedBy=multi-user.target

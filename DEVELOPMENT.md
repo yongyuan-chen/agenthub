@@ -239,7 +239,7 @@ for await (const msg of stream) { handleMessage(task, msg); }
 ### 6.3 并发与资源
 
 - 每节点最大并行会话数可配置(默认 3),超出的任务在 DO 侧保持 `queued`。
-- 每个会话设 `maxTurns`(默认 100)与单任务成本上限(默认 $10,超过转 `waiting_human` 询问是否继续)作为失控保险丝。
+- AgentHub 不为单个对话设置 agent turn 或累计成本上限;成本仍完整记录并作为参考展示。长对话依靠 Claude CLI/模型自身的上下文管理与自动压缩持续运行,不会被 AgentHub 人为截断。
 
 ---
 
