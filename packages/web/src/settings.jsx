@@ -109,7 +109,7 @@ function GeneralSection() {
       <p className="muted">新对话没有手动选路径时用这个仓库;留空则用无仓库的临时目录。</p>
       {saved && <div className="ok-note">已保存</div>}
       {err && <div className="err">{err}</div>}
-      <button type="submit" className="ghost" disabled={busy}>{busy ? '保存中…' : '保存'}</button>
+      <button type="submit" disabled={busy}>{busy ? '保存中…' : '保存'}</button>
     </form>
   );
 }
@@ -220,7 +220,7 @@ function ModelProfilesSection() {
       <FetchModelsButton baseUrl={baseUrl} apiKey={apiKey} onPick={setModel} />
       {err && <div className="err">{err}</div>}
       <div className="row-inline">
-        <button type="button" className="ghost" disabled={busy} onClick={save}>{editingId ? '保存修改' : '添加模型配置'}</button>
+        <button type="button" disabled={busy} onClick={save}>{editingId ? '保存修改' : '添加模型配置'}</button>
         {editingId && <button type="button" className="ghost link" disabled={busy} onClick={resetForm}>取消编辑</button>}
       </div>
     </fieldset>

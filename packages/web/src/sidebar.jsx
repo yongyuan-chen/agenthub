@@ -140,6 +140,14 @@ export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect,
                 )}
                 <span className={`chip ${meta.cls}`}>{meta.label}</span>
                 <span className="muted">{fmtAge(t.updated_at)}</span>
+              </span>
+              {/* Row actions overlay the row's right edge and only appear on
+                  hover/focus (always-on where there's no hover, see the CSS).
+                  Keeping them out of .sidebar-item-meta's flow is what makes
+                  every row the same height whether or not it has actions —
+                  in flow they wrapped onto a second line and left a ragged
+                  gap under rows that happened to have three buttons. */}
+              <span className="sidebar-item-actions">
                 {t.status === 'review' && isMine && (
                   <button
                     type="button" className="ghost sidebar-item-action" title="标记完成"
