@@ -1,113 +1,162 @@
 # AgentHub
 
-A self-hosted hub for AI coding agents: the agents live on your own machines, and you reach them from any device (browser or phone) through Cloudflare — a task board plus structured chat panes instead of a terminal and a scatter of chat windows.
+**Your coding agents keep working while you walk away from the desk.**
+
+AgentHub gives Claude Code and Codex a home that isn't a terminal window. The agents keep
+running on machines you own; you watch them, answer them and steer them from your phone.
+
+---
+
+## The problem
+
+A coding agent is genuinely useful right up until you have to leave. Then:
+
+- It's trapped in one terminal on one machine. Close the laptop, lose the session.
+- It stops and waits the moment it needs permission for something — and you're not there,
+  so a twenty-minute task quietly becomes a three-hour one.
+- Three projects means three terminal tabs, and no way to see across them.
+- Your teammate can't see what your agent is doing, and you can't see theirs.
+- Anything hosted means your source code and your API key leave your machine.
+
+## What AgentHub does
+
+Agents run where they already live — your laptop, your GPU box, your cloud VM. AgentHub
+adds a layer on top so you can reach them from anywhere:
+
+- **Answer approvals from your phone.** When an agent needs permission, you get a push
+  notification. Tap allow or deny and it keeps going. That's the whole feature, and it's
+  the one that turns an agent from a thing you babysit into a thing you delegate to.
+- **Every machine in one place.** Register as many nodes as you like; each conversation
+  is pinned to the machine that should run it. A task on the GPU box and a task on your
+  laptop sit side by side in the same list.
+- **Read the work, not the scrollback.** Tool calls are collapsed into readable steps, and
+  every turn produces a diff you can actually review.
+- **Share with your team.** Group conversations and machines into projects. Teammates see
+  the work; only the creator can act on it.
+- **Pick up in your IDE, hand it back.** Take a conversation over locally, keep talking to
+  it in your editor, then return it — the transcript syncs both ways.
+- **Nothing leaves your machines.** Your code stays on your nodes. Your relay API key is
+  written only to each node's local config and never passes through the cloud. Servers
+  need zero inbound ports — nodes dial out, nothing dials in.
+- **It doesn't cut you off.** No cap on turns or accumulated cost. Cost is shown as
+  information, not as a leash.
 
 ```
-phone/browser ──HTTPS/WS──► Cloudflare Worker (board frontend + API + Hub DO + D1 + Web Push)
-                              ▲
-                              │ outbound WebSocket only (zero inbound ports)
-                    executor daemon (one per machine)
-                    ├─ drives the claude CLI (bidirectional stream-json, via your API relay)
-                    └─ drives the codex CLI (app-server JSON-RPC, via your API relay)
+phone / browser ──HTTPS/WS──► Cloudflare Worker (board + API + push)
+                                 ▲
+                                 │ outbound WebSocket only — zero inbound ports
+                        executor daemon (one per machine)
+                        └─ drives Claude Code / Codex against your own API relay
 ```
 
-The board, approvals, reconnect/reconciliation, diffs, push notifications and scheduled tasks are the same for both agents — every difference is contained in the executor's session adapter layer.
+---
 
-## Deploy (one command)
+## Deploy it with an AI agent
 
-Prerequisites: Node ≥ 22 and git installed locally, plus the claude CLI and/or the codex CLI (whichever you install is what you can run — a node reports its installed backends during the handshake); `deploy/.env` filled in with your Cloudflare token (that file is gitignored).
+The fastest way to stand this up is to let a coding agent do it. Open Claude Code (or any
+agent with shell access) in an empty directory and paste this:
+
+````text
+Deploy AgentHub for me — a self-hosted board for AI coding agents.
+Repo: https://github.com/yongyuan-chen/agenthub
+
+Before doing anything, check I have the prerequisites and ask me for whatever is missing.
+Do not guess or invent any value:
+
+1. Node.js >= 22.5 and git installed.
+2. A Cloudflare account, plus:
+   - CLOUDFLARE_API_TOKEN with permissions for Workers, D1 and (if I'm using a custom
+     domain) that zone's DNS
+   - CLOUDFLARE_ACCOUNT_ID
+   - a domain I control and want this on — ask me for it, don't pick one
+3. The claude CLI and/or the codex CLI installed, whichever I want to run.
+4. An Anthropic-compatible API endpoint and key. I'll enter this in the web UI after
+   deploy, NOT in the env file — don't ask me to put it there.
+
+Then:
+- Clone the repo and cd into it.
+- Create deploy/.env with exactly these three keys:
+    CLOUDFLARE_API_TOKEN=...
+    CLOUDFLARE_ACCOUNT_ID=...
+    CUSTOM_DOMAIN=<my domain>
+  Everything else (admin password, node id, node token, VAPID push keys) is generated by
+  the setup script — leave those out.
+- Run: bash deploy/setup-all.sh
+  It builds the frontend, creates the D1 database and schema, deploys the Worker, creates
+  an admin account, registers this machine as an execution node, and installs the daemon
+  via launchd (macOS) or systemd (Linux).
+
+If it fails, read the actual error and fix it — common causes are an API token missing a
+permission, or the domain's zone not being in this Cloudflare account. Don't retry blindly.
+
+When it succeeds, verify before telling me it worked:
+- the site URL returns HTTP 200
+- I can log in with the admin credentials the script printed
+- the node shows as online in the UI
+
+Then report back: the site URL, the admin username and password, and these next steps —
+sign in, open Settings -> Models, save my API relay's base URL and key (it syncs to every
+node automatically), then add the site to my phone's home screen and enable push.
+````
+
+---
+
+## Deploy it yourself
+
+Needs Node ≥ 22.5, git, and the claude and/or codex CLI.
 
 ```bash
+git clone https://github.com/yongyuan-chen/agenthub
+cd agenthub
+cat > deploy/.env <<'EOF'
+CLOUDFLARE_API_TOKEN=your-token
+CLOUDFLARE_ACCOUNT_ID=your-account-id
+CUSTOM_DOMAIN=agents.example.com
+EOF
 bash deploy/setup-all.sh
 ```
 
-The script runs, in order: build the frontend → create D1 and its tables → deploy the Worker to `agenthub.win` (falling back to workers.dev automatically if the token lacks zone permissions) → walk you through creating an admin account → register this machine as an execution node → write `~/.agenthub/executor.config.json` → install the launchd/systemd service → verify the node is online, and finally print **the site URL and the admin credentials**.
+The script prints your site URL and a generated admin password when it finishes. Sign in,
+save your API relay under **Settings → Models** (it syncs to every node from then on), and
+add the site to your home screen so push notifications work.
 
-Open that URL on your phone → sign in as admin → save your model relay's Base URL / API Key once under Settings (after that it is pushed automatically to every node on your account, so new nodes never need it again) → "Add to Home Screen" is recommended, and tap 🔔 to enable push.
+**Adding another machine** — grab the ready-made one-liner from the "Add node" dialog in
+the web UI; it already has your token in it. No relay config needed, it syncs over.
 
-### Adding more servers (M3)
+---
 
-Clone this repo on the new machine, then sign in to the web UI to get a session token (or just copy the ready-made one-liner from the "Add node" dialog, which already has the token baked in):
+## Day to day
 
-```bash
-APP_URL=https://agenthub.win USER_TOKEN=<your session token> \
-bash deploy/setup-node.sh my-h100-box
-```
-
-No relay URL or API key needed — as long as this server belongs to the same account as the first one, the model config you saved after signing in syncs over automatically.
-
-### Upgrading
-
-Nodes report their protocol version during the handshake. **A node on an outdated protocol version is explicitly marked undispatchable** (creating a task against it fails with a message telling you to upgrade) rather than silently doing the wrong thing after receiving fields it doesn't understand. Upgrade order: **all executor nodes first, then deploy the worker**.
-
-## Usage
-
-- **Create a task**: title + task description (the first prompt) + pick a node, optionally a repo (auto `clone` + `git worktree add -b task/<id>`).
-- **Picking a backend = picking a model profile**: a profile pins both "which agent CLI" and "which relay", so "switch model" is also "switch backend". A card that already has a session cannot switch backends (session IDs are not interchangeable between them); the server rejects it outright.
-- **State machine**: `queued → starting → running → waiting_human ⇄ running → review → done`; plus `failed`, `unknown` when a node goes missing, and cancellable at any time.
-- **Approval flow**: when an agent wants to run an unauthorized Bash command or similar, the task enters "waiting for decision", your phone gets a push, and you tap allow/deny (auto-denied after a 4-hour timeout).
-- **Review**: a full diff is generated after every turn (the "Changes" tab); you can keep the conversation going or mark it done. Each card continuously shows accumulated reference cost — AgentHub never cuts a conversation off based on turn count or accumulated cost.
-- **IDE handoff**: task detail → "Info" → "Take over in IDE", and the executor pastes **the complete command for that specific node** into the conversation (the isolated directory in it is known only to the node itself): for claude, `CLAUDE_CONFIG_DIR=<workRoot>/claude-config claude --resume <session_id>`; for codex, `CODEX_HOME=<workRoot>/codex-home codex resume <session_id>`. Neither environment variable **can be omitted** — without it the CLI looks in `~/.claude` / `~/.codex` and reports that the session does not exist. Your IDE needs the relay configured too. Click "Hand back" when you're done.
-- **Scheduled tasks**: on the claude side, `.claude/scheduled_tasks.json` in the task directory is scanned (created by the agent itself via CronCreate, 5-field cron); on the codex side, `CODEX_HOME/automations/*/automation.toml` (RRULE) is scanned and dispatched to the card matching its `target_thread_id` — which means **an automation you created in the Codex desktop app runs on your server without the app being open**, with results pushed to your phone. The two sides never cross over.
-- **Offline**: while an executor is offline, tasks keep running and events queue locally (outbox), then reconcile idempotently by seq on reconnect; a node is marked offline after a 60s heartbeat timeout, with a push notification.
-
-## Codex backend notes
-
-- **Your relay must support `POST /v1/responses`.** Codex only has `wire_api = "responses"` left (`chat` was removed upstream), so a relay that works for claude will not necessarily work for Codex. The frontend warns about this when you create a Codex profile.
-- **A Codex profile cannot be the account default.** The default profile is the relay used by cards that have no profile pinned, and those cards all run claude; making a Codex profile the default would fail all of them at once, so the server returns 409. The account's first **claude** profile automatically becomes the default.
-- **Verified against codex `0.144.6`.** `codex app-server` is marked `[experimental]` upstream, so if Codex cards stop starting after a codex upgrade, check `~/agenthub/logs/executor.log` for handshake errors first.
-- Codex does not report dollar cost (only tokens), so a Codex card's "cost" shows usage rather than an amount — that is not a bug, it just doesn't make numbers up. The auto-compaction threshold uses the context window Codex reports about itself, which is more accurate than the fixed constant used on the claude side.
-
-## Repository layout
-
-```
-packages/shared/     protocol constants, state machine, ulid (shared front/back, zero deps)
-packages/executor/   the resident daemon: node:sqlite local source of truth + outbox,
-                     worktree management, and two backends:
-                     session.mjs / sessions.mjs      claude CLI (bidirectional stream-json + can_use_tool)
-                     codex-session.mjs               codex app-server (JSON-RPC)
-                     codex-sessions.mjs              codex rollout jsonl reader (incremental tailing
-                                                     when no process is live)
-                     codex-automations.mjs           automation.toml + an RRULE subset
-                     backends.mjs                    backend adapter table for the persistence/transcript layer
-packages/worker/     Cloudflare Worker: routing/auth + Hub DO (WS hibernation, event absorption,
-                     heartbeat alarm, reconciliation) + D1 schema + Web Push (RFC 8291/8292 via WebCrypto)
-packages/web/        React 19 board frontend, built with esbuild, served directly as Worker assets
-deploy/              one-command deploy / add-machine scripts, launchd/systemd templates, VAPID generation
-tests/               unit tests + in-process integration tests (real executor modules ↔ real hub-core,
-                     fake WS / fake D1)
-```
-
-## Consistency model (implementation notes)
-
-**The execution site is the source of truth locally; the cloud is the source of truth for the global view. On reconnect, local overwrites the cloud.**
-
-- Every executor event is written to the local outbox first (`(task_id, seq)`, monotonically increasing) and only then reported; the cloud absorbs it idempotently by `(task_id, seq)` with `INSERT OR IGNORE` and acks.
-- On reconnect the executor reports `{status, lastSeq}` per task, the DO corrects D1 to match the executor, and asks the executor to resend everything after `lastSeq`.
-- Task-level fields (status/session/cost) only ever move forward by seq, so replayed and live events interleaving cannot roll a state backwards.
-
-## Tests
-
-```bash
-npm test             # unit + integration (no network, no cost: fake subprocess + fake WS + fake D1)
-npm run smoke        # real claude CLI + relay; exercises tool calls, the approval route, resume
-npm run smoke:codex  # real codex + relay; exercises tool calls, the approval route, compact, resume
-```
-
-Both smoke tests burn real quota, so they are not part of `npm test` and must be run manually. `smoke:codex`
-needs its relay specified separately (a node's default profile is a claude profile):
-`CODEX_SMOKE_BASE_URL=... CODEX_SMOKE_API_KEY=... npm run smoke:codex`.
+- **New conversation**: pick a machine, optionally point it at a repo (it clones and works
+  on its own branch), and describe the task.
+- **Approvals**: a push arrives, you tap allow or deny. Or switch a conversation to fully
+  autonomous if you trust it.
+- **Review**: every turn produces a diff. Keep talking, or mark it done.
+- **Scheduled work**: agents can schedule their own follow-ups, and automations you created
+  in the Codex desktop app run on your server without the app being open.
+- **Offline**: if a machine drops off, its work continues and events queue locally, then
+  reconcile when it reconnects. Nothing is lost.
 
 ## Security
 
-- Zero inbound ports on the server. Three kinds of credentials are kept separate: the user access token (frontend), the node token (per node, stored hashed, rotatable), and the relay API key (which exists only in each node's local config and never passes through Cloudflare).
-- The default permission mode is `acceptEdits` (edits applied automatically, Bash requires human approval); `bypassPermissions` must be chosen explicitly at card creation and carries a red warning. On the Codex side this maps onto `approvalPolicy`/`sandbox`: `acceptEdits → on-request / workspace-write`, `default → untrusted / workspace-write`, `bypassPermissions → never / danger-full-access`.
-- Agent output is rendered through an allowlist sanitizer to prevent injection.
+Three credentials, deliberately kept apart: your login token (browser), a per-node token
+(stored hashed, rotatable), and your relay API key — which exists **only** in each node's
+local config and never passes through Cloudflare.
+
+Agents default to asking before running shell commands. Fully autonomous mode exists, but
+you have to choose it explicitly, per conversation, behind a warning.
 
 ## Troubleshooting
 
 ```bash
-tail -f ~/agenthub/logs/executor.log        # executor log (macOS)
-launchctl kickstart -k gui/$UID/com.agenthub.executor   # restart the daemon
-npx wrangler tail --config packages/worker/wrangler.generated.jsonc  # live worker logs
+tail -f ~/agenthub/logs/executor.log                     # what the daemon is doing
+launchctl kickstart -k gui/$UID/com.agenthub.executor    # restart it (macOS)
 ```
+
+Node showing offline? Check `~/.agenthub/executor.config.json` on that machine — `cloudUrl`
+must point at your deployment.
+
+---
+
+Implementation notes, the consistency model and the module layout live in
+[DEVELOPMENT.md](DEVELOPMENT.md).
