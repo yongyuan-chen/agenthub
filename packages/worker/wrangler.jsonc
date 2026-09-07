@@ -8,11 +8,6 @@
   // APIs available, it doesn't change existing Hub/D1 behaviour.
   "compatibility_flags": ["nodejs_compat"],
   "routes": [
-    // Primary domain (2026-08-20 迁移). The old agenthub.win stays
-    // attached in parallel until the user confirms stability and shuts it
-    // down themselves — same worker, same D1/DO, so no data is affected;
-    // remove that line (and redeploy) when retiring it.
-    { "pattern": "agenthub.win", "custom_domain": true },
     { "pattern": "agenthub.win", "custom_domain": true }
   ],
   "assets": {
