@@ -4,7 +4,11 @@ import { loadConfig } from './config.mjs';
 import { LocalDb } from './db.mjs';
 import { SessionManager } from './manager.mjs';
 import { CloudLink } from './cloudlink.mjs';
-import { checkAndApply } from './selfupdate.mjs';
+import { checkAndApply, sourceChangedSinceBoot } from './selfupdate.mjs';
+
+// Captured before anything else so a source file written during startup
+// still counts as newer than this boot (see the staleness check below).
+const BOOTED_AT = Date.now();
 
 const config = loadConfig(process.argv[2]);
 const db = new LocalDb(config.workRoot);
@@ -44,7 +48,15 @@ async function runSelfUpdateCheck() {
     console.error('[selfupdate] check failed:', e.message);
     return false;
   });
-  if (updated) shutdown(0);
+  if (updated) { shutdown(0); return; }
+  // Checkout installs get no VERSION file and so never match above — same
+  // idle gate, same "exit and let the service manager restart us" exit, just
+  // driven by the source on disk instead of a published version. See
+  // selfupdate.mjs's sourceChangedSinceBoot for why this exists at all.
+  if (sourceChangedSinceBoot(BOOTED_AT) && !manager.hasActiveGeneration()) {
+    console.log('[selfupdate] source checkout changed since boot, restarting into it');
+    shutdown(0);
+  }
 }
 const updateTimer = setInterval(runSelfUpdateCheck, SELF_UPDATE_INTERVAL_MS);
 if (updateTimer.unref) updateTimer.unref();

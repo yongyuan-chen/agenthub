@@ -47,6 +47,31 @@ CREATE TABLE IF NOT EXISTS nodes (
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_team ON nodes(team_id);
 
+-- What a node told us it can do, refreshed on every hello. Side table for the
+-- same idempotent-redeploy reason as model_profile_backends above.
+-- No row = a node that hasn't reconnected since the upgrade: treated as
+-- protocol_version 1 (claude only, and not dispatchable at all, since the
+-- anthropic->provider rename has no compatibility layer and such a node would
+-- silently ignore a pinned model profile rather than reject it).
+CREATE TABLE IF NOT EXISTS node_capabilities (
+  node_id          TEXT PRIMARY KEY,
+  protocol_version INTEGER NOT NULL DEFAULT 1,
+  backends         TEXT NOT NULL DEFAULT '["claude"]',
+  updated_at       INTEGER
+);
+
+-- Fine-grained capabilities a node reports in `hello`, for changes an older
+-- node handles safely but partially (protocol_version above is the hard gate
+-- for the ones it can't handle at all). Side table for the same
+-- idempotent-redeploy reason as node_capabilities itself. No row = a node
+-- that hasn't reconnected since this shipped: assumed to support nothing
+-- here, which is always the conservative choice.
+CREATE TABLE IF NOT EXISTS node_features (
+  node_id    TEXT PRIMARY KEY,
+  features   TEXT NOT NULL DEFAULT '[]',
+  updated_at INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
@@ -79,7 +104,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   auto_decide_all INTEGER DEFAULT 0,
   -- Which model profile this task is pinned to (model_profiles.id), null =
   -- the node-shared default config from the owner's Settings. The resolved
-  -- {baseUrl, apiKey, model} lives executor-side (anthropic_override);
+  -- {baseUrl, apiKey, model} lives executor-side (provider_override);
   -- cloud keeps only the profile reference so the frontend can display the
   -- current model and offer switching without credentials ever appearing in
   -- a GET /tasks response. Spawn-time env (like permission_mode): a switch
@@ -135,6 +160,19 @@ CREATE TABLE IF NOT EXISTS model_profiles (
   created_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_model_profiles_owner ON model_profiles(owner_user_id);
+
+-- Which agent CLI a profile drives ('claude' | 'codex'); no row = 'claude',
+-- which is what every profile predating dual-backend support is.
+-- A side table rather than a model_profiles column on purpose: this whole file
+-- is re-executed verbatim by deploy/setup-all.sh on every deploy, so it has to
+-- stay fully idempotent. CREATE TABLE IF NOT EXISTS is; a bare
+-- ALTER TABLE ... ADD COLUMN is not — it would abort the deploy script on the
+-- second run and take every subsequent deploy with it. Same reason
+-- conversation_claims_v2 / task_teams / node_teams exist as side tables.
+CREATE TABLE IF NOT EXISTS model_profile_backends (
+  profile_id TEXT PRIMARY KEY,
+  backend    TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS pending_cmds (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -220,6 +258,37 @@ CREATE TABLE IF NOT EXISTS durable_cmds (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_durable_cmds_node ON durable_cmds(node_id, created_at);
+
+-- A user's chat send, persisted the moment the API accepts it and kept until
+-- the node echoes the message back as its own event. This exists because
+-- "the WebSocket send() didn't throw" is not delivery: a half-open socket
+-- (see cloudlink.mjs's heartbeat watchdog comment — one sat "connected" for
+-- 15+ minutes with nothing arriving) accepts writes into the void, so a
+-- message could be POSTed successfully, never reach the executor, and never
+-- exist anywhere — reported live by a project member as a message that
+-- "直接永久消失" after sending. Rows here are what make an accepted send
+-- durable, replayable on reconnect, visible on every device while still in
+-- flight, and idempotent (same client_message_id -> same row, never a
+-- second bubble).
+--
+-- Deliberately not queued through durable_cmds as well: that table's ack
+-- means "the node wrote the command down", which is weaker than the signal
+-- used here ("the node put the message in the conversation"), and having two
+-- queues for one send is how it would get delivered twice.
+CREATE TABLE IF NOT EXISTS outbound_messages (
+  task_id           TEXT NOT NULL,
+  client_message_id TEXT NOT NULL,
+  node_id           TEXT NOT NULL,
+  sender_user_id    TEXT,
+  payload           TEXT NOT NULL,   -- {text, images} exactly as dispatched
+  state             TEXT NOT NULL DEFAULT 'pending', -- pending | failed (delivered rows are deleted)
+  attempts          INTEGER NOT NULL DEFAULT 0,
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL,
+  PRIMARY KEY (task_id, client_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_messages_node ON outbound_messages(node_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_outbound_messages_task ON outbound_messages(task_id, created_at);
 
 -- Admin-managed team sharing: an admin creates teams and adds members. A
 -- task/node explicitly bound to a team (see tasks.team_id / nodes.team_id

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { api } from './api.js';
 import { state, upsertTask, bump } from './store.js';
 import { SessionPicker } from './sessionpicker.jsx';
+import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
 
 // Below this many options, show them as inline selectable chips instead of
 // making the user open a dropdown — most accounts have a handful of nodes
@@ -36,6 +37,12 @@ export function DraftPane({ onCreated, onClose }) {
   const [baseBranch, setBaseBranch] = useState(''); // empty = auto-detect the repo's actual default branch
   const [permissionMode, setPermissionMode] = useState('bypassPermissions');
   const [showSessionPicker, setShowSessionPicker] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  // Same composer affordances as an ongoing conversation (task.jsx) — the
+  // first message is a message. A draft pane is created fresh per slot, so
+  // there's no id to reset on.
+  const { attachments, addFiles, removeAttachment, wireImages, hasError: attachmentError }
+    = useAttachments('draft', setErr);
 
   useEffect(() => {
     api.getSettings().then(s => {
@@ -85,19 +92,25 @@ export function DraftPane({ onCreated, onClose }) {
   // no longer required when resuming.
   const createNow = async (resumeSessionId, resumePreview) => {
     const t = text.trim();
-    if (!t && !resumeSessionId) return;
+    const images = wireImages();
+    // Images with no text is a complete first message ("这个报错怎么回事?" is
+    // often the screenshot alone), so it's enough on its own to create.
+    if (!t && !images.length && !resumeSessionId) return;
+    if (attachmentError) return;
     if (!selectedNode) { setErr('还没有可用节点,请先在左侧「+ 添加节点」'); return; }
     setBusy(true); setErr('');
     // Resuming with nothing typed uses the session's own first-message
     // preview as the title (a real name, same as any other conversation
     // gets from its first message) — the session id hash is only a last
     // resort when even that preview is empty.
-    const fallbackTitle = resumePreview && resumePreview !== '(空会话)'
-      ? deriveTitle(resumePreview) : `继续会话 ${resumeSessionId?.slice(0, 8)}`;
+    const fallbackTitle = resumeSessionId
+      ? (resumePreview && resumePreview !== '(空会话)' ? deriveTitle(resumePreview) : `继续会话 ${resumeSessionId.slice(0, 8)}`)
+      : '图片对话'; // images-only: nothing typed to derive a name from
     try {
       const r = await api.createTask({
         title: t ? deriveTitle(t) : fallbackTitle,
-        spec: t || undefined, nodeId: selectedNode.id,
+        spec: t || undefined, images: images.length ? images : undefined,
+        nodeId: selectedNode.id,
         repoUrl: path.trim() || null, baseBranch: baseBranch.trim() || null, permissionMode,
         modelProfileId: modelProfileId || undefined,
         resumeSessionId: resumeSessionId || undefined,
@@ -198,8 +211,13 @@ export function DraftPane({ onCreated, onClose }) {
 
           {/* ---- existing-session picker: resume a session created outside
                AgentHub — picking one creates the task immediately ---- */}
-          {selectedNode && path.trim() && (
-            <button type="button" className="ghost link" onClick={() => setShowSessionPicker(true)}>查看已有会话…</button>
+          {/* Adoption only discovers claude histories, and a session id belongs
+              to exactly one agent CLI — so with a Codex profile picked there is
+              nothing here to adopt. Say why instead of offering a button whose
+              every outcome is a 409. */}
+          {selectedNode && path.trim() && (selectedProfile?.backend === 'codex'
+            ? <span className="muted">Codex 档案暂不支持接管已有会话(会话 ID 不通用)</span>
+            : <button type="button" className="ghost link" onClick={() => setShowSessionPicker(true)}>查看已有会话…</button>
           )}
 
           {/* ---- model profile picker: inline chips when few, dropdown when many ---- */}
@@ -213,20 +231,20 @@ export function DraftPane({ onCreated, onClose }) {
                   type="button" key={p.id} className={`path-chip ${modelProfileId === p.id ? 'selected' : ''}`}
                   onClick={() => pickProfile(p.id)}
                 >
-                  🧠 {p.name}
+                  🧠 {p.name}{p.backend === 'codex' ? ' · Codex' : ''}
                 </button>
               ))}
             </div>
           ) : (
             <div className="chip-with-picker">
               <button type="button" className="path-chip" onClick={() => { setModelPickerOpen(!modelPickerOpen); closeOtherPickers('model'); }}>
-                🧠 {selectedProfile ? selectedProfile.name : '默认配置'}
+                🧠 {selectedProfile ? selectedProfile.name : '默认配置'}{selectedProfile?.backend === 'codex' ? ' · Codex' : ''}
               </button>
               {modelPickerOpen && (
                 <div className="path-picker">
                   <button type="button" className="path-picker-item" onClick={() => pickProfile(null)}>默认配置</button>
                   {profiles.map(p => (
-                    <button type="button" key={p.id} className="path-picker-item" onClick={() => pickProfile(p.id)}>{p.name}</button>
+                    <button type="button" key={p.id} className="path-picker-item" onClick={() => pickProfile(p.id)}>{p.name}{p.backend === 'codex' ? ' · Codex' : ''}</button>
                   ))}
                 </div>
               )}
@@ -256,14 +274,27 @@ export function DraftPane({ onCreated, onClose }) {
         <div className="draft-empty muted">开始输入,发送第一条消息即可创建对话;或点击「查看已有会话…」直接恢复历史记录</div>
       </div>
 
-      <form className="composer" onSubmit={send}>
-        <textarea
-          value={text} onChange={e => setText(e.target.value)} rows={2} autoFocus
-          placeholder="给 agent 一个任务…(Enter 发送,Shift+Enter 换行)"
-          disabled={busy}
-          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }}
-        />
-        <button disabled={busy || !text.trim()}>{busy ? '创建中…' : '发送'}</button>
+      <form
+        className={`composer${dragOver ? ' drag-over' : ''}`} onSubmit={send}
+        onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={e => { e.preventDefault(); setDragOver(false); addFiles(e.dataTransfer.files); }}
+      >
+        <AttachmentStrip attachments={attachments} onRemove={removeAttachment} />
+        <div className="composer-row">
+          <AttachButton onFiles={addFiles} disabled={busy} />
+          <textarea
+            value={text} onChange={e => setText(e.target.value)} rows={2} autoFocus
+            placeholder="给 agent 一个任务…(Enter 发送,Shift+Enter 换行,可直接粘贴/拖拽图片)"
+            disabled={busy}
+            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }}
+            onPaste={e => {
+              const files = imageFilesFromPaste(e);
+              if (files.length) { e.preventDefault(); addFiles(files); }
+            }}
+          />
+          <button disabled={busy || (!text.trim() && !attachments.length) || attachmentError}>{busy ? '创建中…' : '发送'}</button>
+        </div>
       </form>
 
       {showSessionPicker && selectedNode && (

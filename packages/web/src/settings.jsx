@@ -128,16 +128,22 @@ function ModelProfilesSection() {
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState('');
+  // Which agent CLI this profile drives. It lives on the profile rather than on
+  // the create-task form because picking a relay and picking an agent are the
+  // same decision in practice — a Codex relay can't serve Claude and vice
+  // versa. One consequence: 「切换模型」on a card is also 「切换后端」.
+  const [backend, setBackend] = useState('claude');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
   const load = () => api.modelProfiles().then(r => setProfiles(r.profiles || [])).catch(() => setProfiles([]));
   useEffect(() => { load(); }, []);
 
-  const resetForm = () => { setEditingId(null); setName(''); setBaseUrl(''); setApiKey(''); setModel(''); };
+  const resetForm = () => { setEditingId(null); setName(''); setBaseUrl(''); setApiKey(''); setModel(''); setBackend('claude'); };
 
   const startEdit = (p) => {
     setEditingId(p.id); setName(p.name); setBaseUrl(p.baseUrl || ''); setApiKey(p.apiKey || ''); setModel(p.model || '');
+    setBackend(p.backend || 'claude');
     setErr('');
   };
 
@@ -145,7 +151,7 @@ function ModelProfilesSection() {
     e.preventDefault();
     if (!name.trim() || !baseUrl.trim() || !apiKey.trim()) { setErr('名称、Base URL、API Key 都要填'); return; }
     setBusy(true); setErr('');
-    const payload = { name: name.trim(), baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim() || null };
+    const payload = { name: name.trim(), baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim() || null, backend };
     try {
       if (editingId) await api.updateModelProfile(editingId, payload);
       else await api.createModelProfile(payload);
@@ -180,10 +186,16 @@ function ModelProfilesSection() {
           {profiles.map(p => (
             <div className="row-inline profile-row" key={p.id}>
               <span>{p.name}</span>
+              <span className="chip">{p.backend === 'codex' ? 'Codex' : 'Claude Code'}</span>
               <span className="muted">{p.baseUrl}{p.model ? ` · ${p.model}` : ''}</span>
+              {/* 「默认」is the relay that tasks which picked *no* profile use,
+                  and those always run Claude Code — so a Codex profile can't
+                  hold it (the server refuses too). */}
               {p.isDefault
                 ? <span className="chip">默认</span>
-                : <button type="button" className="ghost link" disabled={busy} onClick={() => setDefault(p.id)}>设为默认</button>}
+                : p.backend === 'codex'
+                  ? <span className="muted" title="默认配置是给「没有选档案」的对话用的,那些对话跑的是 Claude Code">不可设为默认</span>
+                  : <button type="button" className="ghost link" disabled={busy} onClick={() => setDefault(p.id)}>设为默认</button>}
               <button type="button" className="ghost link" disabled={busy} onClick={() => startEdit(p)}>编辑</button>
               <button type="button" className="ghost deny" disabled={busy} onClick={() => remove(p.id)}>删除</button>
             </div>
@@ -200,6 +212,11 @@ function ModelProfilesSection() {
         <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="API Key" />
         <input value={model} onChange={e => setModel(e.target.value)} placeholder="Model(可选)" />
       </div>
+      <div className="row-inline">
+        <label><input type="radio" name="profile-backend" checked={backend === 'claude'} onChange={() => setBackend('claude')} /> Claude Code</label>
+        <label><input type="radio" name="profile-backend" checked={backend === 'codex'} onChange={() => setBackend('codex')} /> Codex</label>
+      </div>
+      {backend === 'codex' && <p className="muted">Codex 只支持 <code>/v1/responses</code>(旧的 <code>/v1/chat/completions</code> 已被移除),中转站必须支持它。用这个档案的节点上要装好 <code>codex</code> CLI。</p>}
       <FetchModelsButton baseUrl={baseUrl} apiKey={apiKey} onPick={setModel} />
       {err && <div className="err">{err}</div>}
       <div className="row-inline">

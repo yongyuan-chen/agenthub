@@ -71,3 +71,69 @@ export async function checkAndApply(cloudUrl, { installRoot = INSTALL_ROOT, isId
   log('[selfupdate] extracted new code, restarting');
   return true;
 }
+
+// ---- git-checkout installs ----
+// checkAndApply above is a deliberate no-op without a VERSION file, which
+// left dev/checkout nodes with *no* update path at all: the daemon keeps
+// running whatever the source said the moment it booted, silently, for as
+// long as it stays up. Found live: a node ran 5-day-old code that still
+// passed `--max-turns 100`, so the commit removing that cap never took
+// effect and a task died at turn 101 with `error_max_turns` — a bug that was
+// already fixed in the repo it was literally running from. Comparing source
+// mtimes to boot time gives the checkout case the same "exit so the service
+// manager restarts into the new code" behaviour tarball installs already
+// have.
+// Only the two trees this process actually imports: editing the web app or
+// the Cloudflare worker has no bearing on the running daemon.
+const WATCHED_SOURCE_DIRS = ['packages/executor/src', 'packages/shared'];
+
+// An editor mid-save, or a half-applied `git checkout`, must not bounce the
+// daemon into a syntax error — act only once the newest file has been quiet
+// for a while.
+export const SOURCE_SETTLE_MS = 60_000;
+
+export function newestSourceMtime(installRoot = INSTALL_ROOT) {
+  let newest = 0;
+  const walk = (dir) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(p);
+      else if (entry.name.endsWith('.mjs')) {
+        try { newest = Math.max(newest, fs.statSync(p).mtimeMs); } catch { /* vanished mid-scan */ }
+      }
+    }
+  };
+  for (const dir of WATCHED_SOURCE_DIRS) walk(path.join(installRoot, dir));
+  return newest;
+}
+
+// True when this process is running a checkout whose source has since moved
+// on. Never true for a tarball install — checkAndApply owns that case, and
+// its extraction rewrites these same files (which would otherwise read as
+// "stale" forever after).
+export function checkoutSourceDirty(installRoot = INSTALL_ROOT, exec = execFileSync) {
+  // A plain extracted install without VERSION isn't necessarily a git checkout;
+  // preserve the old mtime behavior there. If .git does exist, however, never
+  // auto-load half-written executor/shared changes from an active development
+  // session. Clean committed pulls still restart automatically as intended.
+  if (!fs.existsSync(path.join(installRoot, '.git'))) return false;
+  try {
+    return exec('git', [
+      '-C', installRoot, 'status', '--porcelain', '--untracked-files=all', '--',
+      'packages/executor/src', 'packages/shared',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().length > 0;
+  } catch {
+    // If a directory advertises itself as a checkout but git cannot verify its
+    // state, fail closed: an unattended restart into unknown source is worse
+    // than waiting for an explicit service restart.
+    return true;
+  }
+}
+
+export function sourceChangedSinceBoot(bootedAtMs, { installRoot = INSTALL_ROOT, now = Date.now() } = {}) {
+  if (currentVersion(installRoot) || checkoutSourceDirty(installRoot)) return false;
+  const newest = newestSourceMtime(installRoot);
+  return newest > bootedAtMs && now - newest > SOURCE_SETTLE_MS;
+}

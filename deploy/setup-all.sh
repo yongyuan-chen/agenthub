@@ -156,8 +156,9 @@ cat > "$HOME/.agenthub/executor.config.json" <<EOF
   "cloudUrl": "$WS_URL",
   "nodeId": "$NODE_ID",
   "nodeToken": "$NODE_TOKEN",
-  "anthropic": { "baseUrl": "", "apiKey": "", "model": "" },
+  "provider": { "baseUrl": "", "apiKey": "", "model": "" },
   "claudeBin": "$(command -v claude || echo claude)",
+  "codexBin": "$(command -v codex || echo codex)",
   "maxParallel": 3,
   "workRoot": "$HOME/agenthub"
 }

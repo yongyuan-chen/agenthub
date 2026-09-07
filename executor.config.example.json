@@ -2,12 +2,13 @@
   "cloudUrl": "wss://agenthub.win",
   "nodeId": "my-server",
   "nodeToken": "<generated node token, see deploy/setup-node.sh>",
-  "anthropic": {
+  "provider": {
     "baseUrl": "",
     "apiKey": "",
     "model": ""
   },
   "claudeBin": "claude",
+  "codexBin": "codex",
   "maxParallel": 3,
   "workRoot": "~/agenthub"
 }

@@ -15,6 +15,13 @@ export const state = {
   sourceRequestSeq: {},   // scopeKey -> newest source-list request generation
   userGeneration: 0,     // monotonic account boundary; in-flight old-user work is discarded
   msgs: new Map(),       // taskId -> Map(seq -> {seq, role, content, ts}) — global, not scoped (a task's own id is already unique)
+  // taskId -> Map(clientMessageId -> {clientMessageId, text, images, state, createdAt})
+  // Sends the cloud has accepted but no node has echoed back yet. Kept
+  // separate from msgs because they have no seq: they're rendered after the
+  // real log as still-in-flight bubbles, and removed when the node's own
+  // user message arrives with the same id. This is what stops a message from
+  // looking like it vanished while it's actually queued for an offline node.
+  pendingMsgs: new Map(),
   wsConnected: false,
   loaded: false,
   teams: [],             // [{id, name, role}] — this user's own memberships
@@ -68,6 +75,7 @@ export function resetUserState() {
   state.sourceRequestSeq = {};
   state.userGeneration = nextGeneration;
   state.msgs = new Map();
+  state.pendingMsgs = new Map();
   state.wsConnected = false;
   state.loaded = false;
   state.teams = [];
@@ -104,6 +112,55 @@ export function upsertNode(node) {
 export function addMessage(taskId, msg) {
   if (!state.msgs.has(taskId)) state.msgs.set(taskId, new Map());
   state.msgs.get(taskId).set(msg.seq, msg);
+  // The real message won the race against its own pending bubble (the node
+  // echoed it back). Retiring it here as well as on 'pending_settled' means
+  // a client that missed that broadcast — offline, backgrounded, mid-reload
+  // — still doesn't render the same text twice.
+  const clientMessageId = msg.role === 'user' ? msg.content?.clientMessageId : null;
+  if (clientMessageId) removePendingMessage(taskId, clientMessageId);
+}
+
+export function upsertPendingMessage(taskId, pending) {
+  if (!pending?.clientMessageId) return;
+  // Already delivered for real: a late/duplicate 'pending_msg' (a reconnect
+  // replay, a retry racing the delivery) must not resurrect a bubble for a
+  // message that's already in the log.
+  const known = state.msgs.get(taskId);
+  if (known) {
+    for (const message of known.values()) {
+      if (message.role === 'user' && message.content?.clientMessageId === pending.clientMessageId) return;
+    }
+  }
+  if (!state.pendingMsgs.has(taskId)) state.pendingMsgs.set(taskId, new Map());
+  state.pendingMsgs.get(taskId).set(pending.clientMessageId, pending);
+}
+
+export function removePendingMessage(taskId, clientMessageId) {
+  const map = state.pendingMsgs.get(taskId);
+  if (!map) return;
+  map.delete(clientMessageId);
+  if (!map.size) state.pendingMsgs.delete(taskId);
+}
+
+export function markPendingMessageFailed(taskId, clientMessageId) {
+  const existing = state.pendingMsgs.get(taskId)?.get(clientMessageId);
+  if (existing) state.pendingMsgs.get(taskId).set(clientMessageId, { ...existing, state: 'failed' });
+}
+
+// Server-authoritative pending list for one task (from GET /messages).
+// Replaces rather than merges: a row the server no longer has was delivered
+// or abandoned, and keeping a local copy of it is exactly how a stale bubble
+// would outlive the thing it represents.
+export function setPendingMessages(taskId, pending) {
+  const rows = (pending || []).filter(p => p?.clientMessageId);
+  if (!rows.length) { state.pendingMsgs.delete(taskId); return; }
+  state.pendingMsgs.set(taskId, new Map(rows.map(p => [p.clientMessageId, p])));
+}
+
+export function taskPendingMessages(taskId) {
+  const map = state.pendingMsgs.get(taskId);
+  if (!map) return [];
+  return [...map.values()].sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
 }
 
 export function taskMessages(taskId) {
@@ -134,6 +191,11 @@ export function applyWsMessage(msg) {
       break;
     case 'node': upsertNode(msg.node); break;
     case 'msg': addMessage(msg.taskId, { seq: msg.seq, role: msg.role, content: msg.content, created_at: msg.ts }); break;
+    case 'pending_msg': upsertPendingMessage(msg.taskId, msg.pending); break;
+    case 'pending_settled':
+      if (msg.state === 'failed') markPendingMessageFailed(msg.taskId, msg.clientMessageId);
+      else removePendingMessage(msg.taskId, msg.clientMessageId);
+      break;
     case 'conversation_source_claimed':
       {
         const scopeKey = scopeKeyOf(state.activeTeamId);

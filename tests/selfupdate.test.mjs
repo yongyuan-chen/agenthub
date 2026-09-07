@@ -5,12 +5,25 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { currentVersion, fetchLatestVersion, checkAndApply } from '../packages/executor/src/selfupdate.mjs';
+import {
+  currentVersion, fetchLatestVersion, checkAndApply,
+  newestSourceMtime, checkoutSourceDirty, sourceChangedSinceBoot, SOURCE_SETTLE_MS,
+} from '../packages/executor/src/selfupdate.mjs';
 
 function makeInstallRoot(version) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-install-'));
   if (version != null) fs.writeFileSync(path.join(dir, 'VERSION'), version + '\n');
   return dir;
+}
+
+// Writes one source file with an explicit mtime, so staleness can be tested
+// without sleeping out a real settle window.
+function writeSource(installRoot, relPath, mtimeMs) {
+  const file = path.join(installRoot, relPath);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, '// test\n');
+  fs.utimesSync(file, mtimeMs / 1000, mtimeMs / 1000);
+  return file;
 }
 
 test('currentVersion: reads and trims VERSION; null when absent (dev checkout)', () => {
@@ -89,4 +102,74 @@ test('checkAndApply: download failure is caught and returns false, never throws'
   };
   const result = await checkAndApply('wss://cloud', { installRoot, isIdle: () => true, fetchImpl, log: () => {} });
   assert.equal(result, false);
+});
+
+test('newestSourceMtime: only the trees the daemon actually imports count', () => {
+  const installRoot = makeInstallRoot(null);
+  // Second-aligned: utimesSync takes seconds as a float, so a sub-second
+  // mtime doesn't survive the round-trip through the filesystem.
+  const boot = Math.floor(Date.now() / 1000) * 1000;
+  writeSource(installRoot, 'packages/executor/src/manager.mjs', boot - 10_000);
+  writeSource(installRoot, 'packages/shared/protocol.mjs', boot - 5_000);
+  assert.equal(newestSourceMtime(installRoot), boot - 5_000);
+
+  // The web app and the Cloudflare worker have no bearing on this process.
+  writeSource(installRoot, 'packages/web/src/task.jsx', boot + 60_000);
+  writeSource(installRoot, 'packages/worker/src/hub-core.mjs', boot + 60_000);
+  assert.equal(newestSourceMtime(installRoot), boot - 5_000);
+});
+
+test('checkoutSourceDirty: only executor/shared changes block an automatic checkout restart', () => {
+  const installRoot = makeInstallRoot(null);
+  fs.mkdirSync(path.join(installRoot, '.git'));
+  const calls = [];
+  const exec = (_bin, args) => { calls.push(args); return ' M packages/executor/src/manager.mjs\n'; };
+  assert.equal(checkoutSourceDirty(installRoot, exec), true);
+  assert.deepEqual(calls[0].slice(-2), ['packages/executor/src', 'packages/shared']);
+
+  assert.equal(checkoutSourceDirty(installRoot, () => ''), false);
+  assert.equal(checkoutSourceDirty(makeInstallRoot(null), () => { throw new Error('must not run'); }), false,
+    'a non-git install keeps the existing mtime behavior');
+  assert.equal(checkoutSourceDirty(installRoot, () => { throw new Error('git broken'); }), true,
+    'an unverifiable checkout fails closed');
+});
+
+test('sourceChangedSinceBoot: a checkout whose source moved on since boot is stale, once it settles', () => {
+  const installRoot = makeInstallRoot(null);
+  // Second-aligned: utimesSync takes seconds as a float, so a sub-second
+  // mtime doesn't survive the round-trip through the filesystem.
+  const boot = Math.floor(Date.now() / 1000) * 1000;
+
+  // Source older than boot: this is the code we are already running.
+  writeSource(installRoot, 'packages/executor/src/manager.mjs', boot - 60_000);
+  assert.equal(sourceChangedSinceBoot(boot, { installRoot, now: boot + 10 * SOURCE_SETTLE_MS }), false);
+
+  // Just edited: newer than boot, but an editor may still be mid-save.
+  writeSource(installRoot, 'packages/executor/src/manager.mjs', boot + 1_000);
+  assert.equal(sourceChangedSinceBoot(boot, { installRoot, now: boot + 1_000 + SOURCE_SETTLE_MS - 1 }), false);
+
+  // Settled: the exact case that left this node running a `--max-turns 100`
+  // build for five days after the commit removing it.
+  assert.equal(sourceChangedSinceBoot(boot, { installRoot, now: boot + 1_000 + SOURCE_SETTLE_MS + 1 }), true);
+});
+
+test('sourceChangedSinceBoot: dirty executor source is never loaded automatically', () => {
+  const installRoot = makeInstallRoot(null);
+  fs.mkdirSync(path.join(installRoot, '.git'));
+  const boot = Math.floor(Date.now() / 1000) * 1000;
+  writeSource(installRoot, 'packages/executor/src/manager.mjs', boot + 1_000);
+  // This temporary .git directory is not a real repository, so git status
+  // fails and checkoutSourceDirty deliberately fails closed.
+  assert.equal(sourceChangedSinceBoot(boot, { installRoot, now: boot + 10 * SOURCE_SETTLE_MS }), false);
+});
+
+test('sourceChangedSinceBoot: never fires on a tarball install (checkAndApply owns those)', () => {
+  const installRoot = makeInstallRoot('some-hash');
+  // Second-aligned: utimesSync takes seconds as a float, so a sub-second
+  // mtime doesn't survive the round-trip through the filesystem.
+  const boot = Math.floor(Date.now() / 1000) * 1000;
+  // Extraction rewrites these very files, which would otherwise read as
+  // "changed since boot" forever after every successful update.
+  writeSource(installRoot, 'packages/executor/src/manager.mjs', boot + 1_000);
+  assert.equal(sourceChangedSinceBoot(boot, { installRoot, now: boot + 10 * SOURCE_SETTLE_MS }), false);
 });

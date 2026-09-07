@@ -8,6 +8,7 @@ import { DraftPane } from './draftpane.jsx';
 import { ConversationSourcePane } from './sourcepane.jsx';
 import { STATUS_META } from './board.jsx';
 import { MobileConversationSwitcher } from './mobileswitcher.jsx';
+import { layoutNeedsSave, mergeCloudLayout } from './layout-sync.js';
 
 const PANES_KEY = 'agenthub_open_panes';
 const ACTIVE_PANE_KEY = 'agenthub_active_panes';
@@ -176,18 +177,28 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
   // would be a stale closure by the time this async response actually lands
   // anyway (deps are `[]`, captured once at mount).
   const [layoutLoaded, setLayoutLoaded] = useState(false);
+  const lastQueuedLayoutsRef = useRef({});
+  const layoutSaveQueueRef = useRef(Promise.resolve());
   useEffect(() => {
     api.getLayout().then(r => {
-      setPanesByScope(prev => {
-        const merged = { ...prev };
-        let changed = false;
-        for (const [k, v] of Object.entries(r.layout || {})) {
-          if (!(k in merged) && Array.isArray(v)) { merged[k] = v; changed = true; }
-        }
-        return changed ? merged : prev;
-      });
+      const cloudLayout = {};
+      for (const [k, v] of Object.entries(r.layout || {})) {
+        if (Array.isArray(v)) cloudLayout[k] = v.filter(id => typeof id === 'string' && !isTransientPane(id));
+      }
+      // The first save comparison starts from what the server actually has,
+      // not from an implicit [] for whichever scope happens to be selected.
+      // That distinction prevents merely visiting a scope from recording an
+      // empty layout before its task list has had a chance to load.
+      lastQueuedLayoutsRef.current = cloudLayout;
+      setPanesByScope(prev => mergeCloudLayout(prev, cloudLayout));
       setLayoutLoaded(true);
-    }).catch(() => setLayoutLoaded(true));
+    }).catch(() => {
+      // With no authoritative baseline, a populated local layout may still be
+      // uploaded, but layoutNeedsSave() refuses an ambiguous empty one. A
+      // temporary GET failure must never turn into a destructive [] write.
+      lastQueuedLayoutsRef.current = {};
+      setLayoutLoaded(true);
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -348,13 +359,23 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
   }, [state.loaded, scope, openPanes, layoutLoaded, getVersion()]);
 
   useEffect(() => {
-    if (!layoutLoaded) return; // don't race the initial seed-fetch above
+    if (!layoutLoaded) return;
+    const panes = openPanes.filter(id => !isTransientPane(id));
+    const prior = lastQueuedLayoutsRef.current[scope];
+    if (!layoutNeedsSave(prior, panes)) return;
+
     // No debounce: saves are cheap/infrequent (pane add/remove), and any
-    // delay just widens the window where a refresh could race ahead of it.
-    // X-Team-Id on this request is state.activeTeamId, i.e. exactly `scope`
-    // — the backend writes only that scope's bucket, never touching others.
-    api.saveLayout(openPanes.filter(id => !isTransientPane(id))).catch(() => {});
-  }, [openPanes, layoutLoaded]);
+    // delay widens the window where a refresh could race ahead of it. Queue
+    // writes globally so two rapid changes cannot arrive out of order, and
+    // bind each call to this render's scope instead of letting api.js read the
+    // mutable activeTeamId later (the old behavior could save project A's
+    // panes under project B while switching tabs).
+    lastQueuedLayoutsRef.current = { ...lastQueuedLayoutsRef.current, [scope]: panes };
+    const teamId = scope === PERSONAL ? null : scope;
+    layoutSaveQueueRef.current = layoutSaveQueueRef.current
+      .catch(() => {})
+      .then(() => api.saveLayout(panes, teamId));
+  }, [openPanes, layoutLoaded, scope]);
 
   // Sidebar items are plain buttons (their onClick calls preventDefault on
   // the anchor), so this is the only thing that ever moves the hash for a

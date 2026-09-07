@@ -3,7 +3,32 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { externalSessionHistoryPage, listExternalSessions, listExternalSessionsForPaths } from './sessions.mjs';
+import { PROTOCOL_VERSION, EXECUTOR_FEATURES } from '../../shared/protocol.mjs';
+
+// Which agent CLIs this machine can actually run. Probed once per process
+// (spawning a `--version` on every reconnect would be wasteful and, on a
+// flapping connection, noisy) — installing a CLI while the daemon is running
+// needs a daemon restart to be noticed, which matches how claudeBin/codexBin
+// are already treated everywhere else.
+let _backendsCache = null;
+export function availableBackends(config) {
+  if (_backendsCache) return _backendsCache;
+  const found = [];
+  for (const [name, bin] of [['claude', config.claudeBin || 'claude'], ['codex', config.codexBin || 'codex']]) {
+    // shell:true on Windows for the same .cmd-shim reason session.mjs spawns
+    // that way; `bin` comes from this node's own config file, never the wire.
+    const r = spawnSync(bin, ['--version'], { stdio: 'ignore', timeout: 10_000, shell: process.platform === 'win32' });
+    if (!r.error && r.status === 0) found.push(name);
+  }
+  // An empty list is meaningful: this daemon cannot safely spawn either CLI.
+  // Advertising Claude as a fallback made an unconfigured node accept work
+  // only to fail later with ENOENT. Restarting the daemon after installing a
+  // CLI re-runs this process-level probe.
+  _backendsCache = found;
+  return _backendsCache;
+}
 
 // Prefix-completes a path into matching subdirectories, e.g. '/ho' -> ['/home'].
 // Only reachable by the node's owner (ownership-checked cloud-side), who by
@@ -195,12 +220,34 @@ export class CloudLink {
       taskId: t.task_id, status: t.status, lastSeq: this.db.lastSeq(t.task_id),
       sessionId: t.session_id, costUsd: t.cost_usd, lease: t.lease, contextTokens: t.context_tokens,
     }));
-    this._send({ t: 'hello', nodeId: this.config.nodeId, tasks });
+    // protocolVersion + backends let the cloud refuse to dispatch work this
+    // node would mis-handle rather than dispatch it and get a confusing
+    // failure: a pre-rename node silently ignores `provider` and falls back to
+    // the node-wide relay, and a node without the codex CLI can't run a codex
+    // profile at all. Both are answered here, once, instead of being
+    // discovered per-task.
+    this._send({
+      t: 'hello', nodeId: this.config.nodeId, tasks,
+      protocolVersion: PROTOCOL_VERSION,
+      backends: availableBackends(this.config),
+      // Fine-grained capabilities the coarse protocol version can't express —
+      // see EXECUTOR_FEATURES. Absent = an older node, which the cloud then
+      // treats conservatively rather than refusing outright.
+      features: EXECUTOR_FEATURES,
+    });
   }
 
   _onCloudMessage(msg) {
     switch (msg.t) {
       case 'hello_ok': {
+        // The cloud speaks a newer protocol than this daemon and has refused to
+        // hand it work rather than let it run against the wrong relay. Nothing
+        // this process can do about it, so say so loudly on every reconnect —
+        // the alternative is a node that looks connected and never picks
+        // anything up, with no explanation anywhere.
+        if (msg.upgradeRequired) {
+          console.error(`[link] 这个 executor 太旧了(协议 v${PROTOCOL_VERSION},云端要求 v${msg.upgradeRequired}),云端不会向它派发任务。请升级本机的 AgentHub daemon。`);
+        }
         // Replay everything the cloud hasn't absorbed yet, oldest first.
         const known = new Map((msg.tasks || []).map(x => [x.taskId, x.lastSeq]));
         const taskIds = new Set(this.db.allTasks().map(t => t.task_id));
@@ -214,17 +261,23 @@ export class CloudLink {
         // handleHello comment) — reassert on every reconnect rather than
         // trusting the one-shot push from whenever they were originally
         // set. All handlers already no-op if the value already matches.
-        // anthropicOverride is only present when the cloud has an explicit
+        // providerOverride is only present when the cloud has an explicit
         // stance (pinned profile, or explicit revert-to-default) — absent
         // for legacy tasks, whose executor-side override must be left alone.
+        // A checkout node can restart into newer executor code before the
+        // Worker is deployed; accept v1's anthropicOverride spelling too.
         for (const x of msg.tasks || []) {
           if (x.permissionMode) this.onCommand({ t: 'set_permission_mode', taskId: x.taskId, permissionMode: x.permissionMode });
           if ('autoDecideAll' in x) this.onCommand({ t: 'set_auto_decide_all', taskId: x.taskId, autoDecideAll: x.autoDecideAll });
-          if ('anthropicOverride' in x) this.onCommand({ t: 'set_anthropic_override', taskId: x.taskId, anthropic: x.anthropicOverride });
+          if ('providerOverride' in x) this.onCommand({ t: 'set_provider_override', taskId: x.taskId, provider: x.providerOverride, backend: x.backend ?? null });
+          else if ('anthropicOverride' in x) this.onCommand({ t: 'set_provider_override', taskId: x.taskId, provider: x.anthropicOverride, backend: null });
         }
         // Every hello carries the owning user's current relay credentials —
-        // route it through the same path a live {t:'config'} push uses.
-        if (msg.anthropic) this.onCommand({ t: 'config', anthropic: msg.anthropic });
+        // route it through the same path a live {t:'config'} push uses. The
+        // stable production Worker still calls this field `anthropic`, so the
+        // rename must be backward-compatible rather than silently dropping it.
+        const provider = msg.provider ?? msg.anthropic;
+        if (provider) this.onCommand({ t: 'config', provider });
         break;
       }
       case 'ack':

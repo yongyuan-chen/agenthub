@@ -1,15 +1,23 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api.js';
-import { state, taskMessages, addMessage, bump } from './store.js';
+import { state, taskMessages, addMessage, bump, taskPendingMessages, setPendingMessages, upsertPendingMessage } from './store.js';
 import { renderMarkdown } from './md.js';
 import { STATUS_META, fmtAge } from './board.jsx';
 import { SessionPicker } from './sessionpicker.jsx';
-import { addAttachment, revoke } from './attachments.js';
-import { MAX_IMAGES_PER_MESSAGE } from '../../shared/protocol.mjs';
+import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
 
 function Md({ text }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+// Identifies one send end-to-end (browser -> cloud row -> node event -> back).
+// Must match the server's accepted shape (see isValidClientMessageId):
+// URL-safe, <= 64 chars. randomUUID isn't available on every mobile browser
+// in a non-secure context, hence the fallback.
+function newClientMessageId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
 // GET /api/tasks/:id/messages is capped at 1000 per request — a
@@ -30,7 +38,16 @@ async function fetchAllMessagesSince(taskId, after, isCancelled) {
       bump();
       cursor = r.messages[r.messages.length - 1].seq;
     }
-    if (r.messages.length < 1000) return; // caught up to the current tail
+    if (r.messages.length < 1000) {
+      // Server-authoritative on the last page only: earlier pages are a
+      // snapshot of the same list, and applying one of those would briefly
+      // resurrect bubbles that later pages have already seen delivered.
+      // Sends still in flight are part of the conversation's state, so they
+      // have to survive a reload/second device exactly like stored messages.
+      setPendingMessages(taskId, r.pending);
+      bump();
+      return; // caught up to the current tail
+    }
   }
 }
 
@@ -322,7 +339,7 @@ function PermCard({ task, msg, isCreator }) {
         <div className="perm-bypass-note">
           <div className="muted">
             此对话已是自动授权(bypassPermissions)模式,但仍出现了这个请求 —
-            这类操作(常见于包含 rm 的命令)是 claude CLI 自身强制要求人工确认的安全底线,
+            这类操作(常见于包含 rm 的命令)是 agent CLI 自身强制要求人工确认的安全底线,
             任何权限模式都无法跳过。可以继续手动点允许/拒绝,或者让 AgentHub 代你自动点允许
             (这会彻底关掉这道人工把关,不只是切换权限模式)。
           </div>
@@ -331,7 +348,7 @@ function PermCard({ task, msg, isCreator }) {
               className="ghost" disabled={busy}
               title="批准这次,并且这个对话以后遇到这类强制确认都自动点允许,不再弹出"
               onClick={() => {
-                if (confirm('这不是切换权限模式,而是让 AgentHub 代你自动批准 claude CLI 自身要求人工确认的操作(如 rm)——相当于关掉 Anthropic 特意保留的最后一道人工把关。之后这个对话里这类请求将不再有任何人工审核,请确保你完全信任这个任务接下来会做的所有事。确定要这样做吗?')) {
+                if (confirm('这不是切换权限模式,而是让 AgentHub 代你自动批准 agent CLI 自身要求人工确认的操作(如 rm)——相当于关掉 agent 特意保留的最后一道人工把关。之后这个对话里这类请求将不再有任何人工审核,请确保你完全信任这个任务接下来会做的所有事。确定要这样做吗?')) {
                   act('allow', undefined, undefined, 'this');
                 }
               }}
@@ -340,7 +357,7 @@ function PermCard({ task, msg, isCreator }) {
               className="ghost" disabled={busy}
               title="批准这次,并且当前账户下所有对话(含正在运行的)以后遇到这类强制确认都自动点允许"
               onClick={() => {
-                if (confirm('这不是切换权限模式,而是让 AgentHub 代你自动批准 claude CLI 自身要求人工确认的操作(如 rm)——相当于关掉 Anthropic 特意保留的最后一道人工把关,并且是账户下所有对话(含正在运行的)一起生效。之后这些对话里这类请求将不再有任何人工审核,请确保你完全信任所有正在运行的任务接下来会做的所有事。确定要这样做吗?')) {
+                if (confirm('这不是切换权限模式,而是让 AgentHub 代你自动批准 agent CLI 自身要求人工确认的操作(如 rm)——相当于关掉 agent 特意保留的最后一道人工把关,并且是账户下所有对话(含正在运行的)一起生效。之后这些对话里这类请求将不再有任何人工审核,请确保你完全信任所有正在运行的任务接下来会做的所有事。确定要这样做吗?')) {
                   act('allow', undefined, undefined, 'account');
                 }
               }}
@@ -375,10 +392,14 @@ function ContextChip({ tokens }) {
 
 function ResultCard({ msg }) {
   const c = msg.content;
+  const hasCost = Number.isFinite(c.turn_cost_usd) && Number.isFinite(c.total_cost_usd);
   return (
     <div className="result-card">
       <span>{c.is_error ? '❌' : '🏁'} 本轮结束</span>
-      <span className="muted">{(c.duration_ms / 1000).toFixed(0)}s · {c.num_turns} turns · 本轮 ${c.turn_cost_usd?.toFixed(3)} · 累计 ${c.total_cost_usd?.toFixed(3)}(参考成本)</span>
+      <span className="muted">
+        {(c.duration_ms / 1000).toFixed(0)}s · {c.num_turns} turns
+        {hasCost && <> · 本轮 ${c.turn_cost_usd.toFixed(3)} · 累计 ${c.total_cost_usd.toFixed(3)}(参考成本)</>}
+      </span>
     </div>
   );
 }
@@ -415,6 +436,14 @@ function ModelChip({ task, isCreator }) {
     : profile ? profile.name
     : profiles ? '自定义模型' : '…';
 
+  // A profile now pins the agent CLI as well as the relay, and a session id
+  // means nothing to a different CLI — the server refuses such a switch with a
+  // 409, so don't offer it. Only once a session exists: before the first spawn
+  // there's nothing to be incompatible with.
+  const backend = task.backend || (profile ? (profile.backend || 'claude') : 'claude');
+  const locked = !!task.session_id;
+  const compatible = (b) => !locked || (b || 'claude') === backend;
+
   const pick = async (profileId) => {
     setBusy(true);
     try { await api.switchModel(task.id, profileId); setOpen(false); } catch (e) { alert(e.message); }
@@ -427,16 +456,19 @@ function ModelChip({ task, isCreator }) {
         className={`chip model-chip${isCreator ? ' clickable' : ''}`}
         title={isCreator ? '当前模型 — 点击切换(下一轮生效)' : '当前模型'}
         onClick={isCreator ? () => setOpen(o => !o) : undefined}
-      >🧠 {label}</span>
+      >🧠 {label}{backend === 'codex' ? ' · Codex' : ''}</span>
       {open && (
         <div className="model-picker">
-          <button type="button" disabled={busy} className={!pid ? 'selected' : ''} onClick={() => pick(null)}>默认配置</button>
-          {(profiles || []).map(p => (
+          {compatible('claude') && <button type="button" disabled={busy} className={!pid ? 'selected' : ''} onClick={() => pick(null)}>默认配置</button>}
+          {(profiles || []).filter(p => compatible(p.backend)).map(p => (
             <button type="button" key={p.id} disabled={busy} className={p.id === pid ? 'selected' : ''} onClick={() => pick(p.id)}>
               {p.name}<span className="muted"> · {p.model || p.baseUrl}</span>
             </button>
           ))}
-          <div className="muted model-picker-note">切换在下一轮对话生效,当前正在生成的回复不受影响</div>
+          <div className="muted model-picker-note">
+            切换在下一轮对话生效,当前正在生成的回复不受影响
+            {locked && <>{'　'}只列出了 {backend === 'codex' ? 'Codex' : 'Claude Code'} 档案:会话 ID 不能跨 agent 复用,换 agent 请新建一张卡。</>}
+          </div>
         </div>
       )}
     </span>
@@ -533,6 +565,30 @@ function AttachedImages({ images, onImageClick }) {
   );
 }
 
+// A send that's been stored by the cloud but not yet echoed back by the node.
+// Rendering it (instead of nothing) is the whole point: the text the user
+// typed stays visible and attributable while it's in flight, and a delivery
+// that ultimately fails becomes a button rather than a silent disappearance.
+function PendingMessage({ pending, canRetry, onRetry, onImageClick }) {
+  const failed = pending.state === 'failed';
+  return (
+    <div className={`msg-row user pending-msg${failed ? ' failed' : ''}`}>
+      <div className="msg-col">
+        {!!pending.text && <Md text={pending.text} />}
+        <AttachedImages images={pending.images} onImageClick={onImageClick} />
+        <div className="pending-msg-note muted">
+          {failed
+            ? '⚠️ 这条消息一直没能送到节点(节点长时间离线)。消息没有丢,可以重发。'
+            : '⏳ 已保存,正在等待节点接收…'}
+          {failed && canRetry && (
+            <button type="button" className="ghost" onClick={() => onRetry(pending.clientMessageId)}>重发</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function Message({ task, msg, resultByToolId, isCreator, onImageClick }) {
   switch (msg.role) {
     case 'user':
@@ -569,7 +625,7 @@ export function Message({ task, msg, resultByToolId, isCreator, onImageClick }) 
 
 const messageKey = message => message.historyKey ?? message.seq;
 
-export function ConversationMessages({ messages, task = null, isCreator = false, staticHistory = false, onImageClick = () => {} }) {
+export function ConversationMessages({ messages, task = null, isCreator = false, staticHistory = false, onImageClick = () => {}, hideEmpty = false }) {
   const resultByToolId = useMemo(() => {
     const map = new Map();
     for (const message of messages) if (message.role === 'tool_result') map.set(message.content.tool_use_id, message);
@@ -584,7 +640,7 @@ export function ConversationMessages({ messages, task = null, isCreator = false,
             toolUses={group.msgs.filter(message => message.role === 'tool_use')}
           />
         : <Message key={messageKey(group.msg)} task={task} msg={group.msg} resultByToolId={resultByToolId} isCreator={isCreator} onImageClick={onImageClick} />)}
-      {!messages.length && <div className="empty">暂无消息</div>}
+      {!messages.length && !hideEmpty && <div className="empty">暂无消息</div>}
     </>
   );
 }
@@ -597,11 +653,11 @@ export function TaskPane({ taskId, user, onClose }) {
   // (non-team) case a stale/incomplete task row shouldn't be able to break.
   const isCreator = !task?.owner_user_id || task.owner_user_id === user?.id;
   const messages = taskMessages(taskId);
+  const pendingMessages = taskPendingMessages(taskId);
   const [tab, setTab] = useState('chat');
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [sendError, setSendError] = useState(null);
-  const [attachments, setAttachments] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const [lightboxSrc, setLightboxSrc] = useState(null);
   useEffect(() => {
@@ -610,14 +666,8 @@ export function TaskPane({ taskId, user, onClose }) {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [lightboxSrc]);
-  // Object URLs don't get cleaned up on their own — revoke whatever's still
-  // pending if the pane closes/switches tasks without sending. Kept in a
-  // ref (not read from `attachments` directly in the cleanup) since a
-  // cleanup closure over a [taskId]-only effect would otherwise capture
-  // whatever `attachments` was as of the last taskId change, not the latest.
-  const attachmentsRef = useRef(attachments);
-  attachmentsRef.current = attachments;
-  useEffect(() => () => attachmentsRef.current.forEach(revoke), [taskId]);
+  const { attachments, addFiles, removeAttachment, clearAttachments, wireImages, hasError: attachmentError }
+    = useAttachments(taskId, setSendError);
   const [atBottom, setAtBottom] = useState(true);
   const [showSessionPicker, setShowSessionPicker] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -634,7 +684,6 @@ export function TaskPane({ taskId, user, onClose }) {
   // chat log, same text, same second — a stale-closure double-submit, not a
   // network retry). A ref updates immediately, so the second call sees it.
   const sendingRef = useRef(false);
-  const fileInputRef = useRef(null);
 
   useEffect(() => {
     loadedRef.current = false;
@@ -688,12 +737,12 @@ export function TaskPane({ taskId, user, onClose }) {
     // hundreds of imported-history messages) loses its instant jump and
     // animates instead, which is exactly the long-distance case most likely
     // to outrun a short suppression window.
-    if (!atBottom || !listRef.current || !messages.length) return;
+    if (!atBottom || !listRef.current || !(messages.length + pendingMessages.length)) return;
     const behavior = firstPinRef.current ? 'smooth' : 'instant';
     firstPinRef.current = true;
     scrollToBottom(behavior);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages.length, atBottom, tab]);
+  }, [messages.length, pendingMessages.length, atBottom, tab]);
 
   const onScroll = () => {
     const el = listRef.current;
@@ -705,30 +754,19 @@ export function TaskPane({ taskId, user, onClose }) {
   if (!taskId || !task) return null;
   const meta = STATUS_META[task.status] || { label: task.status, cls: '' };
 
-  const addFiles = async (fileList) => {
-    const files = [...fileList].filter(f => f.type.startsWith('image/'));
-    if (!files.length) return;
-    const room = MAX_IMAGES_PER_MESSAGE - attachments.length;
-    if (room <= 0) { setSendError(`最多同时附加 ${MAX_IMAGES_PER_MESSAGE} 张图片`); return; }
-    const results = await Promise.all(files.slice(0, room).map(f => addAttachment(f)));
-    setAttachments(prev => [...prev, ...results]);
-  };
-
-  const removeAttachment = (id) => {
-    setAttachments(prev => {
-      const found = prev.find(a => a.id === id);
-      if (found) revoke(found);
-      return prev.filter(a => a.id !== id);
-    });
-  };
-
   const send = async (e) => {
     e?.preventDefault();
     const t = text.trim();
-    if ((!t && !attachments.length) || attachments.some(a => a.error) || sendingRef.current) return;
+    if ((!t && !attachments.length) || attachmentError || sendingRef.current) return;
     sendingRef.current = true;
     setBusy(true);
     setSendError(null);
+    // Identifies this exact send everywhere it travels (cloud row, node
+    // event, this bubble) — see api.sendMessage. Generated before the request
+    // so a retry of a request whose response was lost reuses it and can never
+    // produce a second copy of the message.
+    const clientMessageId = newClientMessageId();
+    const images = wireImages();
     // alert() alone isn't enough here — found live: a message sent right
     // before the sender stepped away (network/device went to sleep right
     // after) failed silently, the alert had no one there to see it, and
@@ -737,13 +775,31 @@ export function TaskPane({ taskId, user, onClose }) {
     // coming back later still shows what happened. Attachments are left
     // intact on failure too, same reasoning — nothing lost, easy to retry.
     try {
-      await api.sendMessage(taskId, t, attachments.map(a => ({ mediaType: a.mediaType, data: a.data })));
+      await api.sendMessage(taskId, t, images, clientMessageId);
+      // The composer only clears once the cloud has *stored* the send. Until
+      // then the text stays where the user can see (and re-send) it — the
+      // old code cleared on a 200 that only meant "handed to a socket",
+      // which is how a message could disappear from the box without ever
+      // reaching the conversation.
       setText('');
-      attachments.forEach(revoke);
-      setAttachments([]);
+      clearAttachments();
+      // Show it immediately rather than waiting for the broadcast to come
+      // back: on a slow link that round trip is exactly the window where the
+      // composer looks like it swallowed the message. Harmless if the real
+      // one has already landed — the store drops a pending entry whose
+      // message it already has.
+      upsertPendingMessage(taskId, {
+        clientMessageId, text: t, images, state: 'pending', createdAt: Date.now(),
+      });
+      bump();
     } catch (e2) { setSendError(e2.message || '发送失败'); }
     sendingRef.current = false;
     setBusy(false);
+  };
+
+  const retryPending = async (clientMessageId) => {
+    setSendError(null);
+    try { await api.retryMessage(taskId, clientMessageId); } catch (e2) { setSendError(e2.message || '重发失败'); }
   };
 
   const startRename = () => { setTitleDraft(task.title); setEditingTitle(true); };
@@ -757,7 +813,11 @@ export function TaskPane({ taskId, user, onClose }) {
   const takeover = async () => {
     if (!task.session_id) { alert('会话尚未建立(任务还没真正开始),暂时无法接管。'); return; }
     const r = await api.lease(taskId, 'human').catch(e => alert(e.message));
-    if (r) alert(`已切换为 IDE 接管。\n\n在节点 ${r.nodeId} 上执行:\n  CLAUDE_CONFIG_DIR=~/agenthub/claude-config \\\n  ANTHROPIC_BASE_URL=<中转站> ANTHROPIC_API_KEY=<key> \\\n  claude --resume ${r.sessionId}\n\n(会话文件存放在 executor 的 claude-config 目录,不带 CLAUDE_CONFIG_DIR 将找不到会话。)在 IDE 里聊的内容,点「归还」时会自动同步回这里的对话记录。完成后点「归还」。`);
+    // The exact command depends on the task's backend *and* on paths only that
+    // node knows (its isolated CLAUDE_CONFIG_DIR / CODEX_HOME), so the executor
+    // posts it into the conversation as a system message the moment the lease
+    // lands. Repeating a guessed version here is how it would go stale.
+    if (r) alert(`已切换为 IDE 接管(节点 ${r.nodeId},会话 ${r.sessionId})。\n\n接管命令已发到下面的对话里 —— 直接复制那一行到节点的终端执行即可(里面的环境变量是必需的,少了会找不到会话),另外记得带上中转站的 base url / api key。\n\n在 IDE 里聊的内容,点「归还」时会自动同步回这里的对话记录。完成后点「归还」。`);
   };
 
   return (
@@ -786,8 +846,10 @@ export function TaskPane({ taskId, user, onClose }) {
             {task.lease === 'human' && <span className="chip st-waiting">IDE 接管中</span>}
             <ModelChip task={task} isCreator={isCreator} />
             <span className="muted">{task.node_id}</span>
-            <span className="muted">${(task.cost_usd ?? 0).toFixed(3)}</span>
-            {!!task.context_tokens && <ContextChip tokens={task.context_tokens} />}
+            {task.backend !== 'codex' && <span className="muted">${(task.cost_usd ?? 0).toFixed(3)}</span>}
+            {!!task.context_tokens && (task.backend === 'codex'
+              ? <span className="chip ctx-chip ctx-ok" title={`当前上下文约 ${task.context_tokens.toLocaleString()} tokens`}>上下文 {task.context_tokens.toLocaleString()} tokens</span>
+              : <ContextChip tokens={task.context_tokens} />)}
           </div>
         </div>
         <nav className="tabs">
@@ -801,7 +863,16 @@ export function TaskPane({ taskId, user, onClose }) {
       {tab === 'chat' && (
         <>
           <div className="chat-list" ref={listRef} onScroll={onScroll}>
-            <ConversationMessages messages={messages} task={task} isCreator={isCreator} onImageClick={setLightboxSrc} />
+            <ConversationMessages
+              messages={messages} task={task} isCreator={isCreator} onImageClick={setLightboxSrc}
+              hideEmpty={pendingMessages.length > 0}
+            />
+            {pendingMessages.map(pending => (
+              <PendingMessage
+                key={pending.clientMessageId} pending={pending}
+                canRetry={task.lease !== 'human'} onRetry={retryPending} onImageClick={setLightboxSrc}
+              />
+            ))}
             {task.status === 'running' && <ThinkingIndicator />}
           </div>
           {!atBottom && (
@@ -853,7 +924,7 @@ export function TaskPane({ taskId, user, onClose }) {
           )}
           {isCreator && task.status === 'idle' && task.lease === 'daemon' && (
             <div className="review-bar">
-              <span>此会话可能在看板之外继续过(如终端里的 --resume)</span>
+              <span>此会话可能在看板之外继续过(如在终端里 resume 过)</span>
               <button onClick={() => api.resyncSession(taskId).catch(e => alert(e.message))}>🔄 刷新历史</button>
             </div>
           )}
@@ -869,38 +940,20 @@ export function TaskPane({ taskId, user, onClose }) {
             onDragLeave={() => setDragOver(false)}
             onDrop={e => { e.preventDefault(); setDragOver(false); if (task.lease !== 'human') addFiles(e.dataTransfer.files); }}
           >
-            {!!attachments.length && (
-              <div className="composer-attachments">
-                {attachments.map(a => (
-                  <div key={a.id} className={`attachment-thumb${a.error ? ' error' : ''}`} title={a.error || a.name}>
-                    {a.previewUrl ? <img src={a.previewUrl} alt={a.name} /> : <span className="attachment-err-icon">⚠️</span>}
-                    <button type="button" className="remove" onClick={() => removeAttachment(a.id)} aria-label="移除图片">✕</button>
-                  </div>
-                ))}
-              </div>
-            )}
+            <AttachmentStrip attachments={attachments} onRemove={removeAttachment} />
             <div className="composer-row">
-              <input
-                type="file" accept="image/*" multiple ref={fileInputRef} style={{ display: 'none' }}
-                onChange={e => { addFiles(e.target.files); e.target.value = ''; }}
-              />
-              <button
-                type="button" className="ghost attach-btn" title="添加图片" disabled={task.lease === 'human' || busy}
-                onClick={() => fileInputRef.current?.click()}
-              >📎</button>
+              <AttachButton onFiles={addFiles} disabled={task.lease === 'human' || busy} />
               <textarea
                 value={text} onChange={e => setText(e.target.value)} rows={2}
                 placeholder={task.lease === 'human' ? 'IDE 接管中,看板只读' : '发消息继续对话…(Enter 发送,Shift+Enter 换行,可直接粘贴/拖拽图片)'}
                 disabled={task.lease === 'human' || busy}
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }}
                 onPaste={e => {
-                  const files = [...(e.clipboardData?.items || [])]
-                    .filter(i => i.kind === 'file' && i.type.startsWith('image/'))
-                    .map(i => i.getAsFile()).filter(Boolean);
+                  const files = imageFilesFromPaste(e);
                   if (files.length) { e.preventDefault(); addFiles(files); }
                 }}
               />
-              <button disabled={busy || task.lease === 'human' || (!text.trim() && !attachments.length) || attachments.some(a => a.error)}>发送</button>
+              <button disabled={busy || task.lease === 'human' || (!text.trim() && !attachments.length) || attachmentError}>发送</button>
             </div>
           </form>
           {lightboxSrc && (
@@ -924,9 +977,11 @@ export function TaskPane({ taskId, user, onClose }) {
             <dt>权限模式</dt><dd>{task.permission_mode}{task.permission_mode === 'bypassPermissions' && ' ⚠️'}</dd>
             <dt>当前模型</dt><dd><ModelChip task={task} isCreator={isCreator} /></dd>
             {!!task.auto_decide_all && (
-              <><dt>强制确认自动批准</dt><dd className="err">已开启 ⚠️ — 包括 claude CLI 自身要求人工确认的操作(如 rm)</dd></>
+              <><dt>强制确认自动批准</dt><dd className="err">已开启 ⚠️ — 包括 agent CLI 自身要求人工确认的操作(如 rm)</dd></>
             )}
-            <dt>成本(参考)</dt><dd>${(task.cost_usd ?? 0).toFixed(4)}</dd>
+            {task.backend === 'codex'
+              ? <><dt>上下文 tokens</dt><dd>{task.context_tokens?.toLocaleString() || '—'}</dd></>
+              : <><dt>成本(参考)</dt><dd>${(task.cost_usd ?? 0).toFixed(4)}</dd></>}
             <dt>创建于</dt><dd>{new Date(task.created_at).toLocaleString()}</dd>
             {task.last_error && <><dt>最近错误</dt><dd className="err">{task.last_error}</dd></>}
           </dl>
@@ -935,7 +990,7 @@ export function TaskPane({ taskId, user, onClose }) {
             {isCreator && (task.lease === 'daemon'
               ? <button onClick={takeover}>⌨️ 在 IDE 中接管</button>
               : <button onClick={() => api.lease(taskId, 'daemon').catch(e => alert(e.message))}>↩️ 归还给看板</button>)}
-            {isCreator && task.repo_url && !['starting', 'running', 'waiting_human'].includes(task.status) &&
+            {isCreator && task.backend !== 'codex' && task.repo_url && !['starting', 'running', 'waiting_human'].includes(task.status) &&
               <button className="ghost" onClick={() => setShowSessionPicker(true)}>🔀 切换会话</button>}
             {isCreator && !['done', 'failed', 'cancelled'].includes(task.status) &&
               <button className="deny" onClick={() => confirm('确认取消任务?') && api.cancel(taskId).catch(e => alert(e.message))}>✕ 取消任务</button>}

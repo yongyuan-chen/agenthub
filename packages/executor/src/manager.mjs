@@ -1,8 +1,10 @@
 // SessionManager: owns task lifecycle on this node. Local SQLite is the truth;
 // every externally visible change is emitted as an outbox event (via emit()).
-import { ClaudeSession } from './session.mjs';
 import { prepareWorkspace, collectDiff } from './worktree.mjs';
-import { importExternalSession, transcriptToEvents, nativeSessionFile, countTranscriptLines, transcriptEventsSince, findExternalSessionFile, cwdOf, MAX_IMPORT_EVENTS, lastAssistantUsage } from './sessions.mjs';
+import { MAX_IMPORT_EVENTS } from './sessions.mjs';
+import { backendFor, backendByName, DEFAULT_BACKEND } from './backends.mjs';
+import { TRANSIENT_ERROR_CODES, codexHomeFor } from './codex-session.mjs';
+import { readAutomations, firstRruleMatchIn } from './codex-automations.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -33,6 +35,20 @@ const CONTEXT_OVERFLOW_PATTERN = /prompt is too long|input length and .?max_toke
 // actually reclaiming enough space and a human needs to look. The counter
 // resets whenever a turn settles cleanly (see the 'review' branch).
 const MAX_OVERFLOW_COMPACT_ATTEMPTS = 2;
+
+// A turn that ended at a *turn cap* rather than at a problem: the CLI reports
+// subtype 'error_max_turns' after N agentic round-trips, with the session and
+// everything the turn already did still perfectly intact. AgentHub passes no
+// --max-turns (see session.mjs's buildClaudeArgs), but a cap can still arrive
+// from outside it — a node running older code that did pass one, an agent
+// definition's `maxTurns`, a future CLI default. Found live: a task died this
+// way 101 turns and $6 into a refactor, and the only offer was a manual retry
+// that would have *resent the original prompt* into a half-finished job.
+// Recovery is mechanical and cheap: tell it to carry on. Bounded, with the
+// counter reset on any clean settle, so an agent that's genuinely spinning
+// can't turn this into unbounded spend.
+const MAX_TURN_CAP_CONTINUATIONS = 3;
+const TURN_CAP_CONTINUE_PROMPT = '（上一轮是被回合数上限截断的,不是出错)请从刚才停下的地方继续,把任务做完。';
 
 // ---- scheduled tasks (.claude/scheduled_tasks.json) ----
 // The claude CLI's CronCreate tool persists durable jobs to
@@ -101,9 +117,11 @@ function firstCronMatchIn(expr, fromMs, toMs) {
 // retry_last_input (and spec) store a plain string for the common
 // text-only case, byte-identical to before image attachments existed — only
 // JSON-encoded when images are actually attached, so every existing
-// plain-text code path (including spec, which never carries images) is
-// unaffected. decodeInput never throws: a legacy/plain value that isn't
-// JSON just comes back as {text: raw, images: []}.
+// plain-text code path is unaffected. decodeInput never throws: a legacy/plain
+// value that isn't JSON just comes back as {text: raw, images: []}. spec goes
+// through the same encoding when the first message of a new conversation
+// carried attachments (start_task.images) — _spawn decodes whichever of
+// retry_last_input/spec it ends up sending, so both get images for free.
 function encodeInput(text, images) {
   return images?.length ? JSON.stringify({ text, images }) : text;
 }
@@ -123,21 +141,25 @@ export class SessionManager {
    * @param {object} config
    * @param {import('./db.mjs').LocalDb} db
    * @param {(taskId:string, seq:number, ev:object) => void} onEvent  notify link that outbox has news
-   * @param {(opts:object) => ClaudeSession=} sessionFactory  injectable for tests
+   * @param {(opts:object) => object=} sessionFactory  injectable for tests
    */
   constructor(config, db, onEvent, sessionFactory) {
     this.config = config;
     this.db = db;
     this.onEvent = onEvent;
-    this.sessionFactory = sessionFactory ?? ((opts) => new ClaudeSession(opts));
-    this.sessions = new Map();       // taskId -> ClaudeSession
+    // opts.backend names the adapter (see backends.mjs) — resolving the class
+    // here rather than at the call site keeps _spawn identical for both.
+    this.sessionFactory = sessionFactory ?? ((opts) => new (backendByName(opts.backend).Session)(opts));
+    this.sessions = new Map();       // taskId -> live session
     this.pendingDecisions = new Map(); // requestId -> {resolve, timer, taskId}
     this.startQueue = [];            // fresh taskIds waiting for a slot
     this.resumeQueue = [];           // taskIds to resume (daemon restart) waiting for a slot
     this._preparing = 0;             // workspaces being cloned right now
     this._autoRetryTimers = new Map(); // taskId -> setTimeout handle
     this._compactRecoveries = new Map(); // taskId -> overflow-recovery attempts this failure episode
+    this._turnCapContinuations = new Map(); // taskId -> turn-cap continuations this episode (see _maybeContinueAfterTurnCap)
     this._cronChecked = new Map();       // `${taskId}:${jobId}` -> last evaluated ms (see _sweepScheduledTasks)
+    this._warned = new Set();            // dedupe for once-per-process warnings (see _warnOnce)
     this._idleSweeper = setInterval(() => this._sweepIdle(), 60_000);
     if (this._idleSweeper.unref) this._idleSweeper.unref();
   }
@@ -195,17 +217,24 @@ export class SessionManager {
   handleCommand(cmd) {
     switch (cmd.t) {
       case 'start_task': return this.startTask(cmd.task);
-      case 'user_message': return this.userMessage(cmd.taskId, cmd.text, cmd.images);
+      case 'user_message': return this.userMessage(cmd.taskId, cmd.text, cmd.images, cmd.clientMessageId);
       case 'decision': return this.decide(cmd.taskId, cmd.requestId, cmd.behavior, cmd.message, cmd.updatedInput);
       case 'cancel': return this.cancel(cmd.taskId);
       case 'lease': return this.setLease(cmd.taskId, cmd.lease);
-      case 'config': return this.updateAnthropicConfig(cmd.anthropic);
+      case 'config': return this.updateProviderConfig(cmd.provider ?? cmd.anthropic);
       case 'switch_session': return this.switchSession(cmd.taskId, cmd.sessionId);
       case 'retry_task': return this.retryTask(cmd.taskId, cmd.opts || {});
       case 'resync_session': return this.resyncSession(cmd.taskId);
       case 'set_permission_mode': return this.setPermissionMode(cmd.taskId, cmd.permissionMode);
       case 'set_auto_decide_all': return this.setAutoDecideAll(cmd.taskId, cmd.autoDecideAll);
-      case 'set_anthropic_override': return this.setAnthropicOverride(cmd.taskId, cmd.anthropic);
+      case 'set_provider_override': return this.setProviderOverride(cmd.taskId, cmd.provider, cmd.backend);
+      // Legacy wire name for the same thing, from before model overrides grew
+      // a backend to pin (payload under `anthropic`, no backend field). A
+      // node updates independently of the cloud, so a new executor talking to
+      // a not-yet-redeployed worker must still honour a model switch instead
+      // of dropping it — found live as a stream of "[manager] unknown command
+      // set_anthropic_override" the moment this node restarted onto new code.
+      case 'set_anthropic_override': return this.setProviderOverride(cmd.taskId, cmd.anthropic, cmd.backend);
       default: console.warn('[manager] unknown command', cmd.t);
     }
   }
@@ -215,15 +244,15 @@ export class SessionManager {
   // never written back to the local config file — so a restart simply waits
   // for the next hello_ok to repopulate it. Already-running CLI child
   // processes keep their old env until they next respawn.
-  updateAnthropicConfig(anthropic) {
-    if (!anthropic) return;
-    this.config.anthropic = { ...this.config.anthropic, ...anthropic };
-    console.log('[manager] anthropic relay config updated from cloud');
+  updateProviderConfig(provider) {
+    if (!provider) return;
+    this.config.provider = { ...this.config.provider, ...provider };
+    console.log('[manager] model relay config updated from cloud');
   }
 
-  // Attach this task to a different (typically externally-created) claude
-  // session going forward. Stops any live process first — the next message
-  // resumes fresh with the new session id via the normal userMessage() path.
+  // Attach this task to a different (typically externally-created) session
+  // going forward. Stops any live process first — the next message resumes
+  // fresh with the new session id via the normal userMessage() path.
   switchSession(taskId, sessionId) {
     const session = this.sessions.get(taskId);
     if (session) { session.kill(); this.sessions.delete(taskId); }
@@ -236,8 +265,7 @@ export class SessionManager {
     // already records its real cwd, so use that instead (found live: a task
     // switched onto an externally-created session kept the old worktree
     // dir, and every turn after the switch failed this exact way).
-    const file = findExternalSessionFile(sessionId, this.config.claudeProjectsRoot);
-    const sessionCwd = file ? cwdOf(file) : null;
+    const sessionCwd = backendFor(this.db.getTask(taskId)).sessionCwd(this.config, sessionId);
     const patch = { sessionId, realConfigDir: 1 };
     if (sessionCwd && fs.existsSync(sessionCwd)) patch.dir = sessionCwd;
     this.db.patchTask(taskId, patch);
@@ -259,14 +287,12 @@ export class SessionManager {
   // (see resyncSession below) only picks up what's genuinely new, instead of
   // re-importing everything already shown here.
   _importHistory(taskId, sessionId) {
-    // config.claudeProjectsRoot is undefined in real deployments (falls back
-    // to findExternalSessionFile's own ~/.claude/projects default) — only
-    // set by tests, to avoid ever touching a real home directory.
     const task = this.db.getTask(taskId);
-    const file = findExternalSessionFile(sessionId, this.config.claudeProjectsRoot, task?.source_cwd || null);
+    const tx = backendFor(task);
+    const file = tx.externalTranscriptFile(this.config, task, sessionId);
     if (!file) return;
-    this.db.patchTask(taskId, { syncedLines: countTranscriptLines(file) });
-    const events = transcriptToEvents(file);
+    this.db.patchTask(taskId, { syncedLines: tx.countLines(file) });
+    const events = tx.toEvents(file);
     if (!events.length) return;
     this.emit(taskId, { k: 'msg', role: 'system', content: { text: `以下是导入的历史会话(最近 ${events.length} 条)` } });
     for (const ev of events) this.emit(taskId, { k: 'msg', role: ev.role, content: ev.content });
@@ -287,10 +313,16 @@ export class SessionManager {
     this.db.upsertTask({
       // No hardcoded 'main' fallback — prepareWorkspace() detects the
       // clone's actual default branch when this is left unset.
-      taskId: task.id, title: task.title, spec: task.spec, status: 'queued',
+      // Images attached to the first message ride inside spec via the same
+      // encoding retry_last_input uses, so the whole first-send path (and any
+      // later retry of it) needs no separate images column — see encodeInput.
+      taskId: task.id, title: task.title, spec: encodeInput(task.spec, task.images), status: 'queued',
       repoUrl: task.repoUrl ?? null, baseBranch: task.baseBranch || null,
       permissionMode: task.permissionMode ?? 'acceptEdits', sessionId: task.sessionId ?? null,
-      anthropicOverride: task.anthropic ?? null,
+      // v1 Worker payloads call this `anthropic`; a checkout node can restart
+      // into v2 executor code before that Worker is deployed, so carry either
+      // spelling into the unified provider_override column.
+      providerOverride: task.provider ?? task.anthropic ?? null, backend: task.backend ?? null,
       // Adopted from an existing external session -> resume it directly
       // against the real ~/.claude location going forward, not an isolated
       // copy — see the real_config_dir column comment in db.mjs.
@@ -404,40 +436,35 @@ export class SessionManager {
     // A task pinned to a specific model profile at creation time keeps using
     // it even if the account-wide default changes later; otherwise falls
     // back to the node's shared config exactly as before.
-    const override = t.anthropic_override ? JSON.parse(t.anthropic_override) : null;
-    const effectiveConfig = override ? { ...this.config, anthropic: override } : this.config;
-    if (!effectiveConfig.anthropic?.baseUrl || !effectiveConfig.anthropic?.apiKey) {
+    const override = t.provider_override ? JSON.parse(t.provider_override) : null;
+    const effectiveConfig = override ? { ...this.config, provider: override } : this.config;
+    if (!effectiveConfig.provider?.baseUrl || !effectiveConfig.provider?.apiKey) {
       this.setStatus(taskId, 'failed', {
         error: '节点尚未收到模型中转站配置 — 请在网页端「设置」里保存 Base URL / API Key 后重试',
       });
       return;
     }
     const resumeSessionId = fresh ? null : (t.session_id || null);
-    // real_config_dir tasks resume directly against the real ~/.claude
-    // location (session.mjs skips setting CLAUDE_CONFIG_DIR entirely for
-    // these) — nothing to copy, and copying would just recreate the stale
-    // isolated-fork problem this flag exists to avoid. Only non-adopted
-    // tasks still need the isolated copy step.
-    if (resumeSessionId && !t.real_config_dir) {
-      // Best-effort, idempotent: only actually copies a file for sessions
-      // that came from outside AgentHub (~/.claude) — native AgentHub
-      // sessions already live under the isolated config dir and this just
-      // no-ops. targetCwd = t.dir is critical here: this is the directory
-      // the CLI is about to actually spawn in (see session.mjs's `cwd:
-      // t.dir`), and --resume only looks in the project folder matching
-      // *that* directory's slug — see slugifyForResumeCwd's comment in
-      // sessions.mjs for how this was verified against the real CLI.
-      importExternalSession(resumeSessionId, this.config.workRoot, t.dir, this.config.claudeProjectsRoot);
-    }
+    // Best-effort, idempotent: copies a session that came from outside
+    // AgentHub into this node's isolated config home, so the CLI can find it
+    // to resume. A no-op for sessions AgentHub created itself, and skipped
+    // entirely for real_config_dir tasks — those resume against the real
+    // location, and copying would recreate the stale-fork problem that flag
+    // exists to avoid. (What "find it" means differs per backend, which is
+    // why this lives in the adapter — see backends.mjs.)
+    if (resumeSessionId) backendFor(t).prepareResume(this.config, t, resumeSessionId);
     const session = this.sessionFactory({
+      backend: backendFor(t).name,
       config: effectiveConfig,
       cwd: t.dir,
+      taskId,
       resumeSessionId,
       realConfigDir: !!t.real_config_dir,
       permissionMode: t.permission_mode || 'acceptEdits',
       allowRootBypass: !!t.allow_root_bypass,
       onMessage: (msg) => this._onSdkMessage(taskId, msg),
       onPermission: (req) => this._onPermission(taskId, req),
+      onWithdrawPermission: (requestId) => this._withdrawPermission(taskId, requestId),
       onExit: (err) => this._onSessionExit(taskId, err),
     });
     this.sessions.set(taskId, session);
@@ -485,6 +512,12 @@ export class SessionManager {
             this.db.patchTask(taskId, { sessionId: msg.session_id });
             this.emit(taskId, { k: 'session', sessionId: msg.session_id });
           }
+        } else if (msg.subtype === 'compacted') {
+          // History was just summarized away, so the stored context estimate
+          // is now far too high. Left stale it would re-trigger auto-compact
+          // on the very next turn, before any fresh usage reading lands.
+          this.db.patchTask(taskId, { contextTokens: null });
+          this.emit(taskId, { k: 'msg', role: 'system', content: { text: '历史已压缩。' } });
         }
         break;
       case 'assistant': {
@@ -539,34 +572,45 @@ export class SessionManager {
         // ourselves) is done — clear the in-flight guard so a future result
         // can trigger auto-compact again if it's still needed.
         if (session) session.autoCompacting = false;
-        const reported = msg.total_cost_usd ?? 0;
-        const prevReported = session?.lastReportedCost ?? 0;
-        const delta = reported >= prevReported ? reported - prevReported : reported;
-        if (session) session.lastReportedCost = reported;
-        const cost = (t.cost_usd ?? 0) + delta;
-        this.db.patchTask(taskId, { costUsd: cost });
+        // Codex reports token usage but never a dollar amount, so a running
+        // "$0.00" on the Info tab would be an outright lie — skip cost
+        // accounting for backends that don't report it (caps.reportsCost).
+        const reportsCost = session?.caps?.reportsCost !== false;
+        let delta = 0, cost = t.cost_usd ?? 0;
+        if (reportsCost) {
+          const reported = msg.total_cost_usd ?? 0;
+          const prevReported = session?.lastReportedCost ?? 0;
+          delta = reported >= prevReported ? reported - prevReported : reported;
+          if (session) session.lastReportedCost = reported;
+          cost += delta;
+          this.db.patchTask(taskId, { costUsd: cost });
+        }
         // Re-read from disk as the authoritative source (see lastAssistantUsage's
         // comment) — the live per-message value above can't be trusted alone.
         // real_config_dir tasks resume against the real file directly, not
         // the isolated copy — read usage from wherever they actually live.
-        const usageFile = !t.session_id ? null
-          : t.real_config_dir ? findExternalSessionFile(t.session_id, this.config.claudeProjectsRoot, t.source_cwd || null)
-          : t.dir ? nativeSessionFile(this.config.workRoot, t.dir, t.session_id) : null;
+        const tx = backendFor(t);
+        const usageFile = tx.transcriptFile(this.config, t);
         if (usageFile) {
-          const contextTokens = lastAssistantUsage(usageFile);
-          if (contextTokens) {
-            this.db.patchTask(taskId, { contextTokens });
-            this.emit(taskId, { k: 'usage', contextTokens });
+          const usage = tx.usageOf(usageFile);
+          if (usage?.contextTokens) {
+            this.db.patchTask(taskId, { contextTokens: usage.contextTokens });
+            this.emit(taskId, { k: 'usage', contextTokens: usage.contextTokens });
           }
+          // The rollout records the model's real window; keeping it on the
+          // session is what lets _maybeAutoCompact use the actual limit
+          // instead of a hardcoded constant.
+          if (usage?.contextWindow && session?.caps) session.caps.contextWindow = usage.contextWindow;
         }
         this.emit(taskId, {
           k: 'msg', role: 'result',
           content: {
             subtype: msg.subtype, duration_ms: msg.duration_ms, num_turns: msg.num_turns,
-            turn_cost_usd: delta, total_cost_usd: cost, is_error: msg.is_error ?? false,
+            ...(reportsCost ? { turn_cost_usd: delta, total_cost_usd: cost } : {}),
+            is_error: msg.is_error ?? false,
           },
         });
-        this.emit(taskId, { k: 'cost', costUsd: cost });
+        if (reportsCost) this.emit(taskId, { k: 'cost', costUsd: cost });
         const cur = this.db.getTask(taskId);
         // Normally only 'running' (a message was actually sent and we're
         // waiting on that turn) — but a resumed session left 'idle' with
@@ -575,7 +619,10 @@ export class SessionManager {
         // fail internally before ever receiving a turn). Without idle/
         // starting included here, that failure had nowhere to go — the task
         // just sat at 'idle' looking fine while actually being dead.
-        let compacting = false;
+        // "This turn isn't over yet" — a recovery (compact, resend, or a
+        // turn-cap continuation) took the wheel, so the task must not settle
+        // at 'review' and its session must stay alive below.
+        let continuing = false;
         if (['running', 'idle', 'starting'].includes(cur.status)) {
           if (msg.is_error || msg.subtype !== 'success') {
             // msg.result is often empty for internal failures (e.g. subtype
@@ -589,11 +636,13 @@ export class SessionManager {
             // Context-overflow deaths get their own mechanical recovery
             // (compact then resend — retrying as-is can never succeed);
             // everything else keeps the failed + transient-auto-retry path.
-            if (this._maybeOverflowRecover(taskId, errorText)) {
-              compacting = true;
+            if (this._maybeOverflowRecover(taskId, errorText, msg.error_code)) {
+              continuing = true;
+            } else if (msg.subtype === 'error_max_turns' && this._maybeContinueAfterTurnCap(taskId)) {
+              continuing = true;
             } else {
               this.setStatus(taskId, 'failed', { error: errorText });
-              this._scheduleAutoRetry(taskId, errorText);
+              this._scheduleAutoRetry(taskId, errorText, msg.error_code);
             }
           } else if (session?.pendingResendAfterCompact) {
             // The turn that just succeeded was an overflow-recovery /compact
@@ -608,11 +657,11 @@ export class SessionManager {
             this.emit(taskId, { k: 'msg', role: 'system', content: { text: '压缩完成,自动重发被中断的输入继续任务…' } });
             session.send(rText, rImages);
             this.setStatus(taskId, 'running');
-            compacting = true; // keep the session alive (real_config_dir would otherwise kill it below)
+            continuing = true; // keep the session alive (real_config_dir would otherwise kill it below)
           } else if (this._maybeAutoCompact(taskId, session)) {
             // Compaction turn kicked off instead of settling at 'review' —
             // its own 'result' will re-enter this handler and finish normally.
-            compacting = true;
+            continuing = true;
           } else {
             this._publishDiff(taskId);
             // A turn that completes cleanly resolves any prior failure —
@@ -621,6 +670,7 @@ export class SessionManager {
             this.setStatus(taskId, 'review', { clearError: true });
             this._cancelAutoRetry(taskId);
             this._compactRecoveries.delete(taskId);
+            this._turnCapContinuations.delete(taskId);
           }
         }
         // The turn that just finished already wrote everything emitted above
@@ -633,7 +683,7 @@ export class SessionManager {
         // streamed live. Found live: every real_config_dir turn was getting
         // duplicated within a minute — reported as "发了一次继续,看到了两个继续".
         if (t.real_config_dir && usageFile) {
-          this.db.patchTask(taskId, { syncedLines: countTranscriptLines(usageFile) });
+          this.db.patchTask(taskId, { syncedLines: tx.countLines(usageFile) });
         }
         // real_config_dir tasks never keep a session warm between turns —
         // unlike the isolated-copy model, the real ~/.claude file can also
@@ -644,7 +694,7 @@ export class SessionManager {
         // stop the user from having a live VS Code window open at the same
         // literal instant, which is an inherent `claude --resume` limitation
         // with or without AgentHub.)
-        if (t.real_config_dir && !compacting && session) {
+        if (t.real_config_dir && !continuing && session) {
           session.kill();
           this.sessions.delete(taskId);
         }
@@ -655,42 +705,46 @@ export class SessionManager {
     }
   }
 
-  // Verified directly against the real CLI: sending the literal text
-  // "/compact" over stream-json input is recognized as the same local
-  // command the interactive TUI's /compact runs (confirmed via a
-  // 'compact_boundary' system entry with real pre/postTokens in the on-disk
-  // transcript), not just forwarded to the model as plain text. This exists
-  // because some ANTHROPIC_BASE_URL relays report all-zero usage on every
-  // streamed message (see lastAssistantUsage's comment) — the CLI's own
-  // built-in auto-compact is gated on that same (broken, for this relay)
-  // usage signal, so it never fires on its own and a long-running session
-  // eventually hits a hard "prompt too long" API error with no warning.
-  // AgentHub compensates by tracking context size itself (via the reliable
-  // disk-transcript read) and manually issuing the same /compact command
+  // Compact the conversation before it hits the model's hard context wall.
+  // This exists because some relays report all-zero usage on every streamed
+  // message (see lastAssistantUsage's comment) — the claude CLI's own
+  // built-in auto-compact is gated on that same (broken, for such a relay)
+  // signal, so it never fires and a long-running session eventually dies on
+  // a "prompt too long" API error with no warning. AgentHub compensates by
+  // tracking context size itself from the on-disk transcript and compacting
   // once it gets large, so a relayed session behaves like a direct-API one
   // instead of requiring the user to start a fresh conversation.
+  // How the compaction is actually performed is the session's business (see
+  // ClaudeSession.compact / CodexSession.compact) — one sends the CLI's
+  // literal /compact command, the other calls a real RPC.
   _maybeAutoCompact(taskId, session) {
     if (!session?.alive || session.autoCompacting) return false;
-    // This whole mechanism exists solely for relays whose *streamed* usage
-    // is all zeros (the CLI's own auto-compact is gated on that signal). If
-    // this CLI process has reported real streamed usage even once (verified
+    // The streamed-usage escape hatch only applies to the claude path: if
+    // that CLI process has reported real streamed usage even once (verified
     // live 2026-08 against the current relay: real token counts now come
     // through), its built-in auto-compact — which unlike this turn-end
     // fallback also fires mid-turn — is functional, and doubling up would
-    // just burn an extra summarization turn. Per-process on purpose: the
-    // flag can't go stale across a model/profile switch, since that always
-    // spawns a fresh CLI process.
-    if (session.streamedUsageSeen) return false;
+    // just burn an extra summarization turn. A backend that reports its own
+    // context window has no such built-in fallback to defer to, so this
+    // check is deliberately skipped there rather than relying on the
+    // ordering accident of whether a usage message happened to arrive first.
+    // Per-process on purpose: the flag can't go stale across a model/profile
+    // switch, since that always spawns a fresh CLI process.
+    const window = session.caps?.contextWindow ?? null;
+    if (!window && session.streamedUsageSeen) return false;
     if (session.lastAutoCompactAt && Date.now() - session.lastAutoCompactAt < 60_000) return false;
+    // A known window gives a real threshold; without one, fall back to the
+    // constant sized for the ~200k window most Sonnet/Opus models share.
+    const threshold = window ? Math.floor(window * 0.6) : AUTO_COMPACT_THRESHOLD_TOKENS;
     const t = this.db.getTask(taskId);
-    if (!t?.context_tokens || t.context_tokens < AUTO_COMPACT_THRESHOLD_TOKENS) return false;
+    if (!t?.context_tokens || t.context_tokens < threshold) return false;
     session.autoCompacting = true;
     session.lastAutoCompactAt = Date.now();
     this.emit(taskId, {
       k: 'msg', role: 'system',
       content: { text: `上下文已达约 ${t.context_tokens.toLocaleString()} tokens,自动压缩历史以避免中断…` },
     });
-    session.send('/compact');
+    session.compact();
     this.setStatus(taskId, 'running');
     return true;
   }
@@ -701,8 +755,14 @@ export class SessionManager {
   // settles (see the pendingResendAfterCompact branch in the 'result'
   // handler) resend the exact input that failed. Returns true when it took
   // over the failure; false means fall through to the normal failed path.
-  _maybeOverflowRecover(taskId, errorText) {
-    if (!CONTEXT_OVERFLOW_PATTERN.test(errorText)) return false;
+  // errorCode, when present, is the backend's own structured failure reason
+  // (codex's CodexErrorInfo enum) — strictly better than guessing from the
+  // message text, so it wins outright when the backend supplies one.
+  _maybeOverflowRecover(taskId, errorText, errorCode = null) {
+    const overflow = errorCode
+      ? errorCode === 'contextWindowExceeded'
+      : CONTEXT_OVERFLOW_PATTERN.test(errorText);
+    if (!overflow) return false;
     const t = this.db.getTask(taskId);
     // Nothing recorded to resend (e.g. the overflow happened on an
     // unprompted resume) — compacting alone would leave the task looking
@@ -734,7 +794,34 @@ export class SessionManager {
     session.autoCompacting = true; // reuse the in-flight guard; cleared on its result
     session.lastAutoCompactAt = Date.now();
     session.pendingResendAfterCompact = t.retry_last_input;
-    session.send('/compact');
+    session.compact();
+    this.setStatus(taskId, 'running');
+    return true;
+  }
+
+  // The turn didn't fail — it was cut off at a turn cap, with the session and
+  // all the work it already did still intact (see MAX_TURN_CAP_CONTINUATIONS).
+  // So: don't fail the task and don't resend the original input (that would
+  // restart a half-finished job); just tell it to carry on. Returns true when
+  // it took over, false to fall through to the normal failed path.
+  _maybeContinueAfterTurnCap(taskId) {
+    const attempts = this._turnCapContinuations.get(taskId) ?? 0;
+    if (attempts >= MAX_TURN_CAP_CONTINUATIONS) return false;
+    let session = this.sessions.get(taskId);
+    if (!session?.alive) {
+      // Resumed with no first message: retry_last_input must keep pointing at
+      // the real input, not at the continuation nudge.
+      const t = this.db.getTask(taskId);
+      this._spawn(taskId, null, { fresh: !t?.session_id });
+      session = this.sessions.get(taskId);
+      if (!session) return true; // _spawn already failed the task with its own, more specific error
+    }
+    this._turnCapContinuations.set(taskId, attempts + 1);
+    this.emit(taskId, {
+      k: 'msg', role: 'system',
+      content: { text: `本轮被 CLI 的回合数上限截断(不是出错),自动让它接着做完(第 ${attempts + 1}/${MAX_TURN_CAP_CONTINUATIONS} 次)…` },
+    });
+    session.send(TURN_CAP_CONTINUE_PROMPT);
     this.setStatus(taskId, 'running');
     return true;
   }
@@ -819,11 +906,54 @@ export class SessionManager {
     pending.resolve({ behavior, message, updatedInput });
   }
 
-  userMessage(taskId, text, images = []) {
+  // The *backend* withdrew an approval it had asked for (codex sends
+  // serverRequest/resolved after e.g. turn/interrupt). Nobody is listening for
+  // an answer anymore, so resolve it locally and take the card down — left
+  // alone the task would sit in 'waiting_human' showing a button that does
+  // nothing until decisionTimeoutMs (4h by default) finally expires it.
+  // The claude path has no equivalent signal and never calls this.
+  _withdrawPermission(taskId, requestId) {
+    const pending = this.pendingDecisions.get(requestId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    // Dropped rather than resolved: the session already raced this promise
+    // away on its own side (see codex-session's _openApprovals), so nothing
+    // awaits it, and pending.resolve would flip the task back to 'running' —
+    // exactly the wrong status for a turn that just got interrupted.
+    this.pendingDecisions.delete(requestId);
+    this.db.patchTask(taskId, { pendingRequest: null });
+    this.emit(taskId, { k: 'msg', role: 'system', content: { text: '该审批请求已被 agent 撤回(通常是这一轮被中断了)。' } });
+    this.setStatus(taskId, 'review', { clearPending: true });
+  }
+
+  userMessage(taskId, text, images = [], clientMessageId = null) {
     const t = this.db.getTask(taskId);
     if (!t) return console.warn('[manager] user_message for unknown task', taskId);
+    // The cloud keeps redelivering a send until this node echoes it back as a
+    // user event (see hub-core's outbound_messages), so the same message
+    // legitimately arrives more than once whenever an ack was lost, a socket
+    // was half-open, or the daemon restarted mid-flight. Running it twice
+    // would spend real relay tokens on a duplicate turn, so the id is the
+    // dedupe key: already recorded here -> re-assert the original event the
+    // cloud is still waiting on instead of starting a second turn.
+    const known = clientMessageId ? this.db.findClientMessage(taskId, clientMessageId) : null;
+    if (known) {
+      this.onEvent(taskId, known.seq, JSON.parse(known.payload));
+      return;
+    }
+    // Recording what the human typed is unconditional, and happens before any
+    // reason we might not act on it. Every early return below used to drop
+    // the text on the floor with only a system note left behind — the same
+    // "我发的消息不见了" failure as a lost delivery, just from a different
+    // direction. The bubble also carries the id, which is what tells the
+    // cloud this exact send has landed.
+    const record = () => this.emit(taskId, {
+      k: 'msg', role: 'user',
+      content: { text, ...(images.length ? { images } : {}), ...(clientMessageId ? { clientMessageId } : {}) },
+    });
     if (t.lease !== 'daemon') {
-      this.emit(taskId, { k: 'msg', role: 'system', content: { text: '任务当前由 IDE 接管,消息未投递。' } });
+      record();
+      this.emit(taskId, { k: 'msg', role: 'system', content: { text: '任务当前由 IDE 接管,这条消息已记录但没有发给 agent。归还给看板后可以重发。' } });
       return;
     }
     // A live permission/plan decision is a *separate* channel from plain
@@ -837,9 +967,10 @@ export class SessionManager {
     // happened again, with no UI path left to actually decide. Refuse
     // instead, with an explicit pointer back to the real decision.
     if (t.status === 'waiting_human' && t.pending_request) {
+      record();
       this.emit(taskId, {
         k: 'msg', role: 'system',
-        content: { text: '有一个权限请求正在等待你决策,消息未发送 — 请先在上方的请求卡片里选择允许/拒绝,再继续对话。' },
+        content: { text: '有一个权限请求正在等待你决策,上面这条消息已记录但还没发给 agent — 请先在请求卡片里选择允许/拒绝,再重发。' },
       });
       return;
     }
@@ -853,14 +984,22 @@ export class SessionManager {
       if (t.real_config_dir && t.session_id) this._importExternalDelta(taskId, t, { silent: true });
       this._spawn(taskId, null, { fresh: false });
       session = this.sessions.get(taskId);
-      if (!session) return; // _spawn declined (e.g. no relay credentials yet) and already set status
+      if (!session) {
+        // _spawn declined (e.g. no relay credentials yet) and already set the
+        // status + a specific error. The text itself must still survive:
+        // fixing the config and hitting retry has to find something to resend.
+        record();
+        this.db.patchTask(taskId, { retryLastInput: encodeInput(text, images) });
+        return;
+      }
     }
     // The human typing a fresh message supersedes any overflow-recovery
     // resend still pending on this session — without this, that stale input
     // would surprise-fire right after this turn's compact settles.
     session.pendingResendAfterCompact = null;
     this._compactRecoveries.delete(taskId);
-    this.emit(taskId, { k: 'msg', role: 'user', content: { text, ...(images.length ? { images } : {}) } });
+    this._turnCapContinuations.delete(taskId);
+    record();
     session.send(text, images);
     this.setStatus(taskId, 'running');
     // Same bookkeeping as _spawn's firstMessage send — if *this* turn fails
@@ -897,18 +1036,31 @@ export class SessionManager {
   }
 
   // Switch which relay config (model profile) this task's future spawns use
-  // — anthropic is {baseUrl, apiKey, model} or null (revert to the node-
+  // — provider is {baseUrl, apiKey, model} or null (revert to the node-
   // shared default). Like permission_mode, this is a spawn-time env on the
   // CLI child: a live in-flight turn keeps its old model; the change takes
   // effect from the next (re)spawn. Also re-asserted from cloud on every
   // reconnect (see cloudlink's hello_ok) — no-op if unchanged, so that
   // self-healing pass stays silent in the steady state.
-  setAnthropicOverride(taskId, anthropic) {
+  //
+  // `backend` rides along because a profile now pins the agent CLI too. The
+  // cloud refuses cross-backend switches on a task that already has a session
+  // (a claude session id means nothing to `codex resume`); this assert is the
+  // local backstop for that, not an alternative to it.
+  setProviderOverride(taskId, provider, backend = null) {
     const t = this.db.getTask(taskId);
     if (!t) return;
-    const next = anthropic ? JSON.stringify(anthropic) : null;
-    if ((t.anthropic_override ?? null) === next) return;
-    this.db.patchTask(taskId, { anthropicOverride: next });
+    const nextBackend = backend ?? t.backend ?? null;
+    if (t.session_id && (nextBackend ?? DEFAULT_BACKEND) !== (t.backend ?? DEFAULT_BACKEND)) {
+      this.emit(taskId, {
+        k: 'msg', role: 'system',
+        content: { text: `无法把已有会话切换到另一种 agent(${t.backend ?? DEFAULT_BACKEND} → ${nextBackend}):会话 ID 不通用。请新建一张卡。` },
+      });
+      return;
+    }
+    const next = provider ? JSON.stringify(provider) : null;
+    if ((t.provider_override ?? null) === next && (t.backend ?? null) === nextBackend) return;
+    this.db.patchTask(taskId, { providerOverride: next, backend: nextBackend });
     // real_config_dir tasks kill their session after every turn anyway; for
     // the isolated-copy model a warm idle session would otherwise keep the
     // old env alive indefinitely — kill it now (between turns only; an
@@ -921,7 +1073,7 @@ export class SessionManager {
     }
     this.emit(taskId, {
       k: 'msg', role: 'system',
-      content: { text: anthropic ? `已切换模型:${anthropic.model || anthropic.baseUrl}(下一轮生效)` : '已切换回默认模型配置(下一轮生效)' },
+      content: { text: provider ? `已切换模型:${provider.model || provider.baseUrl}(下一轮生效)` : '已切换回默认模型配置(下一轮生效)' },
     });
   }
 
@@ -972,8 +1124,14 @@ export class SessionManager {
   // failure that doesn't match the pattern (missing credentials, a bad
   // workspace path, ...) — those need a human, so they still just sit at
   // 'failed' waiting for the manual retry button, same as before this existed.
-  _scheduleAutoRetry(taskId, errorText) {
-    if (!TRANSIENT_ERROR_PATTERN.test(errorText)) return;
+  // errorCode, when the backend supplies one, replaces the regex entirely:
+  // codex's error notifications carry a CodexErrorInfo enum variant, which
+  // says "transient" far more reliably than pattern-matching prose ever can.
+  _scheduleAutoRetry(taskId, errorText, errorCode = null) {
+    const transient = errorCode
+      ? TRANSIENT_ERROR_CODES.has(errorCode)
+      : TRANSIENT_ERROR_PATTERN.test(errorText);
+    if (!transient) return;
     const t = this.db.getTask(taskId);
     if (!t) return;
     const now = Date.now();
@@ -1013,6 +1171,7 @@ export class SessionManager {
 
   setLease(taskId, lease) {
     const t = this.db.getTask(taskId);
+    const tx = backendFor(t);
     const wasHuman = t?.lease === 'human';
     const session = this.sessions.get(taskId);
     if (lease === 'human' && session?.alive) {
@@ -1027,17 +1186,21 @@ export class SessionManager {
       // to catch up on. real_config_dir tasks track the real file already
       // (see userMessage()'s auto-import) — nothing extra to baseline here.
       if (!t.real_config_dir) {
-        const file = nativeSessionFile(this.config.workRoot, t.dir, t.session_id);
-        this.db.patchTask(taskId, { syncedLines: countTranscriptLines(file) });
+        const file = tx.transcriptFile(this.config, t);
+        if (file) this.db.patchTask(taskId, { syncedLines: tx.countLines(file) });
       }
     } else if (lease === 'daemon' && wasHuman && t?.session_id && t?.dir) {
       this._resyncFromIde(taskId, t);
     }
     this.db.patchTask(taskId, { lease });
     this.emit(taskId, { k: 'status', status: this.db.getTask(taskId).status, extra: { lease } });
+    // The takeover command is backend-specific and, for codex, contains this
+    // node's CODEX_HOME — a path the browser has no way to know. Emitting it
+    // from here is the only place it can come from.
+    const hint = lease === 'human' && t?.session_id ? `\n在你的终端里运行:${tx.resumeCommand(this.config, t)}` : '';
     this.emit(taskId, {
       k: 'msg', role: 'system',
-      content: { text: lease === 'human' ? 'IDE 接管开始,看板暂停驱动此会话。' : 'IDE 接管结束,看板恢复控制。' },
+      content: { text: (lease === 'human' ? 'IDE 接管开始,看板暂停驱动此会话。' : 'IDE 接管结束,看板恢复控制。') + hint },
     });
   }
 
@@ -1054,8 +1217,10 @@ export class SessionManager {
     // the first place (see setLease's baseline branch above) — the generic
     // external-delta import already reads the right (real) file for them.
     if (t.real_config_dir) return this._importExternalDelta(taskId, t);
-    const file = nativeSessionFile(this.config.workRoot, t.dir, t.session_id);
-    const { events, totalLines } = transcriptEventsSince(file, t.synced_lines || 0);
+    const tx = backendFor(t);
+    const file = tx.transcriptFile(this.config, t);
+    if (!file) return;
+    const { events, totalLines } = tx.eventsSince(file, t.synced_lines || 0);
     if (!events.length) { this.db.patchTask(taskId, { syncedLines: totalLines }); return; }
     // Cap like a normal import — an IDE session left open a long time could
     // still produce a large delta, and replaying thousands of events as one
@@ -1082,9 +1247,10 @@ export class SessionManager {
   // adoption time) is the only place ongoing growth outside AgentHub shows
   // up.
   _importExternalDelta(taskId, t, { silent = false } = {}) {
-    const file = findExternalSessionFile(t.session_id, this.config.claudeProjectsRoot, t.source_cwd || null);
+    const tx = backendFor(t);
+    const file = tx.externalTranscriptFile(this.config, t);
     if (!file) return;
-    const { events, totalLines } = transcriptEventsSince(file, t.synced_lines || 0);
+    const { events, totalLines } = tx.eventsSince(file, t.synced_lines || 0);
     if (!events.length) {
       this.db.patchTask(taskId, { syncedLines: totalLines });
       if (!silent) this.emit(taskId, { k: 'msg', role: 'system', content: { text: '没有发现新的历史记录。' } });
@@ -1149,58 +1315,131 @@ export class SessionManager {
   // permission), mirroring the interactive REPL's fire-while-idle rule; a
   // minute that comes due mid-generation fires on the first sweep after the
   // turn settles (lookback capped at CRON_MAX_LOOKBACK_MS, one fire per job).
+  //
+  // Both backends have a schedule store the agent process itself never fires,
+  // but they are *not* interchangeable: .claude/scheduled_tasks.json lives in
+  // the task's working directory, so a codex task that happens to run in a
+  // directory a claude task used before would otherwise inherit cron prompts
+  // that were never written for it (and vice versa). Dispatching on the
+  // task's own backend is what keeps each one reading only its own store.
   _sweepScheduledTasks() {
     const now = Date.now();
     for (const t of this.db.allTasks()) {
       if (!t.dir || t.lease !== 'daemon') continue;
       if (!['review', 'idle'].includes(t.status)) continue;
-      const file = path.join(t.dir, '.claude', 'scheduled_tasks.json');
-      let data;
-      try { data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; } // absent/corrupt → nothing to do
-      const jobs = Array.isArray(data?.tasks) ? data.tasks : [];
-      if (!jobs.length) continue;
-      let fired = false, changed = false;
-      const kept = [];
-      for (const job of jobs) {
-        if (!job?.cron || !job?.prompt) { kept.push(job); continue; }
-        const key = `${t.task_id}:${job.id}`;
-        // Mirror the CLI's own 7-day cap on recurring jobs — also what stops
-        // a forgotten hourly job on an abandoned task from burning relay
-        // tokens forever.
-        if (job.recurring && job.createdAt && now - job.createdAt > CRON_RECURRING_EXPIRY_MS) {
-          changed = true;
-          this._cronChecked.delete(key);
-          this.emit(t.task_id, { k: 'msg', role: 'system', content: { text: `⏰ 定时任务 ${job.id} 已到 7 天上限,自动删除。` } });
-          continue;
-        }
-        // At most one fire per task per sweep — the injected turn makes the
-        // task busy anyway; remaining due jobs fire on later sweeps.
-        if (fired) { kept.push(job); continue; }
-        const seen = this._cronChecked.get(key) ?? Math.max(now - 90_000, job.createdAt ?? 0);
-        const winStart = Math.max(seen, now - CRON_MAX_LOOKBACK_MS);
-        let due = firstCronMatchIn(job.cron, winStart, now);
-        // A one-shot whose single moment passed while the daemon was down
-        // entirely still fires once (the REPL does the same catch-up for
-        // missed one-shots) — bounded so an ancient leftover doesn't.
-        if (!due && !job.recurring) {
-          const born = Math.max(job.createdAt ?? 0, now - CRON_ONESHOT_CATCHUP_MS);
-          due = firstCronMatchIn(job.cron, born, winStart);
-        }
-        this._cronChecked.set(key, now);
-        if (!due) { kept.push(job); continue; }
-        fired = true;
-        if (job.recurring) kept.push(job);
-        else { changed = true; this._cronChecked.delete(key); }
-        this.emit(t.task_id, {
-          k: 'msg', role: 'system',
-          content: { text: `⏰ 定时任务触发(cron ${job.id}${job.recurring ? '' : ',一次性,触发后自动删除'})` },
-        });
-        this.userMessage(t.task_id, job.prompt);
+      if (backendFor(t).name === 'codex') this._sweepCodexAutomations(t, now);
+      else this._sweepClaudeCron(t, now);
+    }
+  }
+
+  _sweepClaudeCron(t, now) {
+    const file = path.join(t.dir, '.claude', 'scheduled_tasks.json');
+    let data;
+    try { data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return; } // absent/corrupt → nothing to do
+    const jobs = Array.isArray(data?.tasks) ? data.tasks : [];
+    if (!jobs.length) return;
+    let fired = false, changed = false;
+    const kept = [];
+    for (const job of jobs) {
+      if (!job?.cron || !job?.prompt) { kept.push(job); continue; }
+      const key = `${t.task_id}:${job.id}`;
+      // Mirror the CLI's own 7-day cap on recurring jobs — also what stops
+      // a forgotten hourly job on an abandoned task from burning relay
+      // tokens forever.
+      if (job.recurring && job.createdAt && now - job.createdAt > CRON_RECURRING_EXPIRY_MS) {
+        changed = true;
+        this._cronChecked.delete(key);
+        this.emit(t.task_id, { k: 'msg', role: 'system', content: { text: `⏰ 定时任务 ${job.id} 已到 7 天上限,自动删除。` } });
+        continue;
       }
-      if (changed) {
-        try { fs.writeFileSync(file, JSON.stringify({ ...data, tasks: kept }, null, 2)); } catch { /* read-only dir — job just stays */ }
+      // At most one fire per task per sweep — the injected turn makes the
+      // task busy anyway; remaining due jobs fire on later sweeps.
+      if (fired) { kept.push(job); continue; }
+      const seen = this._cronChecked.get(key) ?? Math.max(now - 90_000, job.createdAt ?? 0);
+      const winStart = Math.max(seen, now - CRON_MAX_LOOKBACK_MS);
+      let due = firstCronMatchIn(job.cron, winStart, now);
+      // A one-shot whose single moment passed while the daemon was down
+      // entirely still fires once (the REPL does the same catch-up for
+      // missed one-shots) — bounded so an ancient leftover doesn't.
+      if (!due && !job.recurring) {
+        const born = Math.max(job.createdAt ?? 0, now - CRON_ONESHOT_CATCHUP_MS);
+        due = firstCronMatchIn(job.cron, born, winStart);
+      }
+      this._cronChecked.set(key, now);
+      if (!due) { kept.push(job); continue; }
+      fired = true;
+      if (job.recurring) kept.push(job);
+      else { changed = true; this._cronChecked.delete(key); }
+      this.emit(t.task_id, {
+        k: 'msg', role: 'system',
+        content: { text: `⏰ 定时任务触发(cron ${job.id}${job.recurring ? '' : ',一次性,触发后自动删除'})` },
+      });
+      this.userMessage(t.task_id, job.prompt);
+    }
+    if (changed) {
+      try { fs.writeFileSync(file, JSON.stringify({ ...data, tasks: kept }, null, 2)); } catch { /* read-only dir — job just stays */ }
+    }
+  }
+
+  // Codex's equivalent store, with two structural differences from claude's.
+  //
+  // (1) It lives under CODEX_HOME, not the task directory, and each entry
+  //     names the thread it belongs to (target_thread_id) — so ownership is
+  //     "this automation's thread is this task's session", not "this file is
+  //     in this task's cwd".
+  // (2) Only the Codex *desktop app* can create one. Verified against the
+  //     0.144.6 binary: automation.toml / target_thread_id / RRULE / next_run
+  //     appear zero times in it, and the app-server JSON-RPC schema has no
+  //     automation methods at all — but target_thread_id is present in
+  //     Codex.app's asar. So `codex app-server` will never fire these, and
+  //     unlike claude's case the agent can't have written them mid-task
+  //     either. The payoff is different in kind: it lets a user's existing
+  //     automations keep running on a headless server with the desktop app
+  //     closed, and pushes the results to their phone.
+  _sweepCodexAutomations(t, now) {
+    if (!t.session_id) return; // nothing an automation could be bound to
+    const { jobs, skipped } = readAutomations(codexHomeFor(this.config, !!t.real_config_dir));
+    for (const job of jobs) {
+      if (job.threadId !== t.session_id) continue;
+      const key = `${t.task_id}:${job.id}`;
+      // Same 7-day cap claude's jobs get: an automation left pointing at an
+      // abandoned task would otherwise burn relay tokens indefinitely, and
+      // AgentHub can't ask the desktop app whether the user still wants it.
+      if (job.createdAt && now - job.createdAt > CRON_RECURRING_EXPIRY_MS) {
+        if (this._warnOnce(key, 'expired')) {
+          this.emit(t.task_id, { k: 'msg', role: 'system', content: { text: `⏰ 定时任务「${job.name}」创建已超过 7 天,AgentHub 不再代跑(可在 Codex App 里重建)。` } });
+        }
+        continue;
+      }
+      const seen = this._cronChecked.get(key) ?? Math.max(now - 90_000, job.createdAt ?? 0);
+      const winStart = Math.max(seen, now - CRON_MAX_LOOKBACK_MS);
+      const due = firstRruleMatchIn(job.spec, job.createdAt ?? winStart, winStart, now);
+      this._cronChecked.set(key, now);
+      if (!due) continue;
+      this.emit(t.task_id, {
+        k: 'msg', role: 'system',
+        content: { text: `⏰ 定时任务触发(Codex 自动化「${job.name}」)` },
+      });
+      this.userMessage(t.task_id, job.prompt);
+      return; // one fire per task per sweep — the injected turn makes it busy
+    }
+    // An automation AgentHub can't understand is worth saying out loud once:
+    // silently not running it looks identical to running it and getting
+    // nothing back. Only surfaced on a task that owns *some* automation, so
+    // an unrelated task never gets someone else's warnings.
+    if (skipped.length && jobs.some(j => j.threadId === t.session_id)) {
+      for (const s of skipped) {
+        if (!this._warnOnce(`${t.task_id}:${s.id}`, 'skipped')) continue;
+        this.emit(t.task_id, { k: 'msg', role: 'system', content: { text: `⚠️ 跳过 Codex 自动化 ${s.id}:${s.reason}(AgentHub 不会猜它的时间表)` } });
       }
     }
+  }
+
+  _warnOnce(key, kind) {
+    const k = `${kind}:${key}`;
+    if (this._warned.has(k)) return false;
+    this._warned.add(k);
+    return true;
   }
 
   // Tasks resumed against the real ~/.claude (real_config_dir) can grow from
@@ -1220,9 +1459,10 @@ export class SessionManager {
       if (!t.real_config_dir || !t.session_id) continue;
       if (this.sessions.has(t.task_id)) continue; // mid-turn — leave it alone
       if (!['failed', 'review', 'idle'].includes(t.status)) continue;
-      const file = findExternalSessionFile(t.session_id, this.config.claudeProjectsRoot, t.source_cwd || null);
+      const tx = backendFor(t);
+      const file = tx.externalTranscriptFile(this.config, t);
       if (!file) continue;
-      if (countTranscriptLines(file) <= (t.synced_lines || 0)) continue;
+      if (tx.countLines(file) <= (t.synced_lines || 0)) continue;
       const wasFailed = t.status === 'failed';
       this.emit(t.task_id, {
         k: 'msg', role: 'system',

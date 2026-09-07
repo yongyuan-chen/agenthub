@@ -6,8 +6,12 @@ const DEFAULTS = {
   cloudUrl: '',                 // e.g. wss://agenthub.win
   nodeId: os.hostname(),
   nodeToken: '',
-  anthropic: { baseUrl: '', apiKey: '', model: 'gpt-5.6' },
+  // The model relay this node talks to. Named `provider` rather than
+  // `anthropic` since a profile now also picks which agent CLI drives the
+  // task — see packages/executor/src/backends.mjs.
+  provider: { baseUrl: '', apiKey: '', model: 'gpt-5.6' },
   claudeBin: 'claude',
+  codexBin: 'codex',
   maxParallel: 3,
   decisionTimeoutMs: 4 * 3600_000,
   idleSessionTimeoutMs: 30 * 60_000,
@@ -28,23 +32,35 @@ export function loadConfig(explicitPath) {
     throw new Error(`Config not found: ${p}. Copy executor.config.example.json and fill it in.`);
   }
   const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
-  const cfg = { ...DEFAULTS, ...raw, anthropic: { ...DEFAULTS.anthropic, ...(raw.anthropic || {}) } };
+  // `anthropic` is the pre-rename spelling still sitting in every already-
+  // installed node's config file (written by deploy/setup-*.sh). This is a
+  // local file format, not the wire protocol — silently dropping it would
+  // wipe the relay credentials of every node on upgrade.
+  const provider = { ...DEFAULTS.provider, ...(raw.anthropic || {}), ...(raw.provider || {}) };
+  const cfg = { ...DEFAULTS, ...raw, provider };
+  delete cfg.anthropic;
   for (const key of ['cloudUrl', 'nodeId', 'nodeToken']) {
     if (!cfg[key]) throw new Error(`Config missing required field: ${key}`);
   }
-  if (!cfg.anthropic.baseUrl || !cfg.anthropic.apiKey) {
+  if (!cfg.provider.baseUrl || !cfg.provider.apiKey) {
     // Not fatal: a freshly-installed node legitimately has no local relay
     // credentials by design — the cloud pushes them (per the owning user's
     // Settings) on the first hello_ok right after connecting.
-    console.warn('[config] no local anthropic relay config — waiting for cloud-pushed config from the owning user\'s Settings page');
+    console.warn('[config] no local model relay config — waiting for cloud-pushed config from the owning user\'s Settings page');
   }
   cfg.workRoot = cfg.workRoot.replace(/^~(?=[\\/]|$)/, os.homedir());
-  if (cfg.claudeProjectsRoot) {
-    cfg.claudeProjectsRoot = path.resolve(cfg.claudeProjectsRoot.replace(/^~(?=[\\/]|$)/, os.homedir()));
+  for (const key of ['claudeProjectsRoot', 'codexSessionsRoot']) {
+    if (cfg[key]) cfg[key] = path.resolve(cfg[key].replace(/^~(?=[\\/]|$)/, os.homedir()));
   }
   fs.mkdirSync(cfg.workRoot, { recursive: true });
   fs.mkdirSync(path.join(cfg.workRoot, 'scratch'), { recursive: true });
   fs.mkdirSync(path.join(cfg.workRoot, 'repos'), { recursive: true });
   fs.mkdirSync(path.join(cfg.workRoot, 'claude-config'), { recursive: true });
+  // One stable CODEX_HOME per node, shared by every codex task: thread/resume
+  // only ever looks for sessions/ under the CODEX_HOME its app-server was
+  // booted with, so a per-task home would make resume impossible. Per-task
+  // relay credentials still stay isolated — they travel in each child's own
+  // env, not in this directory. See codex-session.mjs.
+  fs.mkdirSync(path.join(cfg.workRoot, 'codex-home'), { recursive: true });
   return cfg;
 }

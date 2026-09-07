@@ -40,6 +40,16 @@ export class ClaudeSession {
     this.sessionId = opts.resumeSessionId ?? null;
     this.lastActivity = Date.now();
     this._exited = false;
+    // The two things manager.mjs genuinely has to branch on. Kept as data
+    // rather than a backend-name check so a third backend only has to answer
+    // the same two questions — see backends.mjs's header.
+    this.caps = {
+      // 'result' carries total_cost_usd, so the Info tab's running cost is real.
+      reportsCost: true,
+      // Unknown per-model, so auto-compaction falls back to manager's
+      // AUTO_COMPACT_THRESHOLD_TOKENS constant.
+      contextWindow: null,
+    };
   }
 
   start() {
@@ -58,9 +68,9 @@ export class ClaudeSession {
     // from what AgentHub shows — see db.mjs's real_config_dir column.
     if (realConfigDir) delete env.CLAUDE_CONFIG_DIR;
     else env.CLAUDE_CONFIG_DIR = path.join(config.workRoot, 'claude-config');
-    env.ANTHROPIC_BASE_URL = config.anthropic.baseUrl;
-    env.ANTHROPIC_API_KEY = config.anthropic.apiKey;
-    if (config.anthropic.model) env.ANTHROPIC_MODEL = config.anthropic.model;
+    env.ANTHROPIC_BASE_URL = config.provider.baseUrl;
+    env.ANTHROPIC_API_KEY = config.provider.apiKey;
+    if (config.provider.model) env.ANTHROPIC_MODEL = config.provider.model;
     env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
     // claude CLI refuses --permission-mode bypassPermissions outright when
     // running as root/sudo — an unattended agent with full root and no
@@ -153,6 +163,26 @@ export class ClaudeSession {
   kill() {
     this._killed = true;
     try { this.child?.kill(); } catch { /* already dead */ }
+  }
+
+  // ---- polymorphic operations manager calls without knowing the backend ----
+
+  // Verified directly against the real CLI: sending the literal text
+  // "/compact" over stream-json input is recognized as the same local command
+  // the interactive TUI's /compact runs (confirmed via a 'compact_boundary'
+  // system entry with real pre/postTokens in the on-disk transcript), not just
+  // forwarded to the model as plain text. Codex has a real RPC for this
+  // instead; both settle as an ordinary 'result', so manager's
+  // compact-then-resend flow doesn't care which happened.
+  compact() {
+    return this.send('/compact');
+  }
+
+  // The command a human runs to take this session over in their own terminal
+  // or IDE. The IDE side needs the same ANTHROPIC_BASE_URL/API_KEY configured
+  // — that part isn't something AgentHub can hand over in a command line.
+  resumeHint() {
+    return `claude --resume ${this.sessionId ?? '<session-id>'}`;
   }
 
   async _onLine(line) {

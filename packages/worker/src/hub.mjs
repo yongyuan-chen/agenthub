@@ -8,6 +8,9 @@ import { sha256Hex, ulid } from '../../shared/protocol.mjs';
 const HEARTBEAT_TIMEOUT_MS = 60_000;
 const ALARM_PERIOD_MS = 30_000;
 const ASK_TIMEOUT_MS = 4_000;
+// Don't re-push a send that was handed to a socket moments ago — give the
+// node a heartbeat cycle to actually confirm it first.
+const OUTBOUND_RETRY_MIN_AGE_MS = 45_000;
 
 export class Hub {
   constructor(state, env) {
@@ -161,6 +164,10 @@ export class Hub {
         this._processing = run.catch(() => {});
         result = await run;
       }
+      // A send accepted for a node that isn't reachable right now needs the
+      // alarm running to be retried (and, eventually, to time out) — without
+      // this it would only move again if some node happened to reconnect.
+      if (result.body?.delivery === 'queued') await this.ensureAlarm();
       return Response.json(result.body, { status: result.status });
     }
 
@@ -227,7 +234,17 @@ export class Hub {
 
   async alarm() {
     await core.checkHeartbeats(this.ctx(), HEARTBEAT_TIMEOUT_MS);
-    if (this.state.getWebSockets('node').length > 0) {
+    // Redeliver user sends the node hasn't confirmed yet. Reconnects already
+    // flush (see handleHello), but a message can also be lost into a socket
+    // that stays "open" while delivering nothing — that case produces no
+    // reconnect to hang the retry off, so the timer is what makes delivery
+    // eventually happen instead of eventually not.
+    await core.flushOutboundMessages(this.ctx(), null, { minAgeMs: OUTBOUND_RETRY_MIN_AGE_MS });
+    // Keep ticking while anything is still undelivered even if no node is
+    // connected — otherwise a message queued for an offline node would sit
+    // untouched (never retried, never timed out) until unrelated traffic
+    // happened to restart the alarm.
+    if (this.state.getWebSockets('node').length > 0 || await core.hasPendingOutboundMessages(this.ctx())) {
       await this.state.storage.setAlarm(Date.now() + ALARM_PERIOD_MS);
     }
   }

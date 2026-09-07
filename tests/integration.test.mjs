@@ -13,7 +13,7 @@ import * as core from '../packages/worker/src/hub-core.mjs';
 import { LocalDb } from '../packages/executor/src/db.mjs';
 import { SessionManager } from '../packages/executor/src/manager.mjs';
 import { CloudLink } from '../packages/executor/src/cloudlink.mjs';
-import { sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES } from '../packages/shared/protocol.mjs';
+import { sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, PROTOCOL_VERSION, OUTBOUND_MESSAGE_TTL_MS } from '../packages/shared/protocol.mjs';
 import * as accounts from '../packages/worker/src/accounts.mjs';
 import { nativeSessionFile } from '../packages/executor/src/sessions.mjs';
 
@@ -98,36 +98,46 @@ function makeCloud() {
 }
 
 // ---- fake claude session: scripted per-test ----
-function makeFakeSessionFactory(script) {
+// `customize` lets a test reshape the session the way a different backend
+// would — codex reports no dollar cost and does know its own context window,
+// and compacts over an RPC instead of by sending "/compact" as text.
+function makeFakeSessionFactory(script, customize) {
   return (opts) => {
     const session = {
       alive: true, busy: false, sessionId: opts.resumeSessionId ?? null, lastActivity: Date.now(),
+      // Mirrors ClaudeSession: reports dollar cost, no self-declared context
+      // window (the manager falls back to its own constant).
+      caps: { reportsCost: true, contextWindow: null },
       start() {
         if (!session.sessionId) session.sessionId = 'sess-' + Math.random().toString(36).slice(2, 8);
         queueMicrotask(() => opts.onMessage({ type: 'system', subtype: 'init', session_id: session.sessionId }));
       },
       send(text, images) { session.busy = true; script(session, opts, text, images); },
+      // Claude has no compaction RPC — the literal text is the mechanism, which
+      // is why these tests assert on '/compact' showing up in sentTexts.
+      compact() { session.send('/compact'); },
       interrupt() {},
       kill() { session.alive = false; },
       recentStderr() { return ''; },
     };
+    customize?.(session, opts);
     return session;
   };
 }
 
-function makeExecutor(cloud, nodeId, script, configOverrides = {}) {
+function makeExecutor(cloud, nodeId, script, configOverrides = {}, customizeSession = undefined) {
   const workRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-test-'));
   fs.mkdirSync(path.join(workRoot, 'scratch'), { recursive: true });
   const config = {
     cloudUrl: 'wss://fake', nodeId, nodeToken: 'tok-' + nodeId,
-    anthropic: { baseUrl: 'x', apiKey: 'y' },
+    provider: { baseUrl: 'x', apiKey: 'y' },
     maxParallel: 3,
     decisionTimeoutMs: 60_000, idleSessionTimeoutMs: 60_000, workRoot,
     ...configOverrides,
   };
   const db = new LocalDb(workRoot);
   const link = new CloudLink(config, db, (cmd) => manager.handleCommand(cmd), cloud.makeSocketFactory(nodeId));
-  const manager = new SessionManager(config, db, (t, s, e) => link.notifyEvent(t, s, e), makeFakeSessionFactory(script));
+  const manager = new SessionManager(config, db, (t, s, e) => link.notifyEvent(t, s, e), makeFakeSessionFactory(script, customizeSession));
   return { config, db, link, manager, workRoot };
 }
 
@@ -277,6 +287,333 @@ test('user_message: images-only message with empty text is accepted', async () =
 
   exec.manager.shutdown();
   exec.link.stop();
+});
+
+// Reported live: "首次对话无法发送图片,只有首次对话有这个问题" — the draft
+// composer that creates a conversation had no attachment support at all, and
+// POST /api/tasks silently ignored images. The first message is a message.
+test('start_task: images attached to the very first message reach the CLI and land in the conversation', async () => {
+  const cloud = makeCloud();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-first-img', await sha256Hex('tok-mac-first-img'), 'user-test', Date.now()).run();
+
+  let received = null;
+  const exec = makeExecutor(cloud, 'mac-first-img', async (session, opts, text, images) => {
+    received = { text, images };
+    await sleep(5);
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } });
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+
+  const images = [{ mediaType: 'image/png', data: TINY_PNG_BASE64 }];
+  const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: '这张图是什么颜色', images, nodeId: 'mac-first-img' });
+  assert.equal(res.status, 200);
+  const taskId = res.body.task.id;
+
+  await until(() => received !== null, 3000, 'first message delivered to the fake session');
+  assert.equal(received.text, '这张图是什么颜色');
+  assert.deepEqual(received.images, images);
+
+  // The user bubble the node echoes back carries them too, so the picture is
+  // visible in the log on every device — not just inside the CLI's context.
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 3000, 'turn done');
+  const msgs = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
+  const userMsg = msgs.body.messages.find(m => m.role === 'user');
+  assert.deepEqual(userMsg.content.images, images);
+
+  // tasks.spec stays the plain human-readable ask (it's what the 信息 tab
+  // renders) — the encoded {text,images} form only exists node-side.
+  assert.equal((await core.getTask(cloud.ctx, taskId)).spec, '这张图是什么颜色');
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('start_task: a first message of images alone (no text) is accepted, and bad batches are refused', async () => {
+  const cloud = makeCloud();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-first-img2', await sha256Hex('tok-mac-first-img2'), 'user-test', Date.now()).run();
+
+  let received = null;
+  const exec = makeExecutor(cloud, 'mac-first-img2', async (session, opts, text, images) => {
+    received = { text, images };
+    await sleep(5);
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+
+  // Neither text nor images nor a session to resume is still a 400.
+  const empty = await cloud.api('POST', '/api/tasks', { title: 't', nodeId: 'mac-first-img2' });
+  assert.equal(empty.status, 400);
+
+  // Same server-side backstop as the message route, now shared.
+  const tooMany = Array.from({ length: MAX_IMAGES_PER_MESSAGE + 1 }, () => ({ mediaType: 'image/png', data: TINY_PNG_BASE64 }));
+  assert.equal((await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', images: tooMany, nodeId: 'mac-first-img2' })).status, 400);
+  assert.equal((await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', images: [{ mediaType: 'image/gif', data: TINY_PNG_BASE64 }], nodeId: 'mac-first-img2' })).status, 400);
+  const oversizedB64 = 'A'.repeat(Math.ceil((MAX_ATTACHMENT_TOTAL_RAW_BYTES + 100_000) / 0.75));
+  assert.equal((await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', images: [{ mediaType: 'image/png', data: oversizedB64 }], nodeId: 'mac-first-img2' })).status, 400);
+  assert.equal(received, null, 'no rejected creation ever reached the node');
+
+  const images = [{ mediaType: 'image/png', data: TINY_PNG_BASE64 }];
+  const res = await cloud.api('POST', '/api/tasks', { title: '图片对话', images, nodeId: 'mac-first-img2' });
+  assert.equal(res.status, 200);
+  await until(() => received !== null, 3000, 'images-only first message delivered');
+  assert.equal(received.text, '');
+  assert.deepEqual(received.images, images);
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('start_task: images are refused for a node whose executor predates the feature, not silently dropped', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('mac-old', await sha256Hex('tok-mac-old'), 'user-test', 'online', now).run();
+  // An old node: current protocol version (so it isn't rejected outright) but
+  // without the task-images feature in its hello.
+  await cloud.db.prepare('INSERT INTO node_capabilities (node_id, protocol_version, backends, updated_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-old', PROTOCOL_VERSION, JSON.stringify(['claude']), now).run();
+  await cloud.db.prepare('INSERT INTO node_features (node_id, features, updated_at) VALUES (?, ?, ?)')
+    .bind('mac-old', JSON.stringify(['message-ack']), now).run();
+
+  const withImages = await cloud.api('POST', '/api/tasks', {
+    title: 't', spec: 'x', images: [{ mediaType: 'image/png', data: TINY_PNG_BASE64 }], nodeId: 'mac-old',
+  });
+  assert.equal(withImages.status, 409);
+  // Text-only creation on the same node is untouched.
+  assert.equal((await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-old' })).status, 200);
+});
+
+// ---- durable user messages ----
+// A chat send is the one command whose loss destroys content the user already
+// typed, with nothing left on screen to retry — reported live as a message
+// that "直接永久消失". These cover the guarantee that replaced the old
+// fire-and-forget dispatch: accepted means persisted, undelivered means
+// visibly pending and retried, and redelivery never runs the turn twice.
+
+test('durable message: a send into a dead socket survives, is visible while pending, and is delivered on reconnect', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-durable', await sha256Hex('tok-mac-durable'), 'user-test', now).run();
+
+  const delivered = [];
+  const exec = makeExecutor(cloud, 'mac-durable', async (session, opts, text) => {
+    delivered.push(text);
+    await sleep(5);
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } });
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  const created = await cloud.api('POST', '/api/tasks', { title: 't', spec: '开始', nodeId: 'mac-durable' });
+  const taskId = created.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 3000, 'first turn settled');
+
+  exec.link.backoff = 30;
+  cloud.dropNode('mac-durable');
+  await until(() => !exec.link.connected, 2000, 'node offline');
+
+  const sent = await cloud.api('POST', `/api/tasks/${taskId}/message`,
+    { text: '离线时发的消息', clientMessageId: 'cm-offline-1' });
+  assert.equal(sent.status, 200);
+  assert.equal(sent.body.delivery, 'queued', 'an unreachable node yields an honest "queued", not a fake success');
+
+  // Still readable everywhere while in flight — this is what makes it not
+  // look like it vanished.
+  const whilePending = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
+  assert.deepEqual(whilePending.body.pending.map(p => [p.clientMessageId, p.text, p.state]),
+    [['cm-offline-1', '离线时发的消息', 'pending']]);
+  assert.ok(cloud.broadcasts.some(b => b.t === 'pending_msg' && b.pending.clientMessageId === 'cm-offline-1'),
+    'other devices are told about the in-flight send immediately');
+
+  await until(() => exec.link.connected, 5000, 'reconnected');
+  await until(() => delivered.includes('离线时发的消息'), 5000, 'delivered after reconnect');
+
+  await until(async () => {
+    const m = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
+    return m.body.messages.some(x => x.role === 'user' && x.content.text === '离线时发的消息') && !m.body.pending.length;
+  }, 5000, 'pending row retired once the node echoed it back');
+  assert.ok(cloud.broadcasts.some(b => b.t === 'pending_settled' && b.clientMessageId === 'cm-offline-1' && b.state === 'delivered'));
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('durable message: redelivery of the same clientMessageId never runs a second turn', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-dedupe', await sha256Hex('tok-mac-dedupe'), 'user-test', now).run();
+
+  const turns = [];
+  const exec = makeExecutor(cloud, 'mac-dedupe', async (session, opts, text) => {
+    turns.push(text);
+    await sleep(5);
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  const created = await cloud.api('POST', '/api/tasks', { title: 't', spec: '开始', nodeId: 'mac-dedupe' });
+  const taskId = created.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 3000, 'first turn settled');
+  turns.length = 0;
+
+  const first = await cloud.api('POST', `/api/tasks/${taskId}/message`, { text: '只该跑一次', clientMessageId: 'cm-once' });
+  assert.equal(first.body.delivery, 'sent');
+  await until(() => turns.length === 1, 3000, 'turn ran');
+
+  // Same id again: the API retry a flaky network would produce, and the
+  // cloud's own redelivery. Neither may spend another relay turn.
+  const second = await cloud.api('POST', `/api/tasks/${taskId}/message`, { text: '只该跑一次', clientMessageId: 'cm-once' });
+  assert.equal(second.status, 200);
+  exec.manager.handleCommand({ t: 'user_message', taskId, text: '只该跑一次', clientMessageId: 'cm-once' });
+  await cloud.flush();
+  await sleep(120);
+  assert.deepEqual(turns, ['只该跑一次'], 'the duplicate produced no second turn');
+
+  const msgs = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
+  const copies = msgs.body.messages.filter(m => m.role === 'user' && m.content.text === '只该跑一次');
+  assert.equal(copies.length, 1, 'and no second bubble');
+  assert.equal(msgs.body.pending.length, 0);
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('durable message: a send the node never confirms is retried, then fails visibly and can be retried by hand', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-halfopen', await sha256Hex('tok-mac-halfopen'), 'user-test', now).run();
+  await cloud.db.prepare(`INSERT INTO tasks (id,title,spec,node_id,owner_user_id,status,created_at,updated_at)
+    VALUES ('HALFOPEN','t','x','mac-halfopen','user-test','review',?,?)`).bind(now, now).run();
+  // A current-code node: it has told us it can confirm deliveries, which is
+  // what entitles this send to be retried until it does.
+  await core.handleHello(cloud.ctx, 'mac-halfopen', {
+    t: 'hello', nodeId: 'mac-halfopen', protocolVersion: PROTOCOL_VERSION,
+    backends: ['claude'], features: ['message-ack'], tasks: [],
+  });
+
+  // A half-open socket: send() reports success, nothing ever arrives. This is
+  // the case that used to lose messages silently, since "didn't throw" was
+  // treated as delivery.
+  const swallowed = [];
+  const realSend = cloud.ctx.sendToNode;
+  cloud.ctx.sendToNode = (nodeId, msg) => {
+    if (msg.t === 'user_message') { swallowed.push(msg); return true; }
+    return realSend(nodeId, msg);
+  };
+  try {
+    const sent = await cloud.api('POST', '/api/tasks/HALFOPEN/message', { text: '掉进黑洞的消息', clientMessageId: 'cm-void' });
+    assert.equal(sent.body.delivery, 'sent', 'the socket claimed it went out');
+    assert.equal(swallowed.length, 1);
+
+    // Unconfirmed, so a later flush pushes it again rather than assuming the
+    // first attempt worked.
+    await core.flushOutboundMessages(cloud.ctx, 'mac-halfopen');
+    assert.equal(swallowed.length, 2, 'still pending -> redelivered');
+
+    const stillThere = await cloud.api('GET', '/api/tasks/HALFOPEN/messages', {});
+    assert.equal(stillThere.body.pending[0].text, '掉进黑洞的消息', 'the text is never lost');
+
+    // Past the TTL the cloud stops pretending and hands the user a retry.
+    cloud.setNow(now + OUTBOUND_MESSAGE_TTL_MS + 1000);
+    await core.flushOutboundMessages(cloud.ctx, 'mac-halfopen');
+    const failed = await cloud.api('GET', '/api/tasks/HALFOPEN/messages', {});
+    assert.equal(failed.body.pending[0].state, 'failed');
+    assert.ok(cloud.broadcasts.some(b => b.t === 'pending_settled' && b.clientMessageId === 'cm-void' && b.state === 'failed'));
+
+    const retry = await cloud.api('POST', '/api/tasks/HALFOPEN/retry-message', { clientMessageId: 'cm-void' });
+    assert.equal(retry.status, 200);
+    const retried = await cloud.api('GET', '/api/tasks/HALFOPEN/messages', {});
+    assert.equal(retried.body.pending[0].state, 'pending', 'retry revives the same bubble rather than making a new one');
+    assert.equal(retried.body.pending.length, 1);
+  } finally {
+    cloud.ctx.sendToNode = realSend;
+  }
+});
+
+test('durable message: a message that arrives during IDE takeover is recorded instead of discarded', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-lease', await sha256Hex('tok-mac-lease'), 'user-test', now).run();
+  const exec = makeExecutor(cloud, 'mac-lease', async (session, opts) => {
+    await sleep(5); // let _spawn finish its own status write before the turn settles
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0, duration_ms: 5, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  const created = await cloud.api('POST', '/api/tasks', { title: 't', spec: '开始', nodeId: 'mac-lease' });
+  const taskId = created.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 3000, 'first turn settled');
+
+  // The lease flips after the cloud already accepted the send (a race the
+  // API's own 409 can't catch). The text must still end up somewhere the
+  // user can see it, not be answered with a system note and thrown away.
+  exec.manager.setLease(taskId, 'human');
+  exec.manager.handleCommand({ t: 'user_message', taskId, text: 'IDE 接管期间发的', clientMessageId: 'cm-lease' });
+  await until(async () => {
+    const m = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
+    return m.body.messages.some(x => x.role === 'user' && x.content.text === 'IDE 接管期间发的');
+  }, 3000, 'message recorded despite the takeover');
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('durable message: a node that cannot confirm delivery is never redelivered to (no duplicate turns during an upgrade)', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO nodes (id,token_hash,owner_user_id,created_at) VALUES (?,?,?,?)')
+    .bind('old-node', 'h', 'user-test', now).run();
+  await cloud.db.prepare(`INSERT INTO tasks (id,title,spec,node_id,owner_user_id,status,created_at,updated_at)
+    VALUES ('OLDNODE','t','x','old-node','user-test','review',?,?)`).bind(now, now).run();
+  // A pre-upgrade executor: it reports no `features`, and (crucially) its
+  // user events carry no clientMessageId, so nothing can ever settle the row.
+  await core.handleHello(cloud.ctx, 'old-node', { t: 'hello', nodeId: 'old-node', protocolVersion: PROTOCOL_VERSION, backends: ['claude'], tasks: [] });
+
+  const sends = [];
+  const realSend = cloud.ctx.sendToNode;
+  cloud.ctx.sendToNode = (nodeId, msg) => {
+    if (msg.t === 'user_message') { sends.push(msg); return true; }
+    return realSend(nodeId, msg);
+  };
+  try {
+    const sent = await cloud.api('POST', '/api/tasks/OLDNODE/message', { text: '给旧节点的消息', clientMessageId: 'cm-old' });
+    assert.equal(sent.status, 200);
+    assert.equal(sends.length, 1, 'delivered once');
+
+    // Retrying here would make that node genuinely re-run the turn and spend
+    // real relay tokens — the row is settled optimistically instead.
+    await core.flushOutboundMessages(cloud.ctx, 'old-node');
+    await core.flushOutboundMessages(cloud.ctx, 'old-node');
+    assert.equal(sends.length, 1, 'a node that cannot confirm is never re-sent to');
+
+    const after = await cloud.api('GET', '/api/tasks/OLDNODE/messages', {});
+    assert.equal(after.body.pending.length, 0, 'and is not left as a bubble that can never resolve');
+
+    // Once that same node upgrades and says so, the real guarantee applies.
+    await core.handleHello(cloud.ctx, 'old-node', {
+      t: 'hello', nodeId: 'old-node', protocolVersion: PROTOCOL_VERSION,
+      backends: ['claude'], features: ['message-ack'], tasks: [],
+    });
+    await cloud.api('POST', '/api/tasks/OLDNODE/message', { text: '升级后的消息', clientMessageId: 'cm-new' });
+    await core.flushOutboundMessages(cloud.ctx, 'old-node');
+    assert.equal(sends.filter(s => s.clientMessageId === 'cm-new').length, 2, 'an upgraded node does get redelivery');
+  } finally {
+    cloud.ctx.sendToNode = realSend;
+  }
 });
 
 test('POST /message: validates images (too many, unsupported type, oversized payload)', async () => {
@@ -841,8 +1178,8 @@ test('config push: hello_ok delivers relay credentials; setting a model profile 
   await until(() => exec.link.connected, 2000, 'link connect');
 
   // hello_ok embeds the owner's current relay credentials
-  await until(() => exec.manager.config.anthropic.baseUrl === 'https://relay.example/v1', 2000, 'hello_ok config applied');
-  assert.equal(exec.manager.config.anthropic.apiKey, 'sk-initial');
+  await until(() => exec.manager.config.provider.baseUrl === 'https://relay.example/v1', 2000, 'hello_ok config applied');
+  assert.equal(exec.manager.config.provider.apiKey, 'sk-initial');
 
   // Creating this account's first-ever profile auto-marks it default and
   // pushes fresh credentials to already-connected nodes immediately.
@@ -850,9 +1187,9 @@ test('config push: hello_ok delivers relay credentials; setting a model profile 
     { name: '新配置', baseUrl: 'https://relay2.example/v1', apiKey: 'sk-updated', model: 'gpt-6' });
   assert.equal(create.status, 200);
   assert.equal(create.body.profile.isDefault, true);
-  await until(() => exec.manager.config.anthropic.apiKey === 'sk-updated', 2000, 'live config push applied');
-  assert.equal(exec.manager.config.anthropic.baseUrl, 'https://relay2.example/v1');
-  assert.equal(exec.manager.config.anthropic.model, 'gpt-6');
+  await until(() => exec.manager.config.provider.apiKey === 'sk-updated', 2000, 'live config push applied');
+  assert.equal(exec.manager.config.provider.baseUrl, 'https://relay2.example/v1');
+  assert.equal(exec.manager.config.provider.model, 'gpt-6');
 
   // A second profile is NOT auto-default; explicitly setting it as default
   // pushes its credentials live too.
@@ -861,11 +1198,52 @@ test('config push: hello_ok delivers relay credentials; setting a model profile 
   assert.equal(create2.body.profile.isDefault, false);
   const setDefault = await cloud.api('POST', `/api/model-profiles/${create2.body.profile.id}/set-default`, {});
   assert.equal(setDefault.status, 200);
-  await until(() => exec.manager.config.anthropic.apiKey === 'sk-third', 2000, 'second live config push applied');
-  assert.equal(exec.manager.config.anthropic.baseUrl, 'https://relay3.example/v1');
+  await until(() => exec.manager.config.provider.apiKey === 'sk-third', 2000, 'second live config push applied');
+  assert.equal(exec.manager.config.provider.baseUrl, 'https://relay3.example/v1');
 
   exec.manager.shutdown();
   exec.link.stop();
+});
+
+test('executor protocol compatibility: a v2 checkout still accepts v1 cloud relay fields', async () => {
+  const workRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-v1-wire-'));
+  const db = new LocalDb(workRoot);
+  db.upsertTask({ taskId: 'existing', title: 'existing', spec: '', status: 'review' });
+  const commands = [];
+  let socket;
+  const link = new CloudLink(
+    { cloudUrl: 'wss://fake', nodeId: 'mac-v1-wire', nodeToken: 'tok', provider: { baseUrl: '', apiKey: '' } },
+    db,
+    cmd => commands.push(cmd),
+    () => {
+      socket = { send() {}, close() {} };
+      setTimeout(() => socket.onopen?.(), 0);
+      return socket;
+    },
+  );
+  link.start();
+  await until(() => link.connected, 1000, 'legacy-wire test link');
+
+  socket.onmessage({ data: JSON.stringify({
+    t: 'hello_ok',
+    anthropic: { baseUrl: 'https://legacy-relay/v1', apiKey: 'sk-legacy', model: 'claude-opus-5' },
+    tasks: [{ taskId: 'existing', lastSeq: 0, anthropicOverride: { baseUrl: 'https://pinned/v1', apiKey: 'sk-pinned', model: 'pinned' } }],
+  }) });
+  assert.deepEqual(commands.find(x => x.t === 'config')?.provider,
+    { baseUrl: 'https://legacy-relay/v1', apiKey: 'sk-legacy', model: 'claude-opus-5' });
+  assert.deepEqual(commands.find(x => x.t === 'set_provider_override')?.provider,
+    { baseUrl: 'https://pinned/v1', apiKey: 'sk-pinned', model: 'pinned' });
+
+  const config = { provider: { baseUrl: '', apiKey: '' }, maxParallel: 1, workRoot };
+  const manager = new SessionManager(config, db, () => {}, makeFakeSessionFactory(async () => {}));
+  manager.handleCommand({ t: 'config', anthropic: { baseUrl: 'https://live-v1/v1', apiKey: 'sk-live' } });
+  assert.deepEqual(config.provider, { baseUrl: 'https://live-v1/v1', apiKey: 'sk-live' });
+  manager.startTask({ id: 'legacy-start', title: 'legacy', spec: '', anthropic: { baseUrl: 'https://task-v1/v1', apiKey: 'sk-task' } });
+  assert.deepEqual(JSON.parse(db.getTask('legacy-start').provider_override),
+    { baseUrl: 'https://task-v1/v1', apiKey: 'sk-task' });
+
+  manager.shutdown();
+  link.stop();
 });
 
 test('switch-model: pins an ongoing task to a profile (next spawn uses it), reverts to default, and self-heals via hello_ok', async () => {
@@ -888,9 +1266,9 @@ test('switch-model: pins an ongoing task to a profile (next spawn uses it), reve
     opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
     session.busy = false;
   });
-  // Wrap the session factory to record which anthropic config each spawn got.
+  // Wrap the session factory to record which provider config each spawn got.
   const origFactory = exec.manager.sessionFactory;
-  exec.manager.sessionFactory = (opts) => { modelsSeen.push(opts.config.anthropic.model); return origFactory(opts); };
+  exec.manager.sessionFactory = (opts) => { modelsSeen.push(opts.config.provider.model); return origFactory(opts); };
   exec.link.start();
   await until(() => exec.link.connected, 2000, 'link connect');
 
@@ -904,7 +1282,7 @@ test('switch-model: pins an ongoing task to a profile (next spawn uses it), reve
   const sw = await cloud.api('POST', `/api/tasks/${taskId}/switch-model`, { modelProfileId: 'prof-1' });
   assert.equal(sw.status, 200);
   assert.equal((await core.getTask(cloud.ctx, taskId)).model_profile_id, 'prof-1');
-  await until(() => JSON.parse(exec.db.getTask(taskId).anthropic_override || 'null')?.model === 'model-alt', 3000, 'override stored locally');
+  await until(() => JSON.parse(exec.db.getTask(taskId).provider_override || 'null')?.model === 'model-alt', 3000, 'override stored locally');
 
   await cloud.api('POST', `/api/tasks/${taskId}/message`, { text: '第二轮' });
   await until(() => modelsSeen.length >= 2, 3000, 'second spawn happened');
@@ -919,16 +1297,16 @@ test('switch-model: pins an ongoing task to a profile (next spawn uses it), reve
   const rev = await cloud.api('POST', `/api/tasks/${taskId}/switch-model`, {});
   assert.equal(rev.status, 200);
   assert.equal((await core.getTask(cloud.ctx, taskId)).model_profile_id, '');
-  await until(() => exec.db.getTask(taskId).anthropic_override === null, 3000, 'override cleared locally');
+  await until(() => exec.db.getTask(taskId).provider_override === null, 3000, 'override cleared locally');
 
   // Self-heal: simulate local drift (override reappears locally while cloud
   // says explicit-default), reconnect, hello_ok re-asserts cloud's stance.
-  exec.db.patchTask(taskId, { anthropicOverride: JSON.stringify({ baseUrl: 'x', apiKey: 'y', model: 'stale' }) });
+  exec.db.patchTask(taskId, { providerOverride: JSON.stringify({ baseUrl: 'x', apiKey: 'y', model: 'stale' }) });
   exec.link.backoff = 30;
   cloud.dropNode('mac-swmodel');
   await until(() => !exec.link.connected, 2000, 'disconnected');
   await until(() => exec.link.connected, 5000, 'reconnected');
-  await until(() => exec.db.getTask(taskId).anthropic_override === null, 3000, 'hello_ok healed the drift back to explicit default');
+  await until(() => exec.db.getTask(taskId).provider_override === null, 3000, 'hello_ok healed the drift back to explicit default');
 
   exec.manager.shutdown();
   exec.link.stop();
@@ -942,7 +1320,7 @@ test('config push: task fails cleanly (no crash) when a node has no relay creden
     .bind('mac-nocfg', await sha256Hex('tok-mac-nocfg'), 'user-test', now).run();
 
   const exec = makeExecutor(cloud, 'mac-nocfg', async () => {});
-  exec.manager.config.anthropic = { baseUrl: '', apiKey: '' }; // simulate a fresh install with no local fallback either
+  exec.manager.config.provider = { baseUrl: '', apiKey: '' }; // simulate a fresh install with no local fallback either
   exec.link.start();
   await until(() => exec.link.connected, 2000, 'link connect');
 
@@ -1149,12 +1527,12 @@ test('tasks: modelProfileId pins the dispatched start_task to that profile; unkn
     const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-profile', modelProfileId: profileId });
     assert.equal(res.status, 200);
     assert.ok(dispatched);
-    assert.deepEqual(dispatched.task.anthropic, { baseUrl: 'https://api.anthropic.com', apiKey: 'sk-ant-x', model: 'claude-opus-5' });
+    assert.deepEqual(dispatched.task.provider, { baseUrl: 'https://api.anthropic.com', apiKey: 'sk-ant-x', model: 'claude-opus-5' });
 
     dispatched = null;
     const plain = await cloud.api('POST', '/api/tasks', { title: 't2', spec: 'x', nodeId: 'mac-profile' });
     assert.equal(plain.status, 200);
-    assert.equal('anthropic' in dispatched.task, false, 'no modelProfileId -> no anthropic override, unchanged from before');
+    assert.equal('provider' in dispatched.task, false, 'no modelProfileId -> no provider override, unchanged from before');
 
     const bad = await cloud.api('POST', '/api/tasks', { title: 't3', spec: 'x', nodeId: 'mac-profile', modelProfileId: 'nope' });
     assert.equal(bad.status, 404);
@@ -1175,13 +1553,13 @@ test('per-task model override: full round trip spawns fine even when the node ha
 
   let sawConfig = null;
   const exec = makeExecutor(cloud, 'mac-override', async (session, opts) => {
-    sawConfig = opts.config.anthropic;
+    sawConfig = opts.config.provider;
     await sleep(10); // let _spawn()'s own setStatus('running') land before the result event does
     opts.onMessage({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } });
     opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 100, num_turns: 1, is_error: false });
     session.busy = false;
   });
-  exec.manager.config.anthropic = { baseUrl: '', apiKey: '' }; // node has no default config at all
+  exec.manager.config.provider = { baseUrl: '', apiKey: '' }; // node has no default config at all
   exec.link.start();
   await until(() => exec.link.connected, 2000, 'link connect');
 
@@ -1227,6 +1605,44 @@ test('layout: round-trips an ordered pane list, scoped per personal/project view
   const finalState = await cloud.api('GET', '/api/layout', {});
   assert.deepEqual(finalState.body.layout.personal, ['t1', 't2', 't3']);
   assert.deepEqual(finalState.body.layout['team-1'], ['t4', 't5']);
+});
+
+test('layout: atomic scope update preserves a sibling write made after its request starts', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, open_panes, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-test', 'alice', 'x', JSON.stringify({ personal: ['old-personal'], 'team-1': ['old-team'] }), now).run();
+
+  // Simulate a sibling scope update racing immediately before the route's
+  // UPDATE executes. The old SELECT + full-object UPDATE implementation read
+  // first, then this hook changed personal, then it overwrote the entire JSON
+  // with its stale snapshot — losing `new-personal`. Atomic json_set never
+  // reads a JS snapshot and therefore preserves the sibling key.
+  const originalPrepare = cloud.db.prepare.bind(cloud.db);
+  let injected = false;
+  cloud.db.prepare = (sql) => {
+    if (!injected && /^UPDATE users SET open_panes = json_set/.test(sql)) {
+      injected = true;
+      return {
+        bind(...args) {
+          const statement = originalPrepare(sql).bind(...args);
+          return {
+            async run() {
+              await originalPrepare('UPDATE users SET open_panes = ? WHERE id = ?')
+                .bind(JSON.stringify({ personal: ['new-personal'], 'team-1': ['old-team'] }), 'user-test').run();
+              return statement.run();
+            },
+          };
+        },
+      };
+    }
+    return originalPrepare(sql);
+  };
+
+  const saved = await core.api({ ...cloud.ctx, teamId: 'team-1' }, 'POST', '/api/layout', { panes: ['new-team'] });
+  assert.equal(saved.status, 200);
+  const row = await originalPrepare('SELECT open_panes FROM users WHERE id = ?').bind('user-test').first();
+  assert.deepEqual(JSON.parse(row.open_panes), { personal: ['new-personal'], 'team-1': ['new-team'] });
 });
 
 // The DO-level promise-correlation in hub.mjs's browseNode() (WebSocketPair,
@@ -1965,7 +2381,7 @@ test('retry: explicit recovery options (permissionMode downgrade / allowRootBypa
   exec.link.stop();
 });
 
-test('userMessage: refuses to send while a permission decision is pending, instead of silently corrupting state', async () => {
+test('userMessage: a message sent while a decision is pending is kept, but not forwarded to the agent', async () => {
   const cloud = makeCloud();
   await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
     .bind('mac-pending', await sha256Hex('tok-mac-pending'), 'user-test', Date.now()).run();
@@ -1974,7 +2390,9 @@ test('userMessage: refuses to send while a permission decision is pending, inste
   // blocked mid-turn waiting on control_response, same as the real stuck
   // state found live (mobile UI couldn't show the decision card, user typed
   // "继续" as a plain message instead).
-  const exec = makeExecutor(cloud, 'mac-pending', async (session, opts) => {
+  const forwarded = [];
+  const exec = makeExecutor(cloud, 'mac-pending', async (session, opts, text) => {
+    forwarded.push(text);
     // The sleep matters: without it, this runs synchronously inside
     // session.send(), racing _spawn()'s own unconditional
     // setStatus('running') right after send() returns — that's a test-
@@ -1992,21 +2410,28 @@ test('userMessage: refuses to send while a permission decision is pending, inste
   const taskId = res.body.task.id;
   await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'waiting_human', 5000, 'waiting_human');
   const pendingBefore = (await core.getTask(cloud.ctx, taskId)).pending_request;
+  forwarded.length = 0;
 
-  const msg = await cloud.api('POST', `/api/tasks/${taskId}/message`, { text: '继续' });
+  const msg = await cloud.api('POST', `/api/tasks/${taskId}/message`, { text: '继续', clientMessageId: 'cm-blocked' });
   assert.equal(msg.status, 200, 'dispatch itself is accepted — the refusal happens executor-side, as a system message');
-  await sleep(50);
+  await until(async () => {
+    const m = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
+    return m.body.messages.some(x => x.role === 'system' && x.content.text.includes('请先在请求卡片里选择'));
+  }, 3000, 'system note explaining why nothing was sent');
 
   const after = await core.getTask(cloud.ctx, taskId);
   assert.equal(after.status, 'waiting_human', 'status must not silently flip to running');
   assert.equal(after.pending_request, pendingBefore, 'the original pending decision must survive untouched');
+  assert.deepEqual(forwarded, [], 'the plain message was never forwarded to the blocked CLI');
 
+  // ...but it is still *kept*. Dropping the text (the original behavior here)
+  // is the same "我发的消息不见了" failure as losing it in transit — the user
+  // typed something and got a system note where their words should be.
   const msgs = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
-  assert.ok(!msgs.body.messages.some(m => m.role === 'user' && m.content.text === '继续'), 'the plain message itself was never forwarded');
-  assert.ok(
-    msgs.body.messages.some(m => m.role === 'system' && m.content.text.includes('请先在上方的请求卡片里选择')),
-    'a clear system note explains why nothing happened',
-  );
+  const kept = msgs.body.messages.find(m => m.role === 'user' && m.content.text === '继续');
+  assert.ok(kept, 'the message the user typed is preserved in the conversation');
+  assert.equal(kept.content.clientMessageId, 'cm-blocked');
+  assert.equal(msgs.body.pending.length, 0, 'and its pending bubble is retired, since the node did record it');
 
   // Resolve the still-outstanding decision before tearing down — otherwise
   // its real decisionTimeoutMs timer (60s in this harness's config) keeps
@@ -2215,6 +2640,83 @@ test('context overflow: a "prompt is too long" failure auto-compacts and resends
   exec.link.stop();
 });
 
+test('turn cap: an error_max_turns result continues the half-finished job instead of failing it', async () => {
+  const cloud = makeCloud();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-turncap', await sha256Hex('tok-mac-turncap'), 'user-test', Date.now()).run();
+
+  const sentTexts = [];
+  const exec = makeExecutor(cloud, 'mac-turncap', async (session, opts, text) => {
+    sentTexts.push(text);
+    await sleep(10);
+    if (text === '大活' ) {
+      // Exactly what a node running a build that still passes --max-turns
+      // emits: is_error, no `result` detail at all, session still alive.
+      opts.onMessage({ type: 'result', subtype: 'error_max_turns', is_error: true, total_cost_usd: 6.2, duration_ms: 1_367_667, num_turns: 101 });
+    } else {
+      opts.onMessage({ type: 'assistant', message: { content: [{ type: 'text', text: '接着做完了' }] } });
+      opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 50, num_turns: 1, is_error: false });
+    }
+    session.busy = false;
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+
+  const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: '开始工作', nodeId: 'mac-turncap' });
+  const taskId = res.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 5000, 'creation turn settles');
+
+  await cloud.api('POST', `/api/tasks/${taskId}/message`, { text: '大活' });
+  await until(() => sentTexts.length === 3, 8000, 'turn cap → continuation chain completes');
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 8000, 'recovered with no human involved');
+
+  const t = await core.getTask(cloud.ctx, taskId);
+  assert.equal(t.status, 'review', 'never lands on failed — the work was fine, only the turn budget ran out');
+  assert.equal(t.last_error, null);
+  assert.notEqual(sentTexts[2], '大活', 'the original ask is NOT resent — that would restart a half-finished job');
+
+  const msgs = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
+  assert.ok(msgs.body.messages.some(m => m.role === 'system' && m.content.text.includes('回合数上限')), 'user is told why, not left with a bare error_max_turns');
+  assert.equal(msgs.body.messages.filter(m => m.role === 'user' && m.content.text === '大活').length, 1, 'no duplicate user bubble');
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('turn cap: gives up visibly after the continuation cap instead of spending forever', async () => {
+  const cloud = makeCloud();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-turncap2', await sha256Hex('tok-mac-turncap2'), 'user-test', Date.now()).run();
+
+  const sentTexts = [];
+  const exec = makeExecutor(cloud, 'mac-turncap2', async (session, opts, text) => {
+    sentTexts.push(text);
+    await sleep(10);
+    if (text === '开始工作') {
+      opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 50, num_turns: 1, is_error: false });
+    } else {
+      // An agent that just keeps spinning: every continuation caps out again.
+      opts.onMessage({ type: 'result', subtype: 'error_max_turns', is_error: true, total_cost_usd: 1, duration_ms: 100, num_turns: 101 });
+    }
+    session.busy = false;
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+
+  const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: '开始工作', nodeId: 'mac-turncap2' });
+  const taskId = res.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 5000, 'creation turn settles');
+
+  await cloud.api('POST', `/api/tasks/${taskId}/message`, { text: '死循环' });
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'failed', 8000, 'settles at failed once the cap is hit');
+
+  assert.equal(sentTexts.length, 5, 'the ask plus exactly MAX_TURN_CAP_CONTINUATIONS continuations');
+  assert.match((await core.getTask(cloud.ctx, taskId)).last_error, /error_max_turns/, 'the real reason is what the user finally sees');
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
 test('context overflow: gives up visibly after the compact-attempt cap instead of looping forever', async () => {
   const cloud = makeCloud();
   await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
@@ -2416,7 +2918,7 @@ test('idle resume: an unprompted error result (CLI chokes resuming before any me
   fs.mkdirSync(path.join(workRoot, 'scratch'), { recursive: true });
   const config = {
     cloudUrl: 'wss://fake', nodeId: 'mac-idle-spontaneous-error', nodeToken: 'tok-mac-idle-spontaneous-error',
-    anthropic: { baseUrl: 'x', apiKey: 'y' },
+    provider: { baseUrl: 'x', apiKey: 'y' },
     maxParallel: 3,
     decisionTimeoutMs: 60_000, idleSessionTimeoutMs: 60_000, workRoot,
   };
@@ -3775,7 +4277,7 @@ test('retry after a pre-send failure (no relay config) still sends the original 
     await sleep(10);
     opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 50, num_turns: 1, is_error: false });
     session.busy = false;
-  }, { anthropic: { baseUrl: '', apiKey: '' } }); // node not configured yet
+  }, { provider: { baseUrl: '', apiKey: '' } }); // node not configured yet
   exec.link.start();
   await until(() => exec.link.connected, 2000, 'link connect');
 
@@ -3786,7 +4288,7 @@ test('retry after a pre-send failure (no relay config) still sends the original 
   assert.ok(exec.db.getTask(taskId).dir, 'dir was already set before the failure — the exact trap');
 
   // Config arrives (as the cloud would push it), user hits retry.
-  exec.manager.updateAnthropicConfig({ baseUrl: 'x', apiKey: 'y', model: '' });
+  exec.manager.updateProviderConfig({ baseUrl: 'x', apiKey: 'y', model: '' });
   await cloud.api('POST', `/api/tasks/${taskId}/retry`, {});
   await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 5000, 'retry actually runs the task');
   assert.deepEqual(sentTexts, ['做正事'], 'the original spec finally got sent, exactly once');
@@ -3843,4 +4345,367 @@ test('cloudlink: the supervisor revives a fully stalled loop (no socket, no time
   link.ws = null; link.connected = false;
   await until(() => attempts >= 2, 2000, 'supervisor forces a fresh attempt');
   link.stop();
+});
+
+// ---- backends: a model profile now pins the agent CLI, not just the relay ----
+// The gates below all exist because a session id belongs to exactly one CLI's
+// on-disk store, and because the account-default profile is what tasks with no
+// profile (always claude) run against. Each one refuses *before* dispatch, so
+// the failure names the real cause instead of surfacing as a mystery spawn
+// error on the node.
+
+// Overwrite what the node reported at hello. availableBackends() probes the
+// real `claude`/`codex` binaries and caches per process, so leaving it to the
+// handshake would make these assertions depend on what's installed on the
+// machine running the suite.
+async function claimBackends(cloud, nodeId, backends, protocolVersion = PROTOCOL_VERSION) {
+  await cloud.db.prepare(
+    `INSERT INTO node_capabilities (node_id, protocol_version, backends, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET protocol_version = excluded.protocol_version,
+       backends = excluded.backends, updated_at = excluded.updated_at`)
+    .bind(nodeId, protocolVersion, JSON.stringify(backends), Date.now()).run();
+}
+
+async function makeBackendCloud(nodeId = 'mac-be') {
+  const cloud = makeCloud();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind(nodeId, await sha256Hex('tok-' + nodeId), 'user-test', Date.now()).run();
+  return cloud;
+}
+
+test('model-profiles: backend round-trips through the side table and is cleaned up on delete', async () => {
+  const cloud = await makeBackendCloud();
+
+  const codex = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Codex 中转', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', model: 'gpt-5.6-sol', backend: 'codex' });
+  assert.equal(codex.status, 200);
+  assert.equal(codex.body.profile.backend, 'codex');
+  const codexId = codex.body.profile.id;
+
+  const plain = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Claude', baseUrl: 'https://a/v1', apiKey: 'sk-a', model: 'claude-opus-5' });
+  assert.equal(plain.body.profile.backend, 'claude', 'omitted backend means claude, as every pre-existing profile is');
+
+  const bad = await cloud.api('POST', '/api/model-profiles',
+    { name: 'x', baseUrl: 'u', apiKey: 'k', backend: 'gemini' });
+  assert.equal(bad.status, 400);
+
+  const list = await cloud.api('GET', '/api/model-profiles', {});
+  assert.deepEqual(Object.fromEntries(list.body.profiles.map(p => [p.name, p.backend])),
+    { 'Codex 中转': 'codex', Claude: 'claude' });
+
+  // Editing can move a non-default profile between backends.
+  const edit = await cloud.api('PUT', `/api/model-profiles/${codexId}`,
+    { name: 'Codex 中转', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', model: 'gpt-5.6-sol', backend: 'claude' });
+  assert.equal(edit.body.profile.backend, 'claude');
+
+  // The side table has no foreign key, so a leftover row would silently hand
+  // its backend to whichever future profile reused the id.
+  await cloud.api('DELETE', `/api/model-profiles/${codexId}`, {});
+  const orphan = await cloud.db.prepare('SELECT backend FROM model_profile_backends WHERE profile_id = ?').bind(codexId).first();
+  assert.equal(orphan, null);
+});
+
+test('model-profiles: deleting a profile used by a task preserves its backend identity', async () => {
+  const cloud = await makeBackendCloud('mac-profile-delete');
+  await claimBackends(cloud, 'mac-profile-delete', ['claude', 'codex']);
+  const profile = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Codex', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', backend: 'codex' });
+  const task = await cloud.api('POST', '/api/tasks', {
+    title: 't', spec: 'x', nodeId: 'mac-profile-delete', modelProfileId: profile.body.profile.id,
+  });
+
+  const removed = await cloud.api('DELETE', `/api/model-profiles/${profile.body.profile.id}`, {});
+  assert.equal(removed.status, 409);
+  assert.equal((await cloud.api('GET', `/api/tasks/${task.body.task.id}`)).body.task.backend, 'codex');
+});
+
+test('model-profiles: a Codex profile can never become the account default', async () => {
+  const cloud = await makeBackendCloud();
+
+  // The default is mirrored into users.* and pushed to nodes as the relay for
+  // any task that picked no profile — and such a task always runs claude, so a
+  // /v1/responses-only relay there would break every unpinned task at once.
+  const first = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Codex', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', backend: 'codex' });
+  assert.equal(first.body.profile.isDefault, false, 'not even as the very first profile');
+
+  const setDefault = await cloud.api('POST', `/api/model-profiles/${first.body.profile.id}/set-default`, {});
+  assert.equal(setDefault.status, 409);
+
+  const claude = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Claude', baseUrl: 'https://a/v1', apiKey: 'sk-a' });
+  assert.equal(claude.body.profile.isDefault, true, 'the first claude profile still becomes the default');
+  const flip = await cloud.api('PUT', `/api/model-profiles/${claude.body.profile.id}`,
+    { name: 'Claude', baseUrl: 'https://a/v1', apiKey: 'sk-a', backend: 'codex' });
+  assert.equal(flip.status, 409, 'and it cannot be converted while it holds that role');
+});
+
+test('tasks: a Codex profile dispatches backend on start_task, and is refused by a claude-only node', async () => {
+  const cloud = await makeBackendCloud('mac-codex');
+  const profile = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Codex', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', model: 'gpt-5.6-sol', backend: 'codex' });
+  const profileId = profile.body.profile.id;
+
+  let dispatched = null;
+  const origSendToNode = cloud.ctx.sendToNode;
+  cloud.ctx.sendToNode = (nodeId, msg) => { if (msg.t === 'start_task') dispatched = msg; return origSendToNode(nodeId, msg); };
+  try {
+    // A node that has never connected to this cloud version stays dispatchable:
+    // refusing on absence of evidence would have broken "register the node,
+    // create the card, start the daemon later", which worked before backends.
+    const unknownNode = await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-codex', modelProfileId: profileId });
+    assert.equal(unknownNode.status, 200);
+    assert.equal(dispatched.task.backend, 'codex');
+
+    await claimBackends(cloud, 'mac-codex', ['claude']);
+    const refused = await cloud.api('POST', '/api/tasks', { title: 't2', spec: 'x', nodeId: 'mac-codex', modelProfileId: profileId });
+    assert.equal(refused.status, 409);
+    assert.match(refused.body.error, /codex/);
+
+    await claimBackends(cloud, 'mac-codex', ['claude', 'codex']);
+    dispatched = null;
+    const okRes = await cloud.api('POST', '/api/tasks', { title: 't3', spec: 'x', nodeId: 'mac-codex', modelProfileId: profileId });
+    assert.equal(okRes.status, 200);
+    assert.equal(dispatched.task.backend, 'codex');
+
+    // Adoption only discovers claude histories, so a resumeSessionId is always
+    // a claude session id — which means nothing to codex.
+    const adopt = await cloud.api('POST', '/api/tasks', {
+      title: 't4', spec: 'x', nodeId: 'mac-codex', modelProfileId: profileId, resumeSessionId: 'sess-from-claude',
+    });
+    assert.equal(adopt.status, 409);
+
+    // A claude task still dispatches with no backend field at all — the wire
+    // stays byte-identical to what a pre-backends cloud sent.
+    dispatched = null;
+    await cloud.api('POST', '/api/tasks', { title: 't5', spec: 'x', nodeId: 'mac-codex' });
+    assert.equal('backend' in dispatched.task, false);
+  } finally {
+    cloud.ctx.sendToNode = origSendToNode;
+  }
+});
+
+test('tasks: an outdated node is refused work up front, and told why on its next hello', async () => {
+  const cloud = await makeBackendCloud('mac-old');
+  await claimBackends(cloud, 'mac-old', ['claude'], PROTOCOL_VERSION - 1);
+
+  // `provider` was called `anthropic` in v1 and there is no compatibility
+  // layer, so a v1 node would silently drop it and run against the wrong
+  // relay while looking perfectly healthy. Queue the work instead.
+  const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-old' });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /升级/);
+
+  const sent = [];
+  cloud.ctx.sendToNode = (nodeId, msg) => { sent.push(msg); return true; };
+  await core.handleHello(cloud.ctx, 'mac-old', { t: 'hello', protocolVersion: PROTOCOL_VERSION - 1, backends: ['claude'], tasks: [] });
+  const helloOk = sent.find(m => m.t === 'hello_ok');
+  assert.equal(helloOk.upgradeRequired, PROTOCOL_VERSION);
+
+  // An upgraded daemon is dispatchable again with no other intervention.
+  await core.handleHello(cloud.ctx, 'mac-old', { t: 'hello', protocolVersion: PROTOCOL_VERSION, backends: ['claude'], tasks: [] });
+  const after = await cloud.api('POST', '/api/tasks', { title: 't2', spec: 'x', nodeId: 'mac-old' });
+  assert.equal(after.status, 200);
+});
+
+test('switch-model: refuses to move a conversation that already has a session to another backend', async () => {
+  const cloud = await makeBackendCloud('mac-switch');
+  await claimBackends(cloud, 'mac-switch', ['claude', 'codex']);
+  const codex = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Codex', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', backend: 'codex' });
+
+  const created = await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-switch' });
+  const taskId = created.body.task.id;
+
+  // No session yet: nothing has spawned, so the card is still free to move.
+  const early = await cloud.api('POST', `/api/tasks/${taskId}/switch-model`, { modelProfileId: codex.body.profile.id });
+  assert.equal(early.status, 200);
+
+  // Back to claude, then give it a session and try again.
+  await cloud.api('POST', `/api/tasks/${taskId}/switch-model`, { modelProfileId: null });
+  await cloud.db.prepare('UPDATE tasks SET session_id = ? WHERE id = ?').bind('sess-claude-1', taskId).run();
+  const late = await cloud.api('POST', `/api/tasks/${taskId}/switch-model`, { modelProfileId: codex.body.profile.id });
+  assert.equal(late.status, 409);
+  assert.match(late.body.error, /会话 ID 不通用/);
+
+  // Switching relay *within* the same backend is still fine.
+  const sameBackend = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Claude 备用', baseUrl: 'https://b/v1', apiKey: 'sk-b' });
+  const ok2 = await cloud.api('POST', `/api/tasks/${taskId}/switch-model`, { modelProfileId: sameBackend.body.profile.id });
+  assert.equal(ok2.status, 200);
+});
+
+test('switch-session: rejects Claude history for a Codex task and exposes task backend', async () => {
+  const cloud = await makeBackendCloud('mac-codex-switch');
+  await claimBackends(cloud, 'mac-codex-switch', ['claude', 'codex']);
+  const profile = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Codex', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', backend: 'codex' });
+  const created = await cloud.api('POST', '/api/tasks', {
+    title: 't', spec: 'x', nodeId: 'mac-codex-switch', modelProfileId: profile.body.profile.id,
+  });
+
+  assert.equal(created.body.task.backend, 'codex');
+  const listed = await cloud.api('GET', '/api/tasks');
+  assert.equal(listed.body.tasks.find(t => t.id === created.body.task.id).backend, 'codex');
+  const switched = await cloud.api('POST', `/api/tasks/${created.body.task.id}/switch-session`, { sessionId: 'claude-session' });
+  assert.equal(switched.status, 409);
+  assert.match(switched.body.error, /Codex/);
+  assert.equal((await core.getTask(cloud.ctx, created.body.task.id)).session_id, null);
+});
+
+test('backend caps: a session that reports no dollar cost never produces a fabricated $0.00', async () => {
+  const cloud = await makeBackendCloud('mac-cost');
+  await claimBackends(cloud, 'mac-cost', ['claude', 'codex']);
+  const profile = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Codex', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', backend: 'codex' });
+
+  const exec = makeExecutor(cloud, 'mac-cost', async (session, opts) => {
+    await sleep(10);
+    // Deliberately *does* carry total_cost_usd: the guard has to be caps, not
+    // "codex happens never to send the field".
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.42, duration_ms: 50, num_turns: 1, is_error: false });
+    session.busy = false;
+  }, {}, (session) => { session.caps = { reportsCost: false, contextWindow: 258400 }; });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  // The real machine running tests may have neither CLI; override the hello
+  // probe after connect so this remains a backend-behaviour test.
+  await claimBackends(cloud, 'mac-cost', ['claude', 'codex']);
+
+  const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-cost', modelProfileId: profile.body.profile.id });
+  const taskId = res.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 5000, 'review');
+
+  assert.equal(exec.db.getTask(taskId).backend, 'codex', 'the backend rode along on start_task');
+  assert.equal((await core.getTask(cloud.ctx, taskId)).cost_usd, 0, 'nothing was accumulated');
+  const msgs = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
+  const result = msgs.body.messages.find(m => m.role === 'result');
+  assert.equal('total_cost_usd' in result.content, false, 'the Info tab has no cost field to render at all');
+  assert.equal('turn_cost_usd' in result.content, false);
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('backend caps: a self-reported context window sets the compaction threshold, and compaction is an RPC', async () => {
+  const cloud = await makeBackendCloud('mac-compact');
+  await claimBackends(cloud, 'mac-compact', ['claude', 'codex']);
+  const profile = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Codex', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', backend: 'codex' });
+
+  const sentTexts = [];
+  let compactCalls = 0;
+  const exec = makeExecutor(cloud, 'mac-compact', async (session, opts, text) => {
+    sentTexts.push(text);
+    await sleep(10);
+    opts.onMessage({ type: 'result', subtype: 'success', duration_ms: 50, num_turns: 1, is_error: false });
+    session.busy = false;
+  }, {}, (session) => {
+    session.caps = { reportsCost: false, contextWindow: 258400 };
+    session.compact = () => { compactCalls++; };
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  await claimBackends(cloud, 'mac-compact', ['claude', 'codex']);
+
+  const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-compact', modelProfileId: profile.body.profile.id });
+  const taskId = res.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 5000, 'review');
+  const session = exec.manager.sessions.get(taskId);
+
+  // 60% of 258400 is 155,040 — above claude's hardcoded 150,000 constant. A
+  // task sitting between the two must not compact, which is only true if the
+  // reported window is what's being used.
+  exec.db.patchTask(taskId, { contextTokens: 152_000 });
+  assert.equal(exec.manager._maybeAutoCompact(taskId, session), false);
+  assert.equal(compactCalls, 0);
+
+  // Streamed usage is claude's reason to defer to the CLI's own auto-compact.
+  // A backend that reports its own window has no such built-in to defer to.
+  session.streamedUsageSeen = true;
+  exec.db.patchTask(taskId, { contextTokens: 160_000 });
+  assert.equal(exec.manager._maybeAutoCompact(taskId, session), true);
+  assert.equal(compactCalls, 1);
+  assert.equal(sentTexts.includes('/compact'), false, 'the literal never went to the model as a prompt');
+
+  await until(async () => {
+    const ms = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
+    return ms.body.messages.some(m => m.role === 'system' && m.content.text.includes('自动压缩'));
+  }, 5000, 'compaction announced');
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('scheduled tasks: each backend reads only its own schedule store', async () => {
+  // The two stores live in different places and are written by different
+  // parties, so a codex task running in a directory a claude task used before
+  // must not inherit cron prompts that were never written for it, and vice
+  // versa.
+  const cloud = await makeBackendCloud('mac-cronmix');
+  await claimBackends(cloud, 'mac-cronmix', ['claude', 'codex']);
+  const profile = await cloud.api('POST', '/api/model-profiles',
+    { name: 'Codex', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', backend: 'codex' });
+
+  const sent = [];  // [taskId, text]
+  const exec = makeExecutor(cloud, 'mac-cronmix', async (session, opts, text) => {
+    sent.push([opts.taskId, text]);
+    await sleep(10);
+    opts.onMessage({ type: 'result', subtype: 'success', duration_ms: 50, num_turns: 1, is_error: false });
+    session.busy = false;
+  }, {}, (session) => { session.caps = { reportsCost: false, contextWindow: 258400 }; });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  await claimBackends(cloud, 'mac-cronmix', ['claude', 'codex']);
+
+  const codexRes = await cloud.api('POST', '/api/tasks', { title: 'codex', spec: '开始', nodeId: 'mac-cronmix', modelProfileId: profile.body.profile.id });
+  const claudeRes = await cloud.api('POST', '/api/tasks', { title: 'claude', spec: '开始', nodeId: 'mac-cronmix' });
+  const codexId = codexRes.body.task.id;
+  const claudeId = claudeRes.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, codexId))?.status === 'review'
+    && (await core.getTask(cloud.ctx, claudeId))?.status === 'review', 5000, 'both creation turns settle');
+
+  // A claude-shaped cron file sitting in the codex task's directory.
+  const codexTask = exec.db.getTask(codexId);
+  const strayCron = path.join(codexTask.dir, '.claude', 'scheduled_tasks.json');
+  fs.mkdirSync(path.dirname(strayCron), { recursive: true });
+  fs.writeFileSync(strayCron, JSON.stringify({ tasks: [{
+    id: 'stray', cron: '* * * * *', prompt: '这是 claude 的定时任务', createdAt: Date.now() - 120_000, recurring: true,
+  }] }));
+
+  exec.manager._sweepScheduledTasks();
+  await sleep(50);
+  assert.equal(sent.some(([, text]) => text === '这是 claude 的定时任务'), false,
+    'a codex task never reads .claude/scheduled_tasks.json');
+
+  // A codex automation bound to the *claude* task's session must not fire
+  // either — ownership is by thread id, but only codex tasks consult the store.
+  const home = path.join(exec.workRoot, 'codex-home');
+  const writeAutomation = (slug, threadId, prompt) => {
+    const dir = path.join(home, 'automations', slug);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'automation.toml'), [
+      'id = "' + slug + '"', 'kind = "heartbeat"', 'name = "' + slug + '"',
+      'prompt = "' + prompt + '"', 'status = "ACTIVE"', 'rrule = "FREQ=MINUTELY"',
+      'target_thread_id = "' + threadId + '"', 'created_at = ' + (Date.now() - 120_000),
+    ].join('\n'));
+  };
+  writeAutomation('for-claude', exec.db.getTask(claudeId).session_id, '不该给 claude 的自动化');
+  exec.manager._sweepScheduledTasks();
+  await sleep(50);
+  assert.equal(sent.some(([, text]) => text === '不该给 claude 的自动化'), false,
+    'a claude task never reads CODEX_HOME/automations');
+
+  // And the codex task does fire its own, matched by target_thread_id.
+  writeAutomation('for-codex', codexTask.session_id, '每日记账');
+  exec.manager._sweepScheduledTasks();
+  await until(() => sent.some(([id, text]) => id === codexId && text === '每日记账'), 5000, 'codex automation fires');
+
+  const msgs = await cloud.api('GET', `/api/tasks/${codexId}/messages`, {});
+  assert.ok(msgs.body.messages.some(m => m.role === 'system' && m.content.text.includes('Codex 自动化')),
+    'firing is visibly announced, naming which automation it was');
+
+  exec.manager.shutdown();
+  exec.link.stop();
 });

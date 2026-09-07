@@ -22,7 +22,7 @@ export class LocalDb {
         cost_usd    REAL NOT NULL DEFAULT 0,
         pending_request TEXT,
         last_error  TEXT,
-        anthropic_override TEXT,
+        provider_override TEXT,
         created_at  INTEGER,
         updated_at  INTEGER
       );
@@ -36,10 +36,22 @@ export class LocalDb {
         UNIQUE(task_id, seq)
       );
       CREATE INDEX IF NOT EXISTS idx_outbox_unacked ON outbox(acked, rowid_pk);
+      -- One row per browser send this node has already recorded, so a
+      -- redelivered user_message (the cloud retries until it sees the event
+      -- come back — see hub-core's outbound_messages) is recognised as the
+      -- same message instead of running a second, duplicate turn. Points at
+      -- the outbox row that already carries it, which is what gets re-sent to
+      -- satisfy the cloud's still-open delivery.
+      CREATE TABLE IF NOT EXISTS client_messages (
+        task_id           TEXT NOT NULL,
+        client_message_id TEXT NOT NULL,
+        seq               INTEGER NOT NULL,
+        created_at        INTEGER,
+        PRIMARY KEY (task_id, client_message_id)
+      );
     `);
     // CREATE TABLE IF NOT EXISTS can't retroactively add a column to an
     // already-existing local_tasks on an already-installed node.
-    try { this.db.exec('ALTER TABLE local_tasks ADD COLUMN anthropic_override TEXT'); } catch { /* already exists */ }
     // Transcript line count as of the last time this task's session file was
     // read (IDE-takeover start, or the last resync on IDE-return) — lets a
     // resync pick up only what's new instead of re-reading from scratch.
@@ -92,6 +104,22 @@ export class LocalDb {
     // when the send carried attachments — see manager.mjs's encodeInput/
     // decodeInput, which is the only place that (de)serializes this.
     try { this.db.exec('ALTER TABLE local_tasks ADD COLUMN retry_last_input TEXT'); } catch { /* already exists */ }
+    // Which agent CLI drives this task — see packages/executor/src/backends.mjs.
+    // Absent/NULL means 'claude', which is what every task predating this
+    // column is; backendFor() applies that default, so no backfill is needed.
+    try { this.db.exec('ALTER TABLE local_tasks ADD COLUMN backend TEXT'); } catch { /* already exists */ }
+    // Renamed from anthropic_override: a model profile now pins the backend as
+    // well as the relay, so "anthropic" stopped being true.
+    try { this.db.exec('ALTER TABLE local_tasks ADD COLUMN provider_override TEXT'); } catch { /* already exists */ }
+    // Data migration, not a compatibility shim: without this, every task
+    // already running on an upgraded daemon loses the relay it was pinned to
+    // and silently falls back to the node-wide default. Runs once — after the
+    // copy, provider_override is non-NULL so the WHERE clause never matches
+    // again. The old column is left in place; dropping it would need a table
+    // rebuild for no benefit.
+    try {
+      this.db.exec('UPDATE local_tasks SET provider_override = anthropic_override WHERE provider_override IS NULL AND anthropic_override IS NOT NULL');
+    } catch { /* pre-rename column absent on a fresh install */ }
   }
 
   getTask(taskId) {
@@ -111,13 +139,14 @@ export class LocalDb {
   upsertTask(t) {
     const now = Date.now();
     this.db.prepare(`
-      INSERT INTO local_tasks (task_id, title, spec, status, session_id, dir, repo_url, base_branch, branch_name, permission_mode, lease, cost_usd, anthropic_override, real_config_dir, source_cwd, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO local_tasks (task_id, title, spec, status, session_id, dir, repo_url, base_branch, branch_name, permission_mode, lease, cost_usd, provider_override, backend, real_config_dir, source_cwd, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET title=excluded.title, spec=excluded.spec, updated_at=excluded.updated_at
     `).run(t.taskId, t.title ?? '', t.spec ?? '', t.status ?? 'queued', t.sessionId ?? null,
       t.dir ?? null, t.repoUrl ?? null, t.baseBranch ?? null, t.branchName ?? null,
       t.permissionMode ?? 'default', t.lease ?? 'daemon', t.costUsd ?? 0,
-      t.anthropicOverride ? JSON.stringify(t.anthropicOverride) : null, t.realConfigDir ? 1 : 0, t.sourceCwd ?? null, now, now);
+      t.providerOverride ? JSON.stringify(t.providerOverride) : null, t.backend ?? null,
+      t.realConfigDir ? 1 : 0, t.sourceCwd ?? null, now, now);
   }
 
   patchTask(taskId, fields) {
@@ -127,7 +156,7 @@ export class LocalDb {
       syncedLines: 'synced_lines', contextTokens: 'context_tokens', realConfigDir: 'real_config_dir',
       permissionMode: 'permission_mode', allowRootBypass: 'allow_root_bypass', autoDecideAll: 'auto_decide_all',
       spec: 'spec', sourceCwd: 'source_cwd', retryAttempt: 'retry_attempt', retryFirstFailedAt: 'retry_first_failed_at',
-      retryLastInput: 'retry_last_input', anthropicOverride: 'anthropic_override',
+      retryLastInput: 'retry_last_input', providerOverride: 'provider_override', backend: 'backend',
     };
     const sets = [];
     const vals = [];
@@ -154,7 +183,29 @@ export class LocalDb {
     const seq = this.nextSeq(taskId);
     this.db.prepare('INSERT INTO outbox (task_id, seq, payload, created_at) VALUES (?, ?, ?, ?)')
       .run(taskId, seq, JSON.stringify(ev), Date.now());
+    // A user event carrying a browser-side id is also the dedupe record for
+    // that send (see findClientMessage / manager.userMessage). Written here,
+    // in the same call that persists the event, so the two can't disagree
+    // about whether a message was recorded.
+    if (ev.k === 'msg' && ev.role === 'user' && ev.content?.clientMessageId) {
+      this.db.prepare(
+        'INSERT OR IGNORE INTO client_messages (task_id, client_message_id, seq, created_at) VALUES (?, ?, ?, ?)'
+      ).run(taskId, ev.content.clientMessageId, seq, Date.now());
+    }
     return seq;
+  }
+
+  // The outbox row for an already-recorded send, or null if this node has
+  // never seen it. Returning the payload (not just "yes") is what lets the
+  // manager re-assert the original event to a cloud that's still waiting for
+  // it, rather than emitting a second copy of the same message.
+  findClientMessage(taskId, clientMessageId) {
+    const row = this.db.prepare(
+      `SELECT o.seq AS seq, o.payload AS payload FROM client_messages c
+       JOIN outbox o ON o.task_id = c.task_id AND o.seq = c.seq
+       WHERE c.task_id = ? AND c.client_message_id = ?`
+    ).get(taskId, clientMessageId);
+    return row ?? null;
   }
 
   unacked(limit = 500) {

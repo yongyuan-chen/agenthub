@@ -62,8 +62,17 @@ for (const f of fs.readdirSync('public')) {
 // Bundle the executor + node-enrollment scripts so /install.sh (served as a
 // static asset) can pull down everything a new server needs in one curl|bash.
 const repoRoot = path.resolve('../..');
+// packages/shared is not optional: the executor imports it directly
+// (protocol constants, ulid, the state machine) via ../../shared/*.mjs, so a
+// tarball without it produces a node that dies on boot with ERR_MODULE_NOT_
+// FOUND. It went unnoticed for a long time only because the executor's
+// *entrypoint* chain happened not to reach it — the moment cloudlink.mjs
+// imported a protocol constant, every self-updating node broke at once.
+// Hashed as well as shipped, so a shared-only change still produces a new
+// VERSION and actually reaches nodes.
 const NODE_PATHS = [
   'packages/executor',
+  'packages/shared',
   'deploy/setup-node.sh',
   'deploy/com.agenthub.executor.plist.template',
   'deploy/agenthub-executor.service',

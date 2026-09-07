@@ -45,14 +45,17 @@ New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 $WorkRoot = "$env:USERPROFILE\agenthub"
 $CloudUrl = $AppUrl -replace '^https:', 'wss:' -replace '^http:', 'ws:'
 $ClaudeCommand = Get-Command claude.exe, claude.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $ClaudeCommand) { throw "claude CLI not found after dependency bootstrap" }
-$ClaudeBin = $ClaudeCommand.Source
+$CodexCommand = Get-Command codex.exe, codex.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $ClaudeCommand -and -not $CodexCommand) { throw "neither claude nor codex CLI was found after dependency bootstrap" }
+$ClaudeBin = if ($ClaudeCommand) { $ClaudeCommand.Source } else { 'claude' }
+$CodexBin = if ($CodexCommand) { $CodexCommand.Source } else { 'codex' }
 $Config = @{
   cloudUrl    = $CloudUrl
   nodeId      = $NodeId
   nodeToken   = $NodeToken
-  anthropic   = @{ baseUrl = ''; apiKey = ''; model = '' }
+  provider    = @{ baseUrl = ''; apiKey = ''; model = '' }
   claudeBin   = $ClaudeBin
+  codexBin    = $CodexBin
   maxParallel = 3
   workRoot    = $WorkRoot
 } | ConvertTo-Json -Depth 5
@@ -70,8 +73,9 @@ if (-not $GitCommand) { throw "git not found after dependency bootstrap" }
 $RuntimePath = @(
   (Split-Path $NodeBin -Parent)
   (Split-Path $GitCommand.Source -Parent)
-  (Split-Path $ClaudeBin -Parent)
-) | Select-Object -Unique
+  $(if ($ClaudeCommand) { Split-Path $ClaudeCommand.Source -Parent })
+  $(if ($CodexCommand) { Split-Path $CodexCommand.Source -Parent })
+) | Where-Object { $_ } | Select-Object -Unique
 $WrapperPath = "$ConfigDir\agenthub-executor-loop.bat"
 $LogPath = "$WorkRoot\logs\executor.log"
 (Get-Content "$Root\deploy\agenthub-executor-loop.bat.template") `

@@ -25,8 +25,11 @@ test('Windows installer verifies portable archives and has reachable mirror fall
   assert.match(installer, /-TimeoutSec \$TimeoutSec/);
 });
 
-test('Windows scheduled task preserves dependency paths and absolute Claude command', () => {
+test('Windows scheduled task supports Claude-only or Codex-only nodes and preserves dependency paths', () => {
   assert.match(setup, /claudeBin\s+=\s+\$ClaudeBin/);
+  assert.match(setup, /codexBin\s+=\s+\$CodexBin/);
+  assert.match(setup, /-not \$ClaudeCommand -and -not \$CodexCommand/);
+  assert.doesNotMatch(setup, /if \(-not \$ClaudeCommand\) \{ throw/);
   assert.match(setup, /__RUNTIME_PATH__/);
   assert.match(wrapper, /set "PATH=__RUNTIME_PATH__;%PATH%"/);
   assert.doesNotMatch(wrapper, /setx/i);

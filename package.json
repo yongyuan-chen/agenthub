@@ -7,6 +7,7 @@
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "smoke": "node packages/executor/scripts/smoke.mjs",
+    "smoke:codex": "node packages/executor/scripts/smoke-codex.mjs",
     "build:web": "cd packages/web && node build.mjs",
     "deploy": "bash deploy/setup-all.sh"
   },

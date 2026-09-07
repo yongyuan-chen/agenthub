@@ -27,7 +27,13 @@ NODE_ID="${1:-$(printf '%s-%s' "$(hostname -s)" "$(whoami)" | tr '[:upper:]' '[:
 NODE_TOKEN="$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64url"))')"
 TOKEN_HASH="$(printf '%s' "$NODE_TOKEN" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(require("crypto").createHash("sha256").update(d).digest("hex")))')"
 
-command -v claude >/dev/null || echo "WARN: claude CLI not found; install it first (npm i -g @anthropic-ai/claude-code)"
+HAS_CLAUDE=0; HAS_CODEX=0
+command -v claude >/dev/null && HAS_CLAUDE=1 || echo "NOTE: claude CLI not found; this node will not run Claude Code profiles (npm i -g @anthropic-ai/claude-code)"
+command -v codex >/dev/null && HAS_CODEX=1 || echo "NOTE: codex CLI not found; this node will not run Codex profiles (npm i -g @openai/codex)"
+if [ "$HAS_CLAUDE" = 0 ] && [ "$HAS_CODEX" = 0 ]; then
+  echo "ERROR: install at least one agent CLI (claude or codex) before setting up this node" >&2
+  exit 1
+fi
 
 echo "[node] enrolling $NODE_ID at $APP_URL${TEAM_ID:+ (team $TEAM_ID)}"
 # Was `curl -sf ... >/dev/null` — with `set -e` that meant any non-2xx (most
@@ -59,8 +65,9 @@ cat > "$HOME/.agenthub/executor.config.json" <<EOF
   "cloudUrl": "${APP_URL/https:/wss:}",
   "nodeId": "$NODE_ID",
   "nodeToken": "$NODE_TOKEN",
-  "anthropic": { "baseUrl": "", "apiKey": "", "model": "" },
+  "provider": { "baseUrl": "", "apiKey": "", "model": "" },
   "claudeBin": "$(command -v claude || echo claude)",
+  "codexBin": "$(command -v codex || echo codex)",
   "maxParallel": 3,
   "workRoot": "$HOME/agenthub"
 }

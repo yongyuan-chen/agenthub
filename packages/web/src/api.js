@@ -5,12 +5,18 @@ export const getToken = () => localStorage.getItem('agenthub_token') || '';
 export const setToken = (t) => localStorage.setItem('agenthub_token', t);
 export const clearToken = () => localStorage.removeItem('agenthub_token');
 
-async function req(method, path, body, { skipTeamHeader = false } = {}) {
+async function req(method, path, body, options = {}) {
+  const { skipTeamHeader = false } = options;
+  // Most calls intentionally follow the currently selected project. A few
+  // delayed/background writes (layout sync in particular) must stay attached
+  // to the scope that produced them even if the user switches projects before
+  // fetch() runs, so an explicitly supplied teamId wins over mutable state.
+  const teamId = Object.hasOwn(options, 'teamId') ? options.teamId : state.activeTeamId;
   const res = await fetch(path, {
     method,
     headers: {
       'authorization': `Bearer ${getToken()}`,
-      ...(state.activeTeamId && !skipTeamHeader ? { 'x-team-id': state.activeTeamId } : {}),
+      ...(teamId && !skipTeamHeader ? { 'x-team-id': teamId } : {}),
       ...(body ? { 'content-type': 'application/json' } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -49,7 +55,7 @@ export const api = {
   switchSession: (taskId, sessionId) => req('POST', `/api/tasks/${taskId}/switch-session`, { sessionId }),
   switchModel: (taskId, modelProfileId) => req('POST', `/api/tasks/${taskId}/switch-model`, { modelProfileId }),
   getLayout: () => req('GET', '/api/layout'),
-  saveLayout: (panes) => req('POST', '/api/layout', { panes }),
+  saveLayout: (panes, teamId = state.activeTeamId) => req('POST', '/api/layout', { panes }, { teamId }),
   modelProfiles: () => req('GET', '/api/model-profiles'),
   createModelProfile: (p) => req('POST', '/api/model-profiles', p),
   updateModelProfile: (id, p) => req('PUT', `/api/model-profiles/${id}`, p),
@@ -86,7 +92,13 @@ export const api = {
   getTask: (id) => req('GET', `/api/tasks/${id}`),
   createTask: (t) => req('POST', '/api/tasks', t),
   messages: (id, afterSeq = 0) => req('GET', `/api/tasks/${id}/messages?after_seq=${afterSeq}&limit=1000`),
-  sendMessage: (id, text, images) => req('POST', `/api/tasks/${id}/message`, { text, ...(images?.length ? { images } : {}) }),
+  // clientMessageId makes the send durable and idempotent end-to-end: the
+  // cloud stores it before answering, keeps redelivering until the node
+  // echoes that same id back, and collapses a retry of the same id onto the
+  // one message instead of sending it twice. See hub-core's outbound_messages.
+  sendMessage: (id, text, images, clientMessageId) =>
+    req('POST', `/api/tasks/${id}/message`, { text, clientMessageId, ...(images?.length ? { images } : {}) }),
+  retryMessage: (id, clientMessageId) => req('POST', `/api/tasks/${id}/retry-message`, { clientMessageId }),
   decision: (id, requestId, behavior, message, updatedInput, autoApprove, forceAll) =>
     req('POST', `/api/tasks/${id}/decision`, { requestId, behavior, message, updatedInput, autoApprove, forceAll }),
   cancel: (id) => req('POST', `/api/tasks/${id}/cancel`, {}),
