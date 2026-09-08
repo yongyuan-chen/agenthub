@@ -1,8 +1,9 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { api } from './api.js';
-import { state, bump, taskInScope, cacheForScope, scopeKeyOf } from './store.js';
-import { STATUS_META, fmtAge, AddNodeModal, ArchivedModal, NodeManageModal, ProjectMembersModal, CreateProjectModal } from './board.jsx';
+import { state, bump, taskInScope, cacheForScope, scopeKeyOf, isTaskUnread, unreadForScope } from './store.js';
+import { STATUS_META, AddNodeModal, ArchivedModal, NodeManageModal, ProjectMembersModal, CreateProjectModal } from './board.jsx';
+import { fmtAge } from './format.js';
 import { ModalBackdrop } from './modal.jsx';
 
 // A conversation can be shared with several projects at once — toggling one
@@ -69,17 +70,21 @@ const DRAG_MIME = 'application/x-agenthub-task';
 // independently, this is just so non-owners never see a button that'd 403.
 function TeamSwitcher({ onSwitchTeam, onManageMembers, onCreateProject }) {
   const activeTeam = state.teams.find(t => t.id === state.activeTeamId);
+  // A dot, not a count: the number of finished-but-unlooked-at conversations
+  // isn't something to act on per-unit, and a tab strip that reflows as
+  // counts change is worse than one that doesn't.
+  const dot = (teamId) => unreadForScope(teamId) > 0 ? <i className="unread-dot" aria-label="有新动静" /> : null;
   return (
     <nav className="tabs team-switcher">
       <button
         type="button" className={!state.activeTeamId ? 'active' : ''}
         onClick={() => onSwitchTeam(null)}
-      >个人</button>
+      >个人{dot(null)}</button>
       {state.teams.map(t => (
         <button
           key={t.id} type="button" className={state.activeTeamId === t.id ? 'active' : ''}
           onClick={() => onSwitchTeam(t.id)}
-        >{t.name}</button>
+        >{t.name}{dot(t.id)}</button>
       ))}
       {activeTeam?.role === 'owner' && (
         <button type="button" className="ghost" title="管理项目成员" onClick={() => onManageMembers(activeTeam)}>⚙</button>
@@ -138,7 +143,10 @@ export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect,
               draggable onDragStart={e => e.dataTransfer.setData(DRAG_MIME, t.id)}
               onClick={e => { e.preventDefault(); onSelect(t.id); }}
             >
-              <span className="sidebar-item-title">{t.title}</span>
+              <span className="sidebar-item-title">
+                {isTaskUnread(t) && <i className="unread-dot" title="有新动静,还没看过" />}
+                {t.title}
+              </span>
               <span className="sidebar-item-meta">
                 {state.activeTeamId && t.owner_username && (
                   <span className="chip owner-chip" title="创建者">{t.owner_username}</span>

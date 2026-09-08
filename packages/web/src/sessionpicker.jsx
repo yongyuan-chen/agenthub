@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { api } from './api.js';
-import { fmtAge } from './board.jsx';
+import { fmtAge } from './format.js';
 import { ModalBackdrop } from './modal.jsx';
 
 // Shared by draftpane.jsx (pick a session to start a new chat from) and

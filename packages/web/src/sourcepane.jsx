@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { api } from './api.js';
 import { state, cacheForScope, scopeKeyOf, bump } from './store.js';
-import { fmtAge } from './board.jsx';
+import { fmtAge } from './format.js';
 import { ConversationMessages } from './task.jsx';
 
 export function ConversationSourcePane({ source, onActivated, onClose }) {

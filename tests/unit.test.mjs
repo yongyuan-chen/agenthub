@@ -8,6 +8,7 @@ import { ulid, userCanTransition, sha256Hex } from '../packages/shared/protocol.
 import { sendWebPush } from '../packages/worker/src/push.mjs';
 import { listDirs } from '../packages/executor/src/cloudlink.mjs';
 import { buildClaudeArgs } from '../packages/executor/src/session.mjs';
+import { fmtDuration } from '../packages/web/src/format.js';
 
 test('Claude CLI arguments never impose AgentHub turn or cost limits', () => {
   const base = [
@@ -124,4 +125,19 @@ test('web push: aes128gcm payload decrypts on the UA side (RFC 8291)', async () 
   assert.equal(plain.at(-1), 2);
   const payload = JSON.parse(new TextDecoder().decode(plain.slice(0, -1)));
   assert.deepEqual(payload, { title: 'hi', body: '世界' });
+});
+
+test('fmtDuration rolls seconds up at 60, then minutes up at 60', () => {
+  assert.equal(fmtDuration(0), '0s');
+  assert.equal(fmtDuration(1499), '1s');
+  assert.equal(fmtDuration(59_000), '59s');
+  assert.equal(fmtDuration(59_600), '1m00s', 'rounding to 60s must carry into a minute, not print "60s"');
+  assert.equal(fmtDuration(60_000), '1m00s');
+  assert.equal(fmtDuration(94_000), '1m34s');
+  assert.equal(fmtDuration(743_000), '12m23s');
+  assert.equal(fmtDuration(3_599_000), '59m59s');
+  assert.equal(fmtDuration(3_600_000), '1h00m');
+  assert.equal(fmtDuration(7_530_000), '2h05m', 'minutes stay zero-padded so widths line up');
+  assert.equal(fmtDuration(undefined), '0s', 'a result card with no duration must not render NaN');
+  assert.equal(fmtDuration(-5_000), '0s');
 });

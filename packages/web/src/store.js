@@ -34,6 +34,15 @@ export const state = {
   // background refresh corrects anything stale — same stale-while-revalidate
   // feel as flipping a browser tab instead of reloading a page.
   scopeCache: {},         // scopeKey -> { tasks: Map, nodes: Map, conversationSources: Map }
+  // Read state for the "这个对话有新动静" dots. Kept out of the task rows on
+  // purpose: a task object is replaced wholesale by every WS broadcast, and
+  // that broadcast goes to a whole project, so it can't carry one viewer's
+  // seen_at. taskSeen is this user's own, from GET /tasks and from marking a
+  // pane read; unread is the server's per-scope count, the only way tabs for
+  // projects this client isn't currently subscribed to learn they have
+  // something waiting.
+  taskSeen: new Map(),    // taskId -> seen_at (ms)
+  unread: {},             // scopeKey -> count, from GET /api/unread
 };
 
 // Must match shell.jsx's own PERSONAL/scopeKey constant and the backend's
@@ -81,6 +90,8 @@ export function resetUserState() {
   state.teams = [];
   state.activeTeamId = null;
   state.scopeCache = {};
+  state.taskSeen = new Map();
+  state.unread = {};
   bump();
 }
 
@@ -101,6 +112,41 @@ export function taskInScope(task) {
   return state.activeTeamId
     ? (task.teamIds || []).includes(state.activeTeamId)
     : !(task.teamIds || []).length;
+}
+
+// A conversation is unread when the agent last stopped needing a human
+// (attention_at, stamped server-side on exactly the transitions that also
+// send a push) more recently than this user last looked at it.
+export function isTaskUnread(task) {
+  if (!task?.attention_at) return false;
+  return task.attention_at > (state.taskSeen.get(task.id) ?? 0);
+}
+
+export function setTaskSeen(taskId, seenAt) {
+  const previous = state.taskSeen.get(taskId) ?? 0;
+  if (!(seenAt > previous)) return false;
+  state.taskSeen.set(taskId, seenAt);
+  return true;
+}
+
+// Seeds read state from a task list response. Only ever moves forward: a
+// list fetch that raced a just-issued mark-seen must not resurrect the dot.
+export function seedTaskSeen(tasks) {
+  for (const t of tasks) if (t?.seen_at) setTaskSeen(t.id, t.seen_at);
+}
+
+// Unread count for a scope tab. The active scope is computed from the live
+// task list instead of the polled server counts — it has the WS feed, so its
+// dot appears and clears instantly rather than up to a poll interval late.
+export function unreadForScope(teamId) {
+  if (scopeKeyOf(teamId) === scopeKeyOf(state.activeTeamId)) {
+    let n = 0;
+    for (const task of state.tasks.values()) {
+      if (!task.archived_at && taskInScope(task) && isTaskUnread(task)) n++;
+    }
+    return n;
+  }
+  return state.unread[scopeKeyOf(teamId)] || 0;
 }
 
 export function upsertNode(node) {

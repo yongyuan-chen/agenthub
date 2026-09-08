@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { STATUS_META, fmtAge } from './board.jsx';
+import { STATUS_META } from './board.jsx';
+import { fmtAge } from './format.js';
 
 function rowMeta(item) {
   if (item.kind === 'source') return { label: '历史 · 未接入', cls: 'source-chip', age: fmtAge(item.mtime) };

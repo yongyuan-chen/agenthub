@@ -269,6 +269,10 @@ async function broadcastTask(ctx, taskId) {
     const teamIds = await taskTeamIds(ctx, taskId);
     task.teamIds = teamIds;
     task.backend = await taskBackend(ctx.db, task);
+    // No seen_at here on purpose: this payload goes to every member of every
+    // project the task is in, and read state is per-user. The client keeps
+    // its own seen map (store.js) and compares it against attention_at.
+    await attachActivity(ctx, [task]);
     fanOutToTeamsOrOwner(ctx, { t: 'task', task }, task.owner_user_id, teamIds);
   }
   return task;
@@ -361,6 +365,10 @@ export async function absorbEvent(ctx, nodeId, { taskId, seq, ev }) {
          lease = COALESCE(?, lease), updated_at = ? WHERE id = ?`,
       ev.status, pending, lastError, extra.lease ?? null, now, taskId,
     ).run();
+    // Stamped before the broadcast so the update the client renders already
+    // carries the new timer origin / unread marker, instead of the frontend
+    // briefly showing a running task with no elapsed time.
+    if (prev !== ev.status) await recordActivity(ctx, taskId, prev, ev.status, now);
     await broadcastTask(ctx, taskId);
     if (prev !== ev.status) {
       notifyStatus(ctx, { ...task, status: ev.status, last_error: extra.error }, extra);
@@ -384,6 +392,54 @@ export async function absorbEvent(ctx, nodeId, { taskId, seq, ev }) {
 
   await q(ctx.db, 'UPDATE tasks SET last_seq = MAX(last_seq, ?) WHERE id = ?', seq, taskId).run();
   ctx.sendToNode(nodeId, { t: 'ack', taskId, seq });
+}
+
+// Statuses meaning "the agent stopped, it's the human's move" — the same set
+// that already sends a push. Landing on one stamps attention_at, which is what
+// puts the unread dot on the conversation (and on its project tab) until
+// someone actually looks at it.
+const ATTENTION_STATUSES = new Set(['review', 'waiting_human', 'failed']);
+
+// Two timestamps the tasks table can't hold (schema.sql is re-run verbatim on
+// every deploy, so no ALTER TABLE — see task_activity's comment there).
+// COALESCE on update: each transition only ever sets the one it's about and
+// leaves the other's previous value alone.
+async function recordActivity(ctx, taskId, prevStatus, nextStatus, now) {
+  const runStartedAt = BUSY_STATUSES.has(nextStatus) && !BUSY_STATUSES.has(prevStatus) ? now : null;
+  const attentionAt = ATTENTION_STATUSES.has(nextStatus) ? now : null;
+  if (!runStartedAt && !attentionAt) return;
+  await q(ctx.db,
+    `INSERT INTO task_activity (task_id, run_started_at, attention_at) VALUES (?, ?, ?)
+     ON CONFLICT(task_id) DO UPDATE SET
+       run_started_at = COALESCE(excluded.run_started_at, task_activity.run_started_at),
+       attention_at = COALESCE(excluded.attention_at, task_activity.attention_at)`,
+    taskId, runStartedAt, attentionAt).run();
+}
+
+// run_started_at / attention_at for a list of task rows, in one query (same
+// batching approach as attachTeamIds). `seenAtByTask` is the caller's own
+// read state — per-user, so it can only ever be attached for a specific
+// requester, never to a broadcast that fans out to a whole project.
+async function attachActivity(ctx, tasks, seenAtByTask = null) {
+  if (!tasks.length) return;
+  const ids = tasks.map(t => t.id);
+  const rows = await q(ctx.db,
+    `SELECT task_id, run_started_at, attention_at FROM task_activity WHERE task_id IN (${inClause(ids)})`, ...ids).all();
+  const byTask = new Map((rows.results ?? rows).map(r => [r.task_id, r]));
+  for (const t of tasks) {
+    const row = byTask.get(t.id);
+    t.run_started_at = row?.run_started_at ?? null;
+    t.attention_at = row?.attention_at ?? null;
+    if (seenAtByTask) t.seen_at = seenAtByTask.get(t.id) ?? null;
+  }
+}
+
+async function seenAtFor(ctx, userId, taskIds) {
+  if (!taskIds.length) return new Map();
+  const rows = await q(ctx.db,
+    `SELECT task_id, seen_at FROM task_reads WHERE user_id = ? AND task_id IN (${inClause(taskIds)})`,
+    userId, ...taskIds).all();
+  return new Map((rows.results ?? rows).map(r => [r.task_id, r.seen_at]));
 }
 
 function notifyStatus(ctx, task, extra = {}) {
@@ -875,7 +931,10 @@ export async function api(ctx, method, pathname, body) {
       assertTeamMember(ctx, ctx.teamId), scopedTasks(ctx, userId),
     ]);
     if (!isMember) return err(403, 'not a member of that team');
-    await Promise.all([attachTeamIds(ctx, tasks), attachTaskBackends(ctx.db, tasks)]);
+    const seen = await seenAtFor(ctx, userId, tasks.map(t => t.id));
+    await Promise.all([
+      attachTeamIds(ctx, tasks), attachTaskBackends(ctx.db, tasks), attachActivity(ctx, tasks, seen),
+    ]);
     return ok({ tasks });
   }
 
@@ -1170,6 +1229,7 @@ export async function api(ctx, method, pathname, body) {
     }
     task.teamIds = teamIds;
     task.backend = await taskBackend(ctx.db, task);
+    await attachActivity(ctx, [task], await seenAtFor(ctx, userId, [taskId]));
     return ok({ task });
   }
 
@@ -1198,8 +1258,23 @@ export async function api(ctx, method, pathname, body) {
       // Retrying an undelivered send of your own is part of sending, not a
       // separate power: refusing it would strand a member's message with no
       // way to get it through.
-      const messageAllowed = method === 'POST' && ['message', 'retry-message'].includes(action);
+      // Marking a conversation read is the other exception: it writes only
+      // this member's own read state (task_reads is keyed by user), touches
+      // nothing about the task itself, and a member who can see a project
+      // conversation is exactly who needs to clear their own unread dot on it.
+      const messageAllowed = method === 'POST' && ['message', 'retry-message', 'seen'].includes(action);
       if (method !== 'GET' && !messageAllowed) return err(403, 'only the task creator can do this');
+    }
+
+    // "The user looked at it" — clears this conversation's unread mark (and
+    // its contribution to the project's dot) for this user only.
+    if (method === 'POST' && action === 'seen') {
+      const now = ctx.now();
+      await q(ctx.db,
+        `INSERT INTO task_reads (user_id, task_id, seen_at) VALUES (?, ?, ?)
+         ON CONFLICT(user_id, task_id) DO UPDATE SET seen_at = excluded.seen_at`,
+        userId, taskId, now).run();
+      return ok({ seenAt: now });
     }
 
     if (method === 'GET' && action === 'messages') {
@@ -1672,10 +1747,65 @@ export async function api(ctx, method, pathname, body) {
     }
   }
 
+  // Repo paths to offer in a new conversation's path picker. Two sources,
+  // in this order:
+  //  1. paths actually used by the conversations *in the current scope*
+  //     (this project, or personal), most-used first — `top` is that winner
+  //     and is what the draft pane pre-fills, since a project is almost
+  //     always about one checkout and re-picking it every time is friction;
+  //  2. the account-wide recent list, so paths from other scopes are still
+  //     one click away.
   if (method === 'GET' && route[0] === 'recent-repos' && route.length === 1) {
-    const rows = await q(ctx.db,
+    const scopedRows = ctx.teamId
+      ? await q(ctx.db,
+          `SELECT repo_url, COUNT(*) AS uses, MAX(created_at) AS last_used FROM tasks
+           WHERE id IN (SELECT task_id FROM task_teams WHERE team_id = ?)
+             AND repo_url IS NOT NULL AND repo_url <> ''
+           GROUP BY repo_url ORDER BY uses DESC, last_used DESC LIMIT 8`, ctx.teamId).all()
+      : await q(ctx.db,
+          `SELECT repo_url, COUNT(*) AS uses, MAX(created_at) AS last_used FROM tasks
+           WHERE owner_user_id = ? AND id NOT IN (SELECT task_id FROM task_teams)
+             AND repo_url IS NOT NULL AND repo_url <> ''
+           GROUP BY repo_url ORDER BY uses DESC, last_used DESC LIMIT 8`, userId).all();
+    const scoped = (scopedRows.results ?? scopedRows).map(r => r.repo_url);
+    const recentRows = await q(ctx.db,
       'SELECT repo_url FROM recent_repos WHERE owner_user_id = ? ORDER BY last_used_at DESC LIMIT 8', userId).all();
-    return ok({ repos: (rows.results ?? rows).map(r => r.repo_url) });
+    const repos = [...scoped];
+    for (const r of (recentRows.results ?? recentRows)) {
+      if (!repos.includes(r.repo_url)) repos.push(r.repo_url);
+    }
+    return ok({ repos: repos.slice(0, 8), top: scoped[0] ?? null });
+  }
+
+  // Unread counts per scope, for the red dots on the 个人 / project tabs.
+  // Scope-wide rather than per-task on purpose: the sidebar already has the
+  // current scope's tasks live over the WS and can mark its own rows, but a
+  // project you're *not* currently viewing sends this client nothing at all —
+  // this is the only way its tab learns it has something waiting.
+  if (method === 'GET' && route[0] === 'unread' && route.length === 1) {
+    const [personal, teams] = await Promise.all([
+      q(ctx.db,
+        `SELECT COUNT(*) AS n FROM tasks t
+         JOIN task_activity a ON a.task_id = t.id
+         LEFT JOIN task_reads r ON r.task_id = t.id AND r.user_id = ?
+         WHERE t.owner_user_id = ? AND t.archived_at IS NULL
+           AND t.id NOT IN (SELECT task_id FROM task_teams)
+           AND a.attention_at IS NOT NULL AND a.attention_at > COALESCE(r.seen_at, 0)`,
+        userId, userId).first(),
+      q(ctx.db,
+        `SELECT tt.team_id AS team_id, COUNT(*) AS n FROM tasks t
+         JOIN task_teams tt ON tt.task_id = t.id
+         JOIN team_members tm ON tm.team_id = tt.team_id AND tm.user_id = ?
+         JOIN task_activity a ON a.task_id = t.id
+         LEFT JOIN task_reads r ON r.task_id = t.id AND r.user_id = ?
+         WHERE t.archived_at IS NULL
+           AND a.attention_at IS NOT NULL AND a.attention_at > COALESCE(r.seen_at, 0)
+         GROUP BY tt.team_id`,
+        userId, userId).all(),
+    ]);
+    const unread = { personal: personal?.n ?? 0 };
+    for (const row of (teams.results ?? teams)) unread[row.team_id] = row.n;
+    return ok({ unread });
   }
 
   // Which conversation panes are open, synced across devices — stored per
@@ -2141,6 +2271,11 @@ export async function snapshot(ctx) {
          ORDER BY tasks.created_at DESC LIMIT 500`, ctx.userId).all();
   const tasks = taskRows.results ?? taskRows;
   await attachTeamIds(ctx, tasks);
+  // Same enrichment the REST list does — the snapshot *replaces* the client's
+  // task map wholesale on every (re)connect, so anything missing here silently
+  // erases it: found live, the run timer and unread dots showed up from the
+  // REST load and then vanished a moment later when the socket opened.
+  await attachActivity(ctx, tasks, await seenAtFor(ctx, ctx.userId, tasks.map(t => t.id)));
   const nodeRows = teamId
     ? await q(ctx.db,
         `SELECT nodes.id, nodes.name, nodes.owner_user_id, users.username AS owner_username, nodes.labels, nodes.status, nodes.last_heartbeat_at

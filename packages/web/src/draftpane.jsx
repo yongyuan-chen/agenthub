@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { api } from './api.js';
 import { state, upsertTask, bump } from './store.js';
 import { SessionPicker } from './sessionpicker.jsx';
@@ -22,9 +22,12 @@ export function DraftPane({ onCreated, onClose }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [path, setPath] = useState('');
-  const [pathTouched, setPathTouched] = useState(false);
+  // A ref, not state: the prefill below resolves asynchronously and must not
+  // clobber a path the user picked while those requests were still in flight.
+  const pathTouched = useRef(false);
   const [defaultRepoUrl, setDefaultRepoUrl] = useState('');
   const [recents, setRecents] = useState([]);
+  const [topRepo, setTopRepo] = useState('');
   const [pickerOpen, setPickerOpen] = useState(false);
   const [customPath, setCustomPath] = useState('');
   const [pathSuggestions, setPathSuggestions] = useState([]);
@@ -45,11 +48,20 @@ export function DraftPane({ onCreated, onClose }) {
     = useAttachments('draft', setErr);
 
   useEffect(() => {
-    api.getSettings().then(s => {
+    // Both requests feed the same decision (which path to pre-fill), so they
+    // settle together — otherwise whichever resolved last would win.
+    Promise.all([
+      api.getSettings().catch(() => ({})),
+      api.recentRepos().catch(() => ({})),
+    ]).then(([s, r]) => {
       setDefaultRepoUrl(s.defaultRepoUrl || '');
-      setPath(prev => (pathTouched ? prev : (s.defaultRepoUrl || '')));
-    }).catch(() => {});
-    api.recentRepos().then(r => setRecents(r.repos || [])).catch(() => {});
+      setRecents(r.repos || []);
+      setTopRepo(r.top || '');
+      // The path this scope's conversations use most wins over the account
+      // default: inside a project you're nearly always working in that
+      // project's checkout, and the account default is the global fallback.
+      setPath(prev => (pathTouched.current ? prev : (r.top || s.defaultRepoUrl || '')));
+    });
     api.modelProfiles().then(r => {
       const profiles = r.profiles || [];
       setProfiles(profiles);
@@ -79,7 +91,7 @@ export function DraftPane({ onCreated, onClose }) {
   }, [customPath, selectedNode?.id]);
 
   const pickPath = (p) => {
-    setPath(p); setPathTouched(true); setPickerOpen(false); setCustomPath(''); setPathSuggestions([]);
+    setPath(p); pathTouched.current = true; setPickerOpen(false); setCustomPath(''); setPathSuggestions([]);
   };
   const pickNode = (id) => { setNodeId(id); setNodePickerOpen(false); };
   const pickProfile = (id) => { setModelProfileId(id); setModelPickerOpen(false); };
@@ -183,12 +195,17 @@ export function DraftPane({ onCreated, onClose }) {
             </button>
             {pickerOpen && (
               <div className="path-picker">
-                {defaultRepoUrl && (
+                {topRepo && (
+                  <button type="button" className="path-picker-item" onClick={() => pickPath(topRepo)}>
+                    {topRepo} <span className="muted">常用</span>
+                  </button>
+                )}
+                {defaultRepoUrl && defaultRepoUrl !== topRepo && (
                   <button type="button" className="path-picker-item" onClick={() => pickPath(defaultRepoUrl)}>
                     {defaultRepoUrl} <span className="muted">默认</span>
                   </button>
                 )}
-                {recents.filter(r => r !== defaultRepoUrl).map(r => (
+                {recents.filter(r => r !== defaultRepoUrl && r !== topRepo).map(r => (
                   <button type="button" key={r} className="path-picker-item" onClick={() => pickPath(r)}>{r}</button>
                 ))}
                 <button type="button" className="path-picker-item" onClick={() => pickPath('')}>无仓库(临时目录)</button>

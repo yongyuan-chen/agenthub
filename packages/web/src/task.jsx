@@ -1,8 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api.js';
-import { state, taskMessages, addMessage, bump, taskPendingMessages, setPendingMessages, upsertPendingMessage } from './store.js';
+import {
+  state, taskMessages, addMessage, bump, taskPendingMessages, setPendingMessages, upsertPendingMessage,
+  isTaskUnread, setTaskSeen,
+} from './store.js';
 import { renderMarkdown } from './md.js';
-import { STATUS_META, fmtAge } from './board.jsx';
+import { STATUS_META } from './board.jsx';
+import { fmtAge, fmtDuration } from './format.js';
 import { SessionPicker } from './sessionpicker.jsx';
 import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
 
@@ -397,7 +401,7 @@ function ResultCard({ msg }) {
     <div className="result-card">
       <span>{c.is_error ? '❌' : '🏁'} 本轮结束</span>
       <span className="muted">
-        {(c.duration_ms / 1000).toFixed(0)}s · {c.num_turns} turns
+        {fmtDuration(c.duration_ms)} · {c.num_turns} turns
         {hasCost && <> · 本轮 ${c.turn_cost_usd.toFixed(3)} · 累计 ${c.total_cost_usd.toFixed(3)}(参考成本)</>}
       </span>
     </div>
@@ -541,6 +545,26 @@ function ThinkingRow({ msg }) {
 // and the model's next turn reads as the UI being stuck, especially since
 // that gap is routinely 10-30s (found live: user submitted an AskUserQuestion
 // answer, saw zero feedback for ~30s, assumed it had frozen).
+// Statuses where a turn is actually in flight — mirrors hub-core.mjs's
+// BUSY_STATUSES, which is what decides when run_started_at gets stamped.
+const RUNNING_STATUSES = new Set(['running', 'starting']);
+
+// Ticks once a second so the header can show how long the current turn has
+// been going. Anchored to the server's run_started_at rather than to when
+// this pane mounted: opening the conversation (or a second device) mid-run
+// shows the real elapsed time instead of restarting from zero.
+function useElapsed(since, active) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active || !since) return undefined;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [active, since]);
+  if (!active || !since) return null;
+  return Math.max(0, now - since);
+}
+
 function ThinkingIndicator() {
   return (
     <div className="msg-row assistant thinking-indicator">
@@ -750,6 +774,29 @@ export function TaskPane({ taskId, user, onClose }) {
   // chat log, same text, same second — a stale-closure double-submit, not a
   // network retry). A ref updates immediately, so the second call sees it.
   const sendingRef = useRef(false);
+  const elapsed = useElapsed(task?.run_started_at, RUNNING_STATUSES.has(task?.status));
+
+  // "看到了" = this conversation is open in a pane and the tab is actually in
+  // front. Re-runs on every new attention_at, so a turn that finishes while
+  // you're watching never flashes a dot, and one that finished while the tab
+  // was in the background clears the moment you come back to it. Failures are
+  // ignored on purpose: an unread dot that outlives one flaky request is
+  // self-correcting (the next visit re-tries), and there is nothing useful to
+  // tell the user about it.
+  const attentionAt = task?.attention_at ?? null;
+  useEffect(() => {
+    if (!attentionAt || !isTaskUnread({ id: taskId, attention_at: attentionAt })) return undefined;
+    let cancelled = false;
+    const mark = () => {
+      if (cancelled || document.hidden) return;
+      api.markTaskSeen(taskId)
+        .then(r => { if (!cancelled && setTaskSeen(taskId, r.seenAt)) bump(); })
+        .catch(() => {});
+    };
+    mark();
+    document.addEventListener('visibilitychange', mark);
+    return () => { cancelled = true; document.removeEventListener('visibilitychange', mark); };
+  }, [taskId, attentionAt]);
 
   useEffect(() => {
     loadedRef.current = false;
@@ -923,6 +970,9 @@ export function TaskPane({ taskId, user, onClose }) {
           )}
           <div className="card-meta">
             <span className={`chip ${meta.cls}`}>{meta.label}</span>
+            {elapsed !== null && (
+              <span className="chip st-running run-timer" title="本轮已运行时间">⏱ {fmtDuration(elapsed)}</span>
+            )}
             {!isCreator && task.owner_username && <span className="chip owner-chip" title="创建者">{task.owner_username}</span>}
             {task.lease === 'human' && <span className="chip st-waiting">IDE 接管中</span>}
             <ModelChip task={task} isCreator={isCreator} />

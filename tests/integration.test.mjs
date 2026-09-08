@@ -1428,6 +1428,38 @@ test('recent-repos: creating tasks with a repoUrl populates history, newest firs
   cloud.setNow(null);
 });
 
+test('recent-repos: `top` is the most-used path in the current scope, per project', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)')
+    .bind('team-repos', '量化', now).run();
+  await cloud.db.prepare('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)')
+    .bind('team-repos', 'user-test', 'owner', now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-top', await sha256Hex('tok-mac-top'), 'user-test', now).run();
+  await cloud.db.prepare('INSERT INTO node_teams (node_id, team_id) VALUES (?, ?)').bind('mac-top', 'team-repos').run();
+  const teamCtx = { ...cloud.ctx, teamId: 'team-repos' };
+
+  // personal: /personal used twice, /solo once
+  for (const repoUrl of ['/personal', '/solo', '/personal']) {
+    await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-top', repoUrl });
+  }
+  // project: /quant used twice, /scratch once — and /personal not at all,
+  // even though it's the account's most recent overall.
+  for (const repoUrl of ['/scratch', '/quant', '/quant']) {
+    const r = await core.api(teamCtx, 'POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-top', repoUrl });
+    assert.equal(r.status, 200);
+  }
+
+  const team = await core.api(teamCtx, 'GET', '/api/recent-repos', {});
+  assert.equal(team.body.top, '/quant', '项目视角下默认填该项目里用得最多的路径');
+  assert.deepEqual(team.body.repos.slice(0, 2), ['/quant', '/scratch'], '项目内路径排在前面,按使用次数');
+  assert.ok(team.body.repos.includes('/personal'), '账号级历史仍然可选');
+
+  const personal = await core.api({ ...cloud.ctx }, 'GET', '/api/recent-repos', {});
+  assert.equal(personal.body.top, '/personal', '个人视角不受项目内路径影响');
+});
+
 test('model-profiles: CRUD + ownership isolation', async () => {
   const cloud = makeCloud();
   const now = Date.now();
@@ -4842,4 +4874,124 @@ test('queued messages: releases one per turn, and queue=false bypasses holding e
   const direct = await cloud.api('POST', '/api/tasks/t1/message', { text: 'NOW', clientMessageId: 'm-now', queue: false });
   assert.equal(direct.body.delivery, 'sent');
   assert.equal(sent[sent.length - 1].text, 'NOW', 'it goes straight through despite the running turn');
+});
+
+test('run timer: a turn starting stamps run_started_at, and it survives cost/usage churn mid-turn', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)')
+    .bind('user-test', 'tester', 'x', now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('n1', 'h', 'user-test', 'online', now).run();
+  await cloud.db.prepare(`INSERT INTO tasks (id, title, spec, node_id, owner_user_id, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind('t1', '计时', 'spec', 'n1', 'user-test', 'queued', now, now).run();
+
+  cloud.setNow(now);
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 1, ev: { k: 'status', status: 'running' } });
+
+  // Cost/usage events land constantly during a turn and each bumps
+  // tasks.updated_at — the timer must not be anchored to that.
+  cloud.setNow(now + 30_000);
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 2, ev: { k: 'cost', costUsd: 0.4 } });
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 3, ev: { k: 'usage', contextTokens: 1000 } });
+
+  let list = await cloud.api('GET', '/api/tasks', {});
+  assert.equal(list.body.tasks[0].run_started_at, now, '仍然是这一轮真正开始的时刻');
+  assert.equal(list.body.tasks[0].attention_at, null, '还在跑,没有需要人看的东西');
+
+  // Turn ends, next turn starts -> the timer restarts from the new turn.
+  cloud.setNow(now + 60_000);
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 4, ev: { k: 'status', status: 'review' } });
+  cloud.setNow(now + 90_000);
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 5, ev: { k: 'status', status: 'running' } });
+  list = await cloud.api('GET', '/api/tasks', {});
+  assert.equal(list.body.tasks[0].run_started_at, now + 90_000);
+  assert.equal(list.body.tasks[0].attention_at, now + 60_000, '上一轮结束的时刻仍然记着');
+
+  cloud.setNow(null);
+});
+
+test('unread: finishing marks the conversation and its project; looking at it clears only that user', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  for (const [id, name] of [['user-test', 'alice'], ['user-bob', 'bob']]) {
+    await cloud.db.prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)')
+      .bind(id, name, 'x', now).run();
+  }
+  await cloud.db.prepare('INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)').bind('team-u', '项目', now).run();
+  for (const uid of ['user-test', 'user-bob']) {
+    await cloud.db.prepare('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)')
+      .bind('team-u', uid, uid === 'user-test' ? 'owner' : 'member', now).run();
+  }
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('n1', 'h', 'user-test', 'online', now).run();
+  await cloud.db.prepare('INSERT INTO node_teams (node_id, team_id) VALUES (?, ?)').bind('n1', 'team-u').run();
+  // one personal conversation, one shared with the project
+  for (const [id, title] of [['t-personal', '私人对话'], ['t-team', '项目对话']]) {
+    await cloud.db.prepare(`INSERT INTO tasks (id, title, spec, node_id, owner_user_id, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, title, 'spec', 'n1', 'user-test', 'running', now, now).run();
+  }
+  await cloud.db.prepare('INSERT INTO task_teams (task_id, team_id) VALUES (?, ?)').bind('t-team', 'team-u').run();
+  const teamCtx = { ...cloud.ctx, teamId: 'team-u' };
+  const bobCtx = { ...cloud.ctx, userId: 'user-bob', teamId: 'team-u' };
+
+  let unread = await cloud.api('GET', '/api/unread', {});
+  assert.equal(unread.body.unread.personal, 0, '什么都没发生前不该有红点');
+
+  cloud.setNow(now + 1000);
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't-personal', seq: 1, ev: { k: 'status', status: 'review' } });
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't-team', seq: 1, ev: { k: 'status', status: 'review' } });
+
+  unread = await cloud.api('GET', '/api/unread', {});
+  assert.equal(unread.body.unread.personal, 1);
+  assert.equal(unread.body.unread['team-u'], 1, '项目 tab 也要标红点');
+  const bobUnread = await core.api(bobCtx, 'GET', '/api/unread', {});
+  assert.equal(bobUnread.body.unread['team-u'], 1, '队友看到的是自己的未读,不是创建者的');
+  assert.equal(bobUnread.body.unread.personal, 0, '别人的个人对话不算队友的未读');
+
+  // Alice looks at the project conversation.
+  cloud.setNow(now + 2000);
+  const seen = await core.api(teamCtx, 'POST', '/api/tasks/t-team/seen', {});
+  assert.equal(seen.status, 200);
+  assert.equal(seen.body.seenAt, now + 2000);
+
+  unread = await cloud.api('GET', '/api/unread', {});
+  assert.equal(unread.body.unread['team-u'] ?? 0, 0, '看过之后红点消失(计数为 0 的项目直接不出现在响应里)');
+  assert.equal(unread.body.unread.personal, 1, '没看的那个还在');
+  assert.equal((await core.api(bobCtx, 'GET', '/api/unread', {})).body.unread['team-u'], 1,
+    'alice 看过不代表 bob 看过');
+
+  // A non-creator can clear their own dot — it writes only their read row.
+  const bobSeen = await core.api(bobCtx, 'POST', '/api/tasks/t-team/seen', {});
+  assert.equal(bobSeen.status, 200, '队友也要能把自己的红点点掉');
+  assert.equal((await core.api(bobCtx, 'GET', '/api/unread', {})).body.unread['team-u'] ?? 0, 0);
+  // ...but that's the only extra power it grants.
+  assert.equal((await core.api(bobCtx, 'POST', '/api/tasks/t-team/archive', {})).status, 403);
+
+  // The list response carries this user's own seen_at, so a reload doesn't
+  // re-light dots the user already cleared.
+  const list = await core.api(teamCtx, 'GET', '/api/tasks', {});
+  assert.equal(list.body.tasks[0].seen_at, now + 2000);
+
+  // The WS snapshot replaces the client's whole task map on every connect —
+  // if it dropped these fields, the dot/timer would appear from the REST load
+  // and then vanish the moment the socket opened (exactly what happened live).
+  const snap = await core.snapshot(teamCtx);
+  const snapTask = snap.tasks.find(t => t.id === 't-team');
+  assert.equal(snapTask.attention_at, now + 1000);
+  assert.equal(snapTask.seen_at, now + 2000);
+  assert.ok(snapTask.run_started_at === null || typeof snapTask.run_started_at === 'number');
+
+  // A new turn finishing after that makes it unread again.
+  cloud.setNow(now + 3000);
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't-team', seq: 2, ev: { k: 'status', status: 'running' } });
+  cloud.setNow(now + 4000);
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't-team', seq: 3, ev: { k: 'status', status: 'waiting_human' } });
+  assert.equal((await core.api(teamCtx, 'GET', '/api/unread', {})).body.unread['team-u'], 1);
+
+  // Archived conversations don't keep a project's dot lit forever.
+  await core.api(teamCtx, 'POST', '/api/tasks/t-team/archive', {});
+  assert.equal((await core.api(teamCtx, 'GET', '/api/unread', {})).body.unread['team-u'] ?? 0, 0);
+
+  cloud.setNow(null);
 });

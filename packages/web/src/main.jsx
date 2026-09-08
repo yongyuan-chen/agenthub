@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { createRoot } from 'react-dom/client';
 import { api, connectWs, getToken, setToken, clearToken, AuthError, ApiError, enablePush } from './api.js';
-import { state, subscribe, getVersion, applyWsMessage, bump, scopeKeyOf, resetUserState } from './store.js';
+import { state, subscribe, getVersion, applyWsMessage, bump, scopeKeyOf, resetUserState, seedTaskSeen } from './store.js';
 import { AuthScreen } from './login.jsx';
 import { SettingsModal } from './settings.jsx';
 import { AppShell } from './shell.jsx';
@@ -61,6 +61,10 @@ function App() {
     api.tasks().then(r => {
       if (state.userGeneration !== userGeneration || (state.taskEpochs[scopeKey] || 0) !== taskEpoch) return;
       const tasks = new Map(r.tasks.map(t => [t.id, t]));
+      // Read state rides along on the list response (it's per-user, so it
+      // can't come over the WS broadcast) — seed it before the tasks land,
+      // or every already-read conversation flashes an unread dot on load.
+      seedTaskSeen(r.tasks);
       state.scopeCache[scopeKey] = { ...(state.scopeCache[scopeKey] || {}), tasks };
       if (scopeKeyOf(state.activeTeamId) === scopeKey) { state.tasks = tasks; state.loaded = true; bump(); }
     }).catch(onAuthError);
@@ -105,6 +109,20 @@ function App() {
       state.sourceStatus[scopeKey] = { loading: false, error: error.message || '历史会话扫描失败', unavailableNodeIds: [] };
       if (scopeKeyOf(state.activeTeamId) === scopeKey) bump();
     });
+  };
+
+  // Unread counts for every scope at once. Polled rather than pushed: the WS
+  // only carries the scope it's connected to, so a project you're not looking
+  // at has no other way to tell this tab that something finished there. The
+  // active scope's own dot doesn't wait for this — it's computed live from
+  // state.tasks (see store.js's unreadForScope).
+  const refreshUnread = () => {
+    const userGeneration = state.userGeneration;
+    api.unread().then(r => {
+      if (state.userGeneration !== userGeneration) return;
+      state.unread = r.unread || {};
+      bump();
+    }).catch(() => {});
   };
 
   // Nodes only, sharing loadScopedData's cache handling. The setup wizard
@@ -152,6 +170,13 @@ function App() {
     // sets right after auth with this wrong-shaped one on every reload.
     api.me().then(r => setUser(r.user)).catch(onAuthError);
     loadScopedData(onAuthError);
+    refreshUnread();
+    // 45s, plus a catch-up whenever the tab comes back to the front — the
+    // common case for "a conversation finished while I was away" is returning
+    // to a tab that's been backgrounded (where timers are throttled anyway).
+    const unreadTimer = setInterval(refreshUnread, 45_000);
+    const onVisible = () => { if (!document.hidden) refreshUnread(); };
+    document.addEventListener('visibilitychange', onVisible);
     api.myTeams().then(r => {
       state.teams = r.teams;
       // A persisted project the account is no longer a member of (removed,
@@ -161,7 +186,11 @@ function App() {
       if (state.activeTeamId && !r.teams.some(x => x.id === state.activeTeamId)) switchTeam(null);
       bump();
     }).catch(() => {});
-    return () => ws.close();
+    return () => {
+      ws.close();
+      clearInterval(unreadTimer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authed]);
 
@@ -196,6 +225,9 @@ function App() {
     bump();
     wsRef.current?.reconnect();
     loadScopedData(() => {});
+    // The scope being left keeps its dot from the last poll; refresh so it
+    // reflects what was just read there rather than what was true 45s ago.
+    refreshUnread();
   };
 
   const togglePush = async () => {

@@ -81,6 +81,10 @@ export const api = {
   addProjectMember: (teamId, username) => req('POST', `/api/teams/${teamId}/members`, { username }),
   removeProjectMember: (teamId, userId) => req('DELETE', `/api/teams/${teamId}/members/${userId}`),
   tasks: () => req('GET', '/api/tasks'),
+  // Unread counts for every scope at once (see hub-core's /api/unread) — not
+  // scope-filtered, so deliberately sent without the X-Team-Id header.
+  unread: () => req('GET', '/api/unread', undefined, { skipTeamHeader: true }),
+  markTaskSeen: (id) => req('POST', `/api/tasks/${id}/seen`),
   conversationSources: () => req('GET', '/api/conversation-sources'),
   conversationSourceHistory: (id, { cursor = null, details = false } = {}) => {
     const params = new URLSearchParams();

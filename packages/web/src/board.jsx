@@ -7,6 +7,7 @@ import {
 } from './node-enrollment.js';
 import { state, bump, taskInScope } from './store.js';
 import { ModalBackdrop } from './modal.jsx';
+import { fmtAge } from './format.js';
 
 // The install command plus the AI-assist fallback. Shared by the "add node"
 // modal and the first-run wizard so both stay in step — onboarding is exactly
@@ -135,15 +136,6 @@ export const STATUS_META = {
   cancelled: { label: '已取消', cls: 'st-done' },
   unknown: { label: '状态未知', cls: 'st-failed' },
 };
-
-export function fmtAge(ts) {
-  if (!ts) return '';
-  const s = Math.max(0, (Date.now() - ts) / 1000);
-  if (s < 60) return `${s | 0}s`;
-  if (s < 3600) return `${(s / 60) | 0}m`;
-  if (s < 86400) return `${(s / 3600) | 0}h`;
-  return `${(s / 86400) | 0}d`;
-}
 
 // Archiving only hides a task from the sidebar (packages/worker/src/hub-core.mjs
 // archive/unarchive routes just set/clear tasks.archived_at, nothing executor-side)

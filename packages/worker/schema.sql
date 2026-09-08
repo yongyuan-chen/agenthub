@@ -332,3 +332,32 @@ CREATE TABLE IF NOT EXISTS node_teams (
 );
 CREATE INDEX IF NOT EXISTS idx_node_teams_team ON node_teams(team_id);
 CREATE INDEX IF NOT EXISTS idx_node_teams_node ON node_teams(node_id);
+
+-- Per-task run/attention timestamps. A side table for the same reason as
+-- task_teams above: this file is re-executed verbatim on every deploy, so
+-- adding columns to tasks with ALTER TABLE would break the second deploy.
+--   run_started_at: when the *current* turn began (transition into
+--     running/starting from anything else) — the live "已运行 12m03s" timer
+--     reads this. Deliberately not tasks.updated_at: cost/usage events bump
+--     that mid-turn, which would reset the timer every few seconds.
+--   attention_at: when the agent last stopped and needed a human (turn
+--     finished / failed / waiting on a decision) — exactly the transitions
+--     that already send a push. Compared against task_reads.seen_at to
+--     decide whether a conversation is "unread".
+CREATE TABLE IF NOT EXISTS task_activity (
+  task_id TEXT PRIMARY KEY,
+  run_started_at INTEGER,
+  attention_at INTEGER
+);
+
+-- Per-user read state: a project conversation is visible to every member, so
+-- "seen" can't live on the task row — each member clears their own dot by
+-- looking at the conversation. No row = never seen (anything with an
+-- attention_at is unread).
+CREATE TABLE IF NOT EXISTS task_reads (
+  user_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  seen_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_reads_user ON task_reads(user_id);
