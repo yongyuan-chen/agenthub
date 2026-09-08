@@ -99,9 +99,67 @@ function Editor({ file, onChange, onSave }) {
   );
 }
 
+
+const joinPath = (dir, name) => `${String(dir).replace(/\/+$/, '')}/${name}`;
+
+// One directory's children, rendered inline under it. Recursive rather than a
+// flattened list because the depth is what carries the structure — and because
+// collapsing a folder should take its whole subtree with it without any
+// bookkeeping about which rows belonged to it.
+//
+// Children are fetched the first time a folder is opened and then kept: a home
+// directory can hold hundreds of entries, and re-listing every one on each
+// toggle would make the tree feel slower the more you use it.
+function TreeLevel({ dir, depth, dirs, expanded, activePath, onToggle, onOpenFile }) {
+  const node = dirs.get(dir);
+  if (!node) return null;
+  if (node.loading) return <div className="muted file-tree-loading" style={{ paddingLeft: depth * 13 + 10 }}>载入中…</div>;
+  if (node.error) return <div className="err file-tree-error" style={{ paddingLeft: depth * 13 + 10 }}>无法读取:{node.error}</div>;
+  if (!node.entries.length) return <div className="muted file-tree-empty" style={{ paddingLeft: depth * 13 + 10 }}>空</div>;
+
+  return (
+    <>
+      {node.entries.map(entry => {
+        const full = joinPath(dir, entry.name);
+        const isDir = entry.type === 'dir';
+        const isOpen = expanded.has(full);
+        return (
+          <React.Fragment key={full}>
+            <button
+              type="button"
+              className={`file-entry ${isDir ? 'is-dir' : ''} ${activePath === full ? 'active' : ''}`}
+              style={{ paddingLeft: depth * 13 + 6 }}
+              onClick={() => (isDir ? onToggle(full) : onOpenFile(full))}
+              title={entry.name}
+            >
+              {/* The chevron column is reserved on files too, so names line up
+                  in a column instead of stepping in and out by folder. */}
+              <span className="file-entry-twisty">{isDir ? (isOpen ? '▾' : '▸') : ''}</span>
+              <span className="file-entry-icon">{isDir ? (isOpen ? '📂' : '📁') : '📄'}</span>
+              <span className="file-entry-name">{entry.name}</span>
+              {!isDir && <span className="muted file-entry-size">{fmtSize(entry.size)}</span>}
+            </button>
+            {isDir && isOpen && (
+              <TreeLevel
+                dir={full} depth={depth + 1} dirs={dirs} expanded={expanded}
+                activePath={activePath} onToggle={onToggle} onOpenFile={onOpenFile}
+              />
+            )}
+          </React.Fragment>
+        );
+      })}
+      {node.truncated && (
+        <div className="muted file-tree-empty" style={{ paddingLeft: depth * 13 + 10 }}>条目过多,只显示了前面一部分</div>
+      )}
+    </>
+  );
+}
+
 export function FilePane({ nodeId, taskId, onClose }) {
-  const [cwd, setCwd] = useState('');
-  const [listing, setListing] = useState(null);   // {path, parent, entries, truncated, error}
+  const [root, setRoot] = useState('');            // the folder the tree is rooted at
+  const [rootParent, setRootParent] = useState(null);
+  const [dirs, setDirs] = useState(() => new Map()); // path -> {entries, truncated, error, loading}
+  const [expanded, setExpanded] = useState(() => new Set());
   const [listError, setListError] = useState('');
   const [file, setFile] = useState(null);         // {path, content, mtime, binary, truncated, loadedAt}
   const [draft, setDraft] = useState('');
@@ -111,20 +169,58 @@ export function FilePane({ nodeId, taskId, onClose }) {
   const [conflict, setConflict] = useState(false);
   const node = state.nodes.get(nodeId);
 
-  const load = (path) => {
-    setListError('');
+  // Fetch one folder's children into `dirs`. Marking it loading first is what
+  // keeps a slow directory from looking like an empty one.
+  const fetchDir = (path, { asRoot = false, taskScoped = false } = {}) => {
+    setDirs(prev => new Map(prev).set(path, { entries: [], loading: true }));
     // taskId only steers the *first* listing — once the user navigates, an
     // explicit path always wins, or every click would bounce back to the
     // task's directory.
-    api.listNodeFiles(nodeId, path ?? '', path == null ? (taskId || '') : '')
-      .then(r => { setListing(r); setCwd(r.path || ''); })
-      .catch(e => setListError(e.message || '读取目录失败'));
+    return api.listNodeFiles(nodeId, taskScoped ? '' : path, taskScoped ? (taskId || '') : '')
+      .then(r => {
+        // The node resolves '~', a taskId, or a relative path into a real
+        // absolute one, and that resolved path — not what we asked for — is
+        // the key every child path is built from.
+        const resolved = r.path || path;
+        setDirs(prev => {
+          const next = new Map(prev);
+          if (resolved !== path) next.delete(path);
+          next.set(resolved, { entries: r.entries || [], truncated: !!r.truncated, error: r.error || null });
+          return next;
+        });
+        if (asRoot) { setRoot(resolved); setRootParent(r.parent ?? null); }
+        return resolved;
+      })
+      .catch(e => {
+        setDirs(prev => new Map(prev).set(path, { entries: [], error: e.message || '读取失败' }));
+        if (asRoot) setListError(e.message || '读取目录失败');
+      });
   };
-  useEffect(() => { load(null); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [nodeId]);
 
-  const openFile = (entry) => {
-    const full = `${cwd.replace(/\/+$/, '')}/${entry.name}`;
-    if (entry.type === 'dir') { load(full); return; }
+  // Re-root the tree (used by ".." and by the initial load). Collapsing
+  // everything is deliberate: the previous root's expansions describe a
+  // different subtree and would otherwise linger as stale state.
+  const reroot = (path, taskScoped = false) => {
+    setListError('');
+    setExpanded(new Set());
+    setDirs(new Map());
+    fetchDir(path ?? '', { asRoot: true, taskScoped });
+  };
+  useEffect(() => { reroot('', true); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [nodeId]);
+
+  const toggleDir = (path) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else {
+        next.add(path);
+        if (!dirs.has(path)) fetchDir(path);
+      }
+      return next;
+    });
+  };
+
+  const openFile = (full) => {
     if (dirty && !confirm('当前文件有未保存的修改,确定要打开别的文件吗?')) return;
     setSaveError(''); setConflict(false);
     api.readNodeFile(nodeId, full)
@@ -169,7 +265,7 @@ export function FilePane({ nodeId, taskId, onClose }) {
       <header className="pane-header">
         <div className="task-head">
           <h2>📁 {node?.name || nodeId}</h2>
-          <div className="muted file-pane-path" title={cwd}>{cwd ? shortPath(cwd) : '…'}</div>
+          <div className="muted file-pane-path" title={root}>{root ? shortPath(root) : '…'}</div>
         </div>
         {file && dirty && <span className="chip st-waiting">未保存</span>}
         {file && (
@@ -196,25 +292,21 @@ export function FilePane({ nodeId, taskId, onClose }) {
       <div className="file-body">
         <nav className="file-tree">
           {listError && <div className="err file-tree-error">{listError}</div>}
-          {listing?.error && <div className="err file-tree-error">无法读取:{listing.error}</div>}
-          {listing?.parent && (
-            <button type="button" className="file-entry file-entry-up" onClick={() => load(listing.parent)}>
-              <span className="file-entry-icon">↰</span>..
+          {/* Climbing out of the root re-roots the tree rather than nesting
+              upward — a tree whose root drifts toward / gets unusable fast. */}
+          {rootParent && (
+            <button type="button" className="file-entry file-entry-up" onClick={() => reroot(rootParent)}>
+              <span className="file-entry-twisty" />
+              <span className="file-entry-icon">↰</span>
+              <span className="file-entry-name">..</span>
             </button>
           )}
-          {(listing?.entries || []).map(entry => (
-            <button
-              type="button" key={entry.name}
-              className={`file-entry ${entry.type === 'dir' ? 'is-dir' : ''} ${file?.path?.endsWith('/' + entry.name) ? 'active' : ''}`}
-              onClick={() => openFile(entry)} title={entry.name}
-            >
-              <span className="file-entry-icon">{entry.type === 'dir' ? '📁' : '📄'}</span>
-              <span className="file-entry-name">{entry.name}</span>
-              {entry.type === 'file' && <span className="muted file-entry-size">{fmtSize(entry.size)}</span>}
-            </button>
-          ))}
-          {listing && !listing.entries.length && !listing.error && <div className="muted file-tree-empty">空目录</div>}
-          {listing?.truncated && <div className="muted file-tree-empty">条目过多,只显示了前面一部分</div>}
+          {root && (
+            <TreeLevel
+              dir={root} depth={0} dirs={dirs} expanded={expanded}
+              activePath={file?.path || null} onToggle={toggleDir} onOpenFile={openFile}
+            />
+          )}
         </nav>
 
         <section className="file-view">

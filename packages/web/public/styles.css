@@ -991,9 +991,15 @@ button.queued-msg-send:hover { background: var(--brand-deep); }
   display: flex; flex-direction: column; gap: 1px;
 }
 button.file-entry {
-  display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
-  background: transparent; border: 0; color: var(--fg); padding: 5px 8px;
+  display: flex; align-items: center; gap: 5px; width: 100%; text-align: left;
+  background: transparent; border: 0; color: var(--fg); padding: 4px 8px;
   border-radius: var(--radius-row); font-size: 13px; box-shadow: none; min-width: 0;
+}
+/* Reserved on files as well as folders, so names form one column instead of
+   stepping in and out depending on whether a row can expand. */
+.file-entry-twisty {
+  flex-shrink: 0; width: 12px; text-align: center; font-size: 11px;
+  color: var(--brand-deep); line-height: 1;
 }
 button.file-entry:hover { background: rgba(var(--brand-rgb), .09); }
 button.file-entry.active { background: rgba(var(--brand-rgb), .16); color: var(--brand-ink); font-weight: 500; }
@@ -1001,7 +1007,7 @@ button.file-entry.is-dir { font-weight: 500; }
 .file-entry-icon { flex-shrink: 0; font-size: 12px; }
 .file-entry-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-entry-size { flex-shrink: 0; font-size: 11px; }
-.file-tree-empty, .file-tree-error { padding: 10px 8px; font-size: 12.5px; }
+.file-tree-empty, .file-tree-error, .file-tree-loading { padding: 4px 8px; font-size: 12px; }
 .file-view { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
 .file-truncated { padding: 7px 14px; background: rgba(217, 160, 60, .1); border-bottom: 1px solid rgba(181, 122, 21, .3); font-size: 12px; }
 .file-editor { flex: 1; min-height: 0; position: relative; overflow: hidden; }
