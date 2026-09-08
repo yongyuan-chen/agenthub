@@ -18,30 +18,6 @@ export function nodeProjectLabels(node, teamNames = new Map()) {
   return teamIds.length ? teamIds.map(id => teamNames.get(id) || id) : ['个人'];
 }
 
-export function nodeEnrollmentMode(nodeId, ownedNodes = []) {
-  const trimmedId = String(nodeId || '').trim();
-  if (!trimmedId) return { kind: 'new-derived-id', nodeId: '' };
-  const matchingNode = ownedNodes.find(node => node.id === trimmedId);
-  return matchingNode
-    ? { kind: 'repair-owned', nodeId: trimmedId, matchingNode }
-    : { kind: 'new-explicit-id', nodeId: trimmedId };
-}
-
-export function enrollmentNeedsAcknowledgement(enrollment) {
-  return enrollment.kind !== 'new-explicit-id';
-}
-
-export function nodeIdValidationError(nodeId) {
-  if (!nodeId) return '';
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(nodeId)) {
-    return '这里应填写节点 ID，不能填写模型中转站或其他网址。';
-  }
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(nodeId)) {
-    return '节点 ID 只能包含英文字母、数字、点、下划线和短横线，且最长 128 个字符。';
-  }
-  return '';
-}
-
 export function buildNodeInstallCommand({ os, origin, token, nodeId = '', teamId = '' }) {
   if (os === 'windows') {
     return `$env:APP_URL='${origin}'; $env:USER_TOKEN='${token}'; ${teamId ? `$env:TEAM_ID='${teamId}'; ` : ''}${nodeId ? `$env:NODE_ID='${nodeId}'; ` : ''}Write-Host '[install] downloading AgentHub bootstrap...'; $agenthubInstaller = irm ${origin}/install.ps1 -TimeoutSec 60; & ([scriptblock]::Create($agenthubInstaller))`;

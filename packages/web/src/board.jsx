@@ -2,8 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { api, getToken } from './api.js';
 import {
-  buildNodeInstallCommand, enrollmentNeedsAcknowledgement, nodeDisplayName,
-  nodeEnrollmentMode, nodeIdValidationError, nodeLabels, nodeProjectLabels,
+  buildNodeInstallCommand, nodeDisplayName, nodeLabels, nodeProjectLabels,
   nodeRepairCommands,
 } from './node-enrollment.js';
 import { state, bump, taskInScope } from './store.js';
@@ -12,27 +11,7 @@ import { ModalBackdrop } from './modal.jsx';
 export function AddNodeModal({ onClose }) {
   const [copied, setCopied] = useState(false);
   const [os, setOs] = useState('unix'); // 'unix' | 'windows'
-  const [nodeId, setNodeId] = useState('');
-  const [ownedNodes, setOwnedNodes] = useState(null);
-  const [loadError, setLoadError] = useState('');
-  const [acknowledgedKey, setAcknowledgedKey] = useState('');
-  const loadSeq = useRef(0);
   const token = useRef(getToken()).current;
-
-  const loadOwnedNodes = async () => {
-    const seq = ++loadSeq.current;
-    setOwnedNodes(null); setLoadError(''); setAcknowledgedKey('');
-    try {
-      const result = await api.myNodes();
-      if (seq === loadSeq.current) setOwnedNodes(result.nodes || []);
-    } catch (e) {
-      if (seq === loadSeq.current) setLoadError(e.message || '节点清单加载失败');
-    }
-  };
-  useEffect(() => {
-    loadOwnedNodes();
-    return () => { loadSeq.current++; };
-  }, []);
 
   // Whichever scope is active right now (个人 / a specific team) becomes the
   // node's permanent binding at enrollment — nodes aren't auto-shared with
@@ -40,130 +19,42 @@ export function AddNodeModal({ onClose }) {
   // team-sharing redesign notes), so this is the only place that decision
   // gets made.
   const activeTeam = state.teams.find(t => t.id === state.activeTeamId);
-  const enrollment = nodeEnrollmentMode(nodeId, ownedNodes || []);
-  const nodeIdError = nodeIdValidationError(enrollment.nodeId);
-  const needsAcknowledgement = enrollmentNeedsAcknowledgement(enrollment);
-  const enrollmentKey = `${loadSeq.current}:${enrollment.kind}:${nodeId}:${enrollment.matchingNode?.id || ''}`;
-  const acknowledged = acknowledgedKey === enrollmentKey;
-  const canCopy = ownedNodes !== null && !nodeIdError && (!needsAcknowledgement || acknowledged);
-  const cmd = canCopy ? buildNodeInstallCommand({
-    os, origin: location.origin, token, nodeId: enrollment.nodeId, teamId: state.activeTeamId,
-  }) : '';
-  const inventoryRows = useMemo(() => {
-    const teamNames = new Map(state.teams.map(team => [team.id, team.name]));
-    return (ownedNodes || []).map(node => {
-      const isOnline = node.status === 'online';
-      return {
-        node, isOnline, statusLabel: isOnline ? '在线' : '离线',
-        labels: nodeLabels(node), projects: nodeProjectLabels(node, teamNames),
-      };
-    });
-  }, [ownedNodes, state.teams]);
+  // No node id is passed: the installer derives one from the target machine's
+  // hostname + OS username, and the server steps past any collision (see the
+  // autoName branch in hub-core.mjs). This modal used to ask the user to
+  // invent an id up front, which meant it also had to show their existing
+  // nodes, validate the format, and get a checkbox ticked to acknowledge that
+  // a clash would silently hijack another machine — a lot of ceremony to push
+  // a naming problem onto someone who has no way to answer it from a browser.
+  const cmd = buildNodeInstallCommand({ os, origin: location.origin, token, teamId: state.activeTeamId });
 
   const copy = async () => {
-    if (!canCopy) return;
     try { await navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 2000); }
     catch { /* clipboard unavailable, user can select manually */ }
   };
 
   return createPortal(
     <ModalBackdrop onClose={onClose}>
-      <div className="modal modal-lg add-node-modal" onClick={e => e.stopPropagation()}>
+      <div className="modal add-node-modal" onClick={e => e.stopPropagation()}>
         <h2>添加执行节点</h2>
-        <p className="muted">模型中转站配置在「设置」里保存一次即可,登录后自动下发到所有节点,不要把中转站地址填成节点 ID。</p>
         <p className="muted">
-          这台节点将绑定到:<b>{activeTeam ? activeTeam.name : '个人'}</b>
-          {activeTeam ? '(该项目成员都能在上面建任务)' : '(只有你自己能用)'} — 切换左侧的项目 tab 可以改变这里的绑定。
+          在要接入的机器上执行下面这条命令就行。节点名字会自动按「主机名-用户名」生成,重名会自动加后缀,
+          之后可以在「节点管理」里改显示名。缺 Node.js / Git / claude / codex 会自动装好。
         </p>
-
-        <section className="node-enrollment-inventory" aria-live="polite">
-          <div className="node-enrollment-heading">
-            <strong>当前账号已有节点</strong>
-            {ownedNodes !== null && <button type="button" className="ghost" onClick={loadOwnedNodes}>刷新</button>}
-          </div>
-          {ownedNodes === null && !loadError && <div className="muted">正在检查你已有的节点…</div>}
-          {loadError && (
-            <div className="node-enrollment-load-error">
-              <span className="err">无法读取已有节点:{loadError}</span>
-              <button type="button" className="ghost" onClick={loadOwnedNodes}>重试</button>
-            </div>
-          )}
-          {ownedNodes && !ownedNodes.length && <div className="muted">当前账号还没有节点。</div>}
-          {ownedNodes && ownedNodes.length > 0 && (
-            <>
-              <div className="node-enrollment-count">你已经添加了 {ownedNodes.length} 个节点。添加新机器时不要复用下面的节点 ID。</div>
-              <div className="node-enrollment-list">
-                {inventoryRows.map(({ node, isOnline, statusLabel, labels, projects }) => (
-                    <div className="node-enrollment-row" key={node.id}>
-                      <i className={`dot ${isOnline ? 'online' : ''}`} aria-label={statusLabel} />
-                      <div className="node-enrollment-row-body">
-                        <strong>{nodeDisplayName(node)}</strong>
-                        <code className="node-enrollment-id">ID: {node.id}</code>
-                        <span className="muted">
-                          {statusLabel}
-                          {node.last_heartbeat_at ? ` · 最后心跳 ${fmtAge(node.last_heartbeat_at)} 前` : ''}
-                          {labels.length ? ` · ${labels.join(' / ')}` : ''}
-                          {` · ${projects.join(' / ')}`}
-                        </span>
-                      </div>
-                    </div>
-                ))}
-              </div>
-            </>
-          )}
-        </section>
-
-        <label>
-          节点 ID(逻辑身份,不是显示名称)
-          <span className="muted">建议填写一个能唯一识别目标机器的 ID。留空时安装器会在目标机上根据“主机名-系统用户名”生成;显示名称可稍后在“节点管理”中修改。</span>
-          <input type="text" value={nodeId} onChange={e => setNodeId(e.target.value)} placeholder="例如:gpu31-chenyongyuan" />
-        </label>
-
-        {nodeIdError && <div className="node-enrollment-warning danger" role="alert"><strong>节点 ID 格式不正确</strong><span>{nodeIdError}</span></div>}
-        {enrollment.kind === 'repair-owned' && (
-          <div className="node-enrollment-warning danger" role="alert">
-            <strong>这是已有节点，不是新增节点</strong>
-            <span>输入的 ID 精确匹配“{nodeDisplayName(enrollment.matchingNode)}”({enrollment.nodeId})。在另一台机器执行下面的命令会轮换这个节点的 token，原机器下次重连时将失效。</span>
-          </div>
-        )}
-        {enrollment.kind === 'new-derived-id' && ownedNodes !== null && (
-          <div className="node-enrollment-warning" role="alert">
-            <strong>留空无法预先排除 ID 冲突</strong>
-            <span>浏览器不知道目标服务器最终生成的“主机名-系统用户名”。建议填写唯一 ID;如果生成结果与已有节点相同，也会重新接入并轮换旧 token。</span>
-          </div>
-        )}
-        {enrollment.kind === 'new-explicit-id' && ownedNodes !== null && !nodeIdError && (
-          <div className="node-enrollment-new-note">
-            “{enrollment.nodeId}”不在你的已有节点中，将按新增节点处理。节点 ID 全局唯一，如果已被其他账号占用，安装器会拒绝注册。
-          </div>
-        )}
-        {needsAcknowledgement && ownedNodes !== null && (
-          <label className="row-inline node-enrollment-ack">
-            <input type="checkbox" checked={acknowledged} onChange={e => setAcknowledgedKey(e.target.checked ? enrollmentKey : '')} />
-            {enrollment.kind === 'repair-owned'
-              ? '我确认要修复/重新接入这个已有节点，并知晓它会轮换 token。'
-              : '我已确认目标服务器自动生成的 ID 不会撞到上面的已有节点。'}
-          </label>
-        )}
+        <p className="muted">
+          这台机器会加入:<b>{activeTeam ? activeTeam.name : '个人'}</b>
+          {activeTeam ? '(项目成员都能用它建任务)' : '(只有你自己能用)'} — 切换左侧项目 tab 可改变这里。
+        </p>
 
         <nav className="tabs">
           <button type="button" className={os === 'unix' ? 'active' : ''} onClick={() => setOs('unix')}>macOS / Linux</button>
           <button type="button" className={os === 'windows' ? 'active' : ''} onClick={() => setOs('windows')}>Windows</button>
         </nav>
-        <label>
-          {enrollment.kind === 'repair-owned' ? '修复/重新接入已有节点命令' : '新增节点命令'}
-          <span className="muted">
-            {os === 'windows'
-              ? '在目标服务器的 PowerShell 里执行(Node.js、Git、Claude Code 缺失时会自动安装,无需管理员权限)'
-              : '在目标服务器上执行(Node.js、Claude Code 缺失时会自动安装;需要系统已有 git)'}
-          </span>
-          <textarea
-            readOnly rows={4}
-            value={cmd || '请先完成上方的节点检查和确认，安装命令随后显示。'}
-            onClick={e => e.target.select()}
-          />
-        </label>
-        <button type="button" onClick={copy} disabled={!canCopy}>{copied ? '已复制 ✓' : ownedNodes === null ? '检查已有节点后可复制' : nodeIdError ? '修正节点 ID 后可复制' : '复制命令'}</button>
+        <textarea
+          readOnly rows={4} value={cmd}
+          onClick={e => e.target.select()}
+        />
+        <button type="button" onClick={copy}>{copied ? '已复制 ✓' : '复制命令'}</button>
         <div className="modal-actions">
           <button type="button" className="ghost" onClick={onClose}>关闭</button>
         </div>

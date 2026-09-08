@@ -1480,24 +1480,48 @@ export async function api(ctx, method, pathname, body) {
     return ok({ nodes });
   }
   if (method === 'POST' && route[0] === 'nodes' && route.length === 1) {
-    const { id, tokenHash, labels } = body || {};
+    const { id, tokenHash, labels, autoName } = body || {};
     if (!id || !tokenHash) return err(400, 'id + tokenHash required');
     if (!(await assertTeamMember(ctx, ctx.teamId))) return err(403, 'not a member of that team');
-    const existing = await q(ctx.db, 'SELECT owner_user_id FROM nodes WHERE id = ?', id).first();
-    if (existing && existing.owner_user_id !== userId) return err(409, 'node id already taken');
+
+    // Two enrollment intents share this route, and they want opposite things
+    // when the id is already in use:
+    //
+    //   autoName=true  — "add a machine". The installer derived the id from
+    //     hostname+username without anyone choosing it, so a collision is an
+    //     accident, and the ON CONFLICT below would silently rotate the token
+    //     of whatever machine already holds that id, knocking it offline for
+    //     good (it can't re-auth, and nothing tells its owner why). Step to
+    //     the next free suffix instead and hand the real id back so the
+    //     installer writes *that* into its config.
+    //   autoName=false — "repair / re-enroll this exact node" (the offline
+    //     repair one-liner, which passes the existing id deliberately).
+    //     Rotating the token is the entire point there, so it is left alone.
+    let assignedId = id;
+    if (autoName) {
+      for (let suffix = 2; await q(ctx.db, 'SELECT 1 FROM nodes WHERE id = ?', assignedId).first(); suffix++) {
+        assignedId = `${id}-${suffix}`;
+      }
+    } else {
+      const existing = await q(ctx.db, 'SELECT owner_user_id FROM nodes WHERE id = ?', id).first();
+      if (existing && existing.owner_user_id !== userId) return err(409, 'node id already taken');
+    }
+    const registeredId = assignedId;
     await q(ctx.db,
       `INSERT INTO nodes (id, token_hash, owner_user_id, labels, status, created_at) VALUES (?, ?, ?, ?, 'offline', ?)
        ON CONFLICT(id) DO UPDATE SET token_hash = excluded.token_hash, labels = excluded.labels`,
-      id, tokenHash, userId, JSON.stringify(labels ?? []), ctx.now()).run();
+      registeredId, tokenHash, userId, JSON.stringify(labels ?? []), ctx.now()).run();
     // The team active in the browser when "添加节点" generated this install
     // command (see board.jsx) becomes this node's initial project — same
     // starting-point UX as before, but now additive rather than exclusive:
     // re-running install against an existing node id doesn't remove any
     // project associations it already picked up since then.
     if (ctx.teamId) {
-      await q(ctx.db, 'INSERT OR IGNORE INTO node_teams (node_id, team_id) VALUES (?, ?)', id, ctx.teamId).run();
+      await q(ctx.db, 'INSERT OR IGNORE INTO node_teams (node_id, team_id) VALUES (?, ?)', registeredId, ctx.teamId).run();
     }
-    return ok({ id });
+    // The installer must use the id we actually registered, not the one it
+    // asked for — under autoName they differ whenever there was a collision.
+    return ok({ id: registeredId });
   }
   // Add/remove an EXISTING node to/from a project after the fact — a node
   // can be shared with several projects at once, same as tasks. Owner-only;

@@ -2,10 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildNodeInstallCommand,
-  enrollmentNeedsAcknowledgement,
   nodeDisplayName,
-  nodeEnrollmentMode,
-  nodeIdValidationError,
   nodeLabels,
   nodeProjectLabels,
   nodeRepairCommands,
@@ -15,48 +12,6 @@ const nodes = [
   { id: 'gpu31', name: 'A100 训练机', labels: '["linux","a100"]', teamIds: ['team-a', 'missing-team'] },
   { id: 'Case-Sensitive', name: '', labels: 'legacy-invalid-json', teamIds: [] },
 ];
-
-test('node enrollment: exact owned ID is an acknowledged repair', () => {
-  const mode = nodeEnrollmentMode('  gpu31  ', nodes);
-  assert.equal(mode.kind, 'repair-owned');
-  assert.equal(mode.nodeId, 'gpu31');
-  assert.equal(mode.matchingNode, nodes[0]);
-  assert.equal(enrollmentNeedsAcknowledgement(mode), true);
-});
-
-test('node enrollment: matching stays case-sensitive', () => {
-  const mode = nodeEnrollmentMode('case-sensitive', nodes);
-  assert.deepEqual(mode, { kind: 'new-explicit-id', nodeId: 'case-sensitive' });
-  assert.equal(enrollmentNeedsAcknowledgement(mode), false);
-});
-
-test('node enrollment: explicit unknown ID is a normal new node', () => {
-  const mode = nodeEnrollmentMode('new-server', nodes);
-  assert.deepEqual(mode, { kind: 'new-explicit-id', nodeId: 'new-server' });
-  assert.equal(enrollmentNeedsAcknowledgement(mode), false);
-});
-
-test('node enrollment: blank ID is derived on target and requires acknowledgement', () => {
-  const mode = nodeEnrollmentMode('   ', nodes);
-  assert.deepEqual(mode, { kind: 'new-derived-id', nodeId: '' });
-  assert.equal(enrollmentNeedsAcknowledgement(mode), true);
-});
-
-test('node enrollment: URLs and shell-hostile IDs are rejected before command generation', () => {
-  assert.equal(
-    nodeIdValidationError(nodeEnrollmentMode('https://claudecode.yun:8081', nodes).nodeId),
-    '这里应填写节点 ID，不能填写模型中转站或其他网址。',
-  );
-  assert.equal(
-    nodeIdValidationError(nodeEnrollmentMode('https://legacy-node.example', [{ id: 'https://legacy-node.example' }]).nodeId),
-    '这里应填写节点 ID，不能填写模型中转站或其他网址。',
-    'even a legacy owned URL-shaped node cannot be repaired from the Add Node flow',
-  );
-  assert.match(nodeIdValidationError(nodeEnrollmentMode('bad id/with spaces', nodes).nodeId), /只能包含/);
-  assert.equal(nodeIdValidationError(nodeEnrollmentMode('gpu31', nodes).nodeId), '', 'an owned ID remains valid for explicit repair');
-  assert.equal(nodeIdValidationError(nodeEnrollmentMode('new_gpu.server-2', nodes).nodeId), '');
-  assert.equal(nodeIdValidationError(nodeEnrollmentMode('', nodes).nodeId), '', 'blank keeps the installer-derived-ID path');
-});
 
 test('node enrollment: presentation helpers have honest legacy fallbacks', () => {
   const teamNames = new Map([['team-a', '量化项目']]);

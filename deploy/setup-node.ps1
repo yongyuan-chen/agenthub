@@ -21,6 +21,11 @@ $TeamId = $env:TEAM_ID  # optional — binds this node to a team at enrollment
 # indication why. Different accounts on a shared box almost always mean
 # different Windows users too, so folding $env:USERNAME in avoids the
 # collision by default without anyone having to think about it.
+# $AutoName tells the server this id was derived rather than chosen, so a
+# collision should step to a free suffix instead of taking over whichever
+# machine already holds it. An explicit id means "this exact node" (the repair
+# one-liner) and keeps the take-over-and-rotate behaviour.
+$AutoName = -not $NodeIdArg
 $NodeId = if ($NodeIdArg) { $NodeIdArg } else { ("$env:COMPUTERNAME-$env:USERNAME".ToLower() -replace '[^a-z0-9-]', '-') -replace '-+$', '' -replace '^-+', '' }
 
 # Same one-liners setup-node.sh uses (node's own crypto, not a separate
@@ -34,11 +39,18 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
 }
 
 Write-Host "[node] enrolling $NodeId at $AppUrl$(if ($TeamId) { " (team $TeamId)" })"
-$body = @{ id = $NodeId; tokenHash = $TokenHash; labels = @('windows') } | ConvertTo-Json -Compress
+$body = @{ id = $NodeId; tokenHash = $TokenHash; labels = @('windows'); autoName = $AutoName } | ConvertTo-Json -Compress
 $Headers = @{ Authorization = "Bearer $UserToken" }
 if ($TeamId) { $Headers['x-team-id'] = $TeamId }
-Invoke-RestMethod -Method Post -Uri "$AppUrl/api/nodes" `
-  -Headers $Headers -ContentType 'application/json' -Body $body | Out-Null
+$Enrolled = Invoke-RestMethod -Method Post -Uri "$AppUrl/api/nodes" `
+  -Headers $Headers -ContentType 'application/json' -Body $body
+# Under $AutoName the server may hand back a different id than we asked for
+# (it stepped past a collision); the config below has to use the id actually
+# registered or this box would authenticate as nobody.
+if ($Enrolled.id -and $Enrolled.id -ne $NodeId) {
+  Write-Host "[node] '$NodeId' was already in use; this machine was registered as '$($Enrolled.id)'"
+  $NodeId = $Enrolled.id
+}
 
 $ConfigDir = "$env:USERPROFILE\.agenthub"
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null

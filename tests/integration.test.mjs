@@ -3630,6 +3630,49 @@ test('node registration: X-Team-Id at enroll time binds the node to that project
   assert.equal((await cloud.db.prepare('SELECT token_hash FROM nodes WHERE id = ?').bind('node-a').first()).token_hash, 'hash-a2');
 });
 
+// "Add node" no longer asks anyone to invent an id — the installer derives one
+// from hostname+username and sends autoName, so two machines that happen to
+// derive the same id must not silently steal each other's identity. Without
+// this, the second box rotates the first one's token and knocks it offline
+// permanently: it can't re-authenticate, and nothing anywhere says why.
+test('node enrollment: autoName steps past a collision instead of hijacking the node holding it', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-test', 'tester', 'x', 0, now).run();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-bob', 'bob', 'x', 0, now).run();
+
+  const first = await cloud.api('POST', '/api/nodes', { id: 'ubuntu-root', tokenHash: 'hash-1', autoName: true });
+  assert.equal(first.status, 200);
+  assert.equal(first.body.id, 'ubuntu-root');
+
+  // Same account, same derived id, a genuinely different machine.
+  const second = await cloud.api('POST', '/api/nodes', { id: 'ubuntu-root', tokenHash: 'hash-2', autoName: true });
+  assert.equal(second.status, 200);
+  assert.equal(second.body.id, 'ubuntu-root-2', 'server must hand back the id it actually registered');
+  const third = await cloud.api('POST', '/api/nodes', { id: 'ubuntu-root', tokenHash: 'hash-3', autoName: true });
+  assert.equal(third.body.id, 'ubuntu-root-3');
+
+  // The original box keeps its token: it is still online and still itself.
+  assert.equal((await cloud.db.prepare('SELECT token_hash FROM nodes WHERE id = ?').bind('ubuntu-root').first()).token_hash, 'hash-1');
+  assert.equal((await cloud.db.prepare('SELECT token_hash FROM nodes WHERE id = ?').bind('ubuntu-root-2').first()).token_hash, 'hash-2');
+
+  // Collisions are avoided across accounts too, so autoName never 409s and a
+  // stranger's node name can't block someone else's install.
+  const otherAccount = await core.api({ ...cloud.ctx, userId: 'user-bob' }, 'POST', '/api/nodes', { id: 'ubuntu-root', tokenHash: 'hash-bob', autoName: true });
+  assert.equal(otherAccount.status, 200);
+  assert.equal(otherAccount.body.id, 'ubuntu-root-4');
+  assert.equal((await cloud.db.prepare('SELECT owner_user_id FROM nodes WHERE id = ?').bind('ubuntu-root').first()).owner_user_id, 'user-test');
+
+  // Repair keeps working: an explicit id (no autoName) still re-enrolls that
+  // exact node and rotates its token on purpose.
+  const repair = await cloud.api('POST', '/api/nodes', { id: 'ubuntu-root', tokenHash: 'hash-repaired' });
+  assert.equal(repair.status, 200);
+  assert.equal(repair.body.id, 'ubuntu-root');
+  assert.equal((await cloud.db.prepare('SELECT token_hash FROM nodes WHERE id = ?').bind('ubuntu-root').first()).token_hash, 'hash-repaired');
+});
+
 // ---- Phase 3: admin user management + global overview ----
 
 test('admin users: non-admin gets 403 on every admin user-management route', async () => {

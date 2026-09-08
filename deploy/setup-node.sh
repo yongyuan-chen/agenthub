@@ -23,7 +23,16 @@ TEAM_ID="${TEAM_ID:-}"
 # mean different OS users too, so folding $(whoami) into the default is
 # enough to avoid the collision in the common case without anyone having to
 # think about it — NODE_ID is still there to override explicitly either way.
-NODE_ID="${1:-$(printf '%s-%s' "$(hostname -s)" "$(whoami)" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed -e 's/-*$//' -e 's/^-*//')}"
+# AUTO_NAME tells the server this id was derived, not chosen, so a collision
+# should step to a free suffix rather than take over the machine already
+# holding it. An explicitly passed id means "this exact node" (the repair
+# one-liner) and keeps the old take-over-and-rotate behaviour.
+if [ -n "${1:-}" ]; then
+  NODE_ID="$1"; AUTO_NAME=false
+else
+  NODE_ID="$(printf '%s-%s' "$(hostname -s)" "$(whoami)" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed -e 's/-*$//' -e 's/^-*//')"
+  AUTO_NAME=true
+fi
 NODE_TOKEN="$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64url"))')"
 TOKEN_HASH="$(printf '%s' "$NODE_TOKEN" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(require("crypto").createHash("sha256").update(d).digest("hex")))')"
 
@@ -47,7 +56,7 @@ echo "[node] enrolling $NODE_ID at $APP_URL${TEAM_ID:+ (team $TEAM_ID)}"
 ENROLL_RESP="$(curl -s -w $'\n%{http_code}' -X POST "$APP_URL/api/nodes" \
   -H "authorization: Bearer $USER_TOKEN" -H "content-type: application/json" \
   ${TEAM_ID:+-H "x-team-id: $TEAM_ID"} \
-  -d "{\"id\":\"$NODE_ID\",\"tokenHash\":\"$TOKEN_HASH\",\"labels\":[\"$(uname -s | tr '[:upper:]' '[:lower:]')\"]}")"
+  -d "{\"id\":\"$NODE_ID\",\"tokenHash\":\"$TOKEN_HASH\",\"labels\":[\"$(uname -s | tr '[:upper:]' '[:lower:]')\"],\"autoName\":$AUTO_NAME}")"
 ENROLL_HTTP_CODE="${ENROLL_RESP##*$'\n'}"
 ENROLL_BODY="${ENROLL_RESP%$'\n'*}"
 if [ "$ENROLL_HTTP_CODE" != "200" ]; then
@@ -57,6 +66,16 @@ if [ "$ENROLL_HTTP_CODE" != "200" ]; then
     echo "  NODE_ID=\"$NODE_ID-$(whoami)\" APP_URL=... USER_TOKEN=... bash deploy/setup-node.sh" >&2
   fi
   exit 1
+fi
+
+# Under AUTO_NAME the server may have handed back a different id than we asked
+# for (it stepped past a collision). Everything downstream — the config file,
+# the daemon's identity, the "done" message — has to use the id that was
+# actually registered, or this box would authenticate as nobody.
+REGISTERED_ID="$(printf '%s' "$ENROLL_BODY" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).id||"")}catch{process.stdout.write("")}})' 2>/dev/null || true)"
+if [ -n "$REGISTERED_ID" ] && [ "$REGISTERED_ID" != "$NODE_ID" ]; then
+  echo "[node] '$NODE_ID' was already in use; this machine was registered as '$REGISTERED_ID'"
+  NODE_ID="$REGISTERED_ID"
 fi
 
 mkdir -p "$HOME/.agenthub"
