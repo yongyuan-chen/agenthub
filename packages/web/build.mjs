@@ -42,14 +42,22 @@ fs.mkdirSync(outdir, { recursive: true });
 const dedupe = ['react', 'react-dom'];
 const alias = Object.fromEntries(dedupe.map(pkg => [pkg, path.resolve('node_modules', pkg)]));
 
+// ESM + splitting rather than a single IIFE: the file browser's editor
+// (CodeMirror) is ~300KB and most sessions never open a file, so it is
+// dynamically imported and esbuild emits it as a separate chunk that only
+// loads on first use. Splitting requires format:'esm', which is why
+// index.html loads app.js with type="module".
 await build({
   entryPoints: ['src/main.jsx'],
   bundle: true,
   minify: true,
-  format: 'iife',
+  format: 'esm',
+  splitting: true,
   jsx: 'automatic',
   alias,
-  outfile: path.join(outdir, 'app.js'),
+  outdir,
+  entryNames: 'app',
+  chunkNames: 'chunk-[hash]',
   define: { 'process.env.NODE_ENV': '"production"' },
   loader: { '.js': 'jsx' },
   logLevel: 'info',

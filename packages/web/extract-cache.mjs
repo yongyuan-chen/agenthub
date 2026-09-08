@@ -10,6 +10,8 @@ const WANT = [
   ['react-dom', '19.2.7'],
   ['scheduler', '0.27.0'],
   ['marked', '17.0.6'],
+  // File-browser editor; loaded as a separate chunk (see build.mjs).
+  ['codemirror', '6.0.2'],
   ['esbuild', '0.28.1'],
   ['@esbuild/darwin-arm64', '0.28.1'],
 ];

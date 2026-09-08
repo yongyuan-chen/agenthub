@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { externalSessionHistoryPage, listExternalSessions, listExternalSessionsForPaths } from './sessions.mjs';
+import { listDir, readFile, writeFile } from './files.mjs';
 import { PROTOCOL_VERSION, EXECUTOR_FEATURES } from '../../shared/protocol.mjs';
 
 // Which agent CLIs this machine can actually run. Probed once per process
@@ -288,6 +289,26 @@ export class CloudLink {
         break;
       case 'browse':
         this._send({ t: 'browse_result', requestId: msg.requestId, entries: listDirs(msg.path) });
+        break;
+      // File browser. Separate from 'browse' above, which answers the
+      // path-autocomplete question (directories only) — see files.mjs.
+      case 'list_dir': {
+        // No path + a taskId means "start where this task works". Only the
+        // node knows that path (it's the worktree it created), so resolving
+        // it here is what saves the browser from having to guess.
+        let target = msg.path;
+        if (!target && msg.taskId) target = this.db.getTask(msg.taskId)?.dir || '';
+        this._send({ t: 'list_dir_result', requestId: msg.requestId, ...listDir(target) });
+        break;
+      }
+      case 'read_file':
+        this._send({ t: 'read_file_result', requestId: msg.requestId, ...readFile(msg.path) });
+        break;
+      case 'write_file':
+        this._send({
+          t: 'write_file_result', requestId: msg.requestId,
+          ...writeFile(msg.path, msg.content, msg.expectedMtime ?? null),
+        });
         break;
       case 'list_sessions':
         this._send({ t: 'list_sessions_result', requestId: msg.requestId, sessions: listExternalSessions(msg.path) });

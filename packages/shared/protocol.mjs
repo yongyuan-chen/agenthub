@@ -93,6 +93,16 @@ export const DEFAULT_BACKEND = 'claude';
 //                                                          not tied to a task — used to autocomplete project paths.
 // {t:'list_project_sessions', requestId, paths}            scans external Claude histories for task-derived directories.
 // {t:'read_project_session', requestId, sessionId, cwd, before?, turns} reads one page of an authorized history without adopting it.
+// {t:'list_dir', requestId, path?, taskId?}                cloud-initiated, answered by list_dir_result. Unlike 'browse'
+//                                                          (directories only, for path autocomplete) this returns files too,
+//                                                          with size/mtime. taskId with no path resolves that task's own
+//                                                          working directory — the worktree path is known only to the node.
+// {t:'read_file', requestId, path}                         answered by read_file_result: {content, encoding, size, mtime,
+//                                                          truncated, binary}. Binary (and images) come back base64.
+// {t:'write_file', requestId, path, content, expectedMtime} answered by write_file_result. expectedMtime is an optimistic
+//                                                          lock, NOT a security control: the agent is very likely editing
+//                                                          these same files, and an unconditional write would silently
+//                                                          discard whatever it just did.
 // ---- Cloud -> Frontend messages ----
 // {t:'snapshot', tasks, nodes}
 // {t:'task', task}
@@ -132,9 +142,21 @@ export function isValidClientMessageId(value) {
 // silently drop them and answer a question about a picture it never received —
 // so unlike MESSAGE_ACK there is no safe degraded behaviour, and the cloud
 // refuses the creation with a "node is still upgrading" message instead.
+// FILE_IO: this node can list/read/write arbitrary files on its own machine
+// (the file browser). Nothing degrades gracefully here — a node without it
+// simply has no such handler and would never answer — so the cloud refuses the
+// request with "this node needs upgrading" rather than hanging until timeout.
 export const FEATURE_MESSAGE_ACK = 'message-ack';
 export const FEATURE_TASK_IMAGES = 'task-images';
-export const EXECUTOR_FEATURES = [FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES];
+export const FEATURE_FILE_IO = 'file-io';
+export const EXECUTOR_FEATURES = [FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO];
+
+// Caps for the file browser, shared so the executor and the cloud agree.
+// A file's bytes travel as JSON over the node WebSocket and then over the
+// HTTP response, so this is about keeping a single message sane, not about
+// what the editor can display.
+export const MAX_FILE_READ_BYTES = 1_000_000;
+export const MAX_DIR_ENTRIES = 2000;
 
 // How long an accepted-but-undelivered send keeps being retried at the node
 // before the cloud gives up and marks it failed. Long enough to cover a node

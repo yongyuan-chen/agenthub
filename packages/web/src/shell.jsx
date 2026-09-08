@@ -6,6 +6,7 @@ import { Sidebar } from './sidebar.jsx';
 import { TaskPane } from './task.jsx';
 import { DraftPane } from './draftpane.jsx';
 import { ConversationSourcePane } from './sourcepane.jsx';
+import { FilePane } from './filepane.jsx';
 import { STATUS_META } from './board.jsx';
 import { MobileConversationSwitcher } from './mobileswitcher.jsx';
 import { layoutNeedsSave, mergeCloudLayout } from './layout-sync.js';
@@ -15,7 +16,16 @@ const ACTIVE_PANE_KEY = 'agenthub_active_panes';
 const DRAG_MIME = 'application/x-agenthub-task';
 const isDraft = (id) => typeof id === 'string' && id.startsWith('draft-');
 const isSource = (id) => typeof id === 'string' && id.startsWith('source:');
-const isTransientPane = (id) => isDraft(id) || isSource(id);
+// files:<nodeId>[:<taskId>] — a filesystem browser for one node, tileable
+// next to the conversation it belongs to. Transient like a draft: it holds no
+// server-side identity, so syncing it across devices would restore a pane
+// pointing at a machine the other device may not even be looking at.
+const isFiles = (id) => typeof id === 'string' && id.startsWith('files:');
+const parseFilesPane = (id) => {
+  const [, nodeId = '', taskId = ''] = id.split(':');
+  return { nodeId, taskId };
+};
+const isTransientPane = (id) => isDraft(id) || isSource(id) || isFiles(id);
 // scopeKeyOf lives in store.js now — it's also used there for the
 // tasks/nodes cache, and the two must always agree on what "personal" is
 // called or a scope's pane list and its task/node cache silently disagree
@@ -347,6 +357,10 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
     setOpenPanes(p => {
       const kept = p.filter(id => {
         if (isDraft(id)) return true;
+        // A file browser has no server-side identity to check for — without
+        // this it falls through to the task lookup below, finds nothing, and
+        // is pruned in the same commit that opened it.
+        if (isFiles(id)) return true;
         if (isSource(id)) return state.conversationSources.has(id.slice(7));
         return pendingTaskIds.current.has(id) || (state.tasks.has(id) && !state.tasks.get(id)?.archived_at);
       });
@@ -434,6 +448,10 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
   const itemForPane = (id) => {
     if (!id) return null;
     if (isDraft(id)) return { paneId: id, kind: 'draft', title: '新对话' };
+    if (isFiles(id)) {
+      const { nodeId } = parseFilesPane(id);
+      return { paneId: id, kind: 'files', title: `📁 ${state.nodes.get(nodeId)?.name || nodeId}` };
+    }
     if (isSource(id)) {
       const source = state.conversationSources.get(id.slice(7));
       return source ? { paneId: id, kind: 'source', title: source.preview || 'Claude Code 历史对话', ...source } : null;
@@ -491,13 +509,20 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
                 if (!isTransientPane(id)) location.hash = `#/task/${id}`;
               }}
             >
-              {isDraft(id)
+              {isFiles(id)
+                ? <FilePane {...parseFilesPane(id)} onClose={() => closePane(id)} />
+                : isDraft(id)
                 ? <DraftPane onCreated={(realId) => replacePane(id, realId)} onClose={() => closePane(id)} />
                 : isSource(id)
                   ? (state.conversationSources.has(id.slice(7))
                       ? <ConversationSourcePane source={state.conversationSources.get(id.slice(7))} onActivated={(realId) => replacePane(id, realId)} onClose={() => closePane(id)} />
                       : null)
-                  : (state.tasks.has(id) ? <TaskPane taskId={id} user={user} onClose={() => closePane(id)} /> : null)}
+                  : (state.tasks.has(id)
+                      ? <TaskPane
+                          taskId={id} user={user} onClose={() => closePane(id)}
+                          onOpenFiles={(nodeId) => addPane(`files:${nodeId}:${id}`)}
+                        />
+                      : null)}
             </div>
           ))}
           {!openPanes.length && (

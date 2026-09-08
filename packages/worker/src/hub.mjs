@@ -66,6 +66,13 @@ export class Hub {
       },
       browseNode: (nodeId, path) => this.askNode(nodeId, { t: 'browse', path }).then(r => (r ? { entries: r.entries || [] } : null)),
       listSessions: (nodeId, path) => this.askNode(nodeId, { t: 'list_sessions', path }).then(r => (r ? { sessions: r.sessions || [] } : null)),
+      // File browser. Longer timeouts than browse: a cold directory on a
+      // network mount, or a megabyte of file bytes, is legitimately slower
+      // than the autocomplete round trip these sit next to.
+      listDir: (nodeId, path, taskId) => this.askNode(nodeId, { t: 'list_dir', path, taskId }, 12_000),
+      readFile: (nodeId, path) => this.askNode(nodeId, { t: 'read_file', path }, 20_000),
+      writeFile: (nodeId, path, content, expectedMtime) =>
+        this.askNode(nodeId, { t: 'write_file', path, content, expectedMtime }, 20_000),
       listProjectSessions: (nodeId, paths) => this.askNode(nodeId, { t: 'list_project_sessions', paths }, 12_000)
         .then(r => (r ? { sessions: r.sessions || [] } : null)),
       readProjectSession: (nodeId, sessionId, cwd, options = {}) => this.askNode(nodeId, {

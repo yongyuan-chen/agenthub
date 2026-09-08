@@ -5006,3 +5006,80 @@ test('unread: finishing marks the conversation and its project; looking at it cl
 
   cloud.setNow(null);
 });
+
+// The file browser reaches into a real machine's filesystem through the cloud,
+// so the gates matter more than the happy path: only the machine's owner, and
+// only nodes that actually have the handlers (an older one would never answer
+// and the user would watch a spinner until the askNode timeout).
+test('node files: owner-only, and refused for a node without the file-io feature', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-test', 'tester', 'x', 0, now).run();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-bob', 'bob', 'x', 0, now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('n1', 'h', 'user-test', 'online', now).run();
+
+  cloud.ctx.listDir = async () => ({ path: '/home/me', parent: '/home', entries: [{ name: 'a.js', type: 'file', size: 3 }] });
+  cloud.ctx.readFile = async () => ({ path: '/home/me/a.js', content: 'hi\n', encoding: 'utf8', size: 3, mtime: 111 });
+  cloud.ctx.writeFile = async () => ({ ok: true, mtime: 222, size: 5 });
+
+  // No node_features row yet = a node that hasn't reconnected on a build with
+  // the handlers. Refused with an explanation rather than left to time out.
+  // The harness hands pathName straight to core.api without parsing a query
+  // string (hub.mjs does that in the real request path), so GET params go in
+  // the body argument — same as the existing /browse tests above.
+  const tooOld = await cloud.api('GET', '/api/nodes/n1/files', { path: '/home/me' });
+  assert.equal(tooOld.status, 409);
+
+  await cloud.db.prepare('INSERT INTO node_features (node_id, features, updated_at) VALUES (?, ?, ?)')
+    .bind('n1', JSON.stringify(['file-io']), now).run();
+
+  const list = await cloud.api('GET', '/api/nodes/n1/files', { path: '/home/me' });
+  assert.equal(list.status, 200);
+  assert.deepEqual(list.body.entries.map(e => e.name), ['a.js']);
+  assert.equal(list.body.parent, '/home', 'the parent comes through so the UI can navigate up');
+
+  const read = await cloud.api('GET', '/api/nodes/n1/file', { path: '/home/me/a.js' });
+  assert.equal(read.status, 200);
+  assert.equal(read.body.content, 'hi\n');
+  assert.equal(read.body.mtime, 111, 'mtime round-trips — it is the save-time conflict check');
+
+  const write = await cloud.api('POST', '/api/nodes/n1/file', { path: '/home/me/a.js', content: 'bye\n', expectedMtime: 111 });
+  assert.equal(write.status, 200);
+  assert.equal(write.body.mtime, 222);
+
+  // Someone else's machine, even a real logged-in account.
+  for (const call of [
+    ['GET', '/api/nodes/n1/files'],
+    ['GET', '/api/nodes/n1/file'],
+    ['POST', '/api/nodes/n1/file'],
+  ]) {
+    const res = await core.api({ ...cloud.ctx, userId: 'user-bob' }, call[0], call[1], { path: '/x', content: 'x' });
+    assert.equal(res.status, 404, `${call[0]} ${call[1]} must not expose another owner's node`);
+  }
+});
+
+test('node files: a save that lost a race with the agent comes back as a conflict, not a failure', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-test', 'tester', 'x', 0, now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('n1', 'h', 'user-test', 'online', now).run();
+  await cloud.db.prepare('INSERT INTO node_features (node_id, features, updated_at) VALUES (?, ?, ?)')
+    .bind('n1', JSON.stringify(['file-io']), now).run();
+
+  cloud.ctx.writeFile = async () => ({ ok: false, conflict: true, mtime: 999 });
+  const res = await cloud.api('POST', '/api/nodes/n1/file', { path: '/x', content: 'mine', expectedMtime: 1 });
+  assert.equal(res.status, 409);
+  // The frontend needs the flag to offer reload-or-overwrite rather than just
+  // printing "save failed".
+  assert.equal(JSON.parse(res.body.error).conflict, true);
+
+  // A node that never answers must not look like a successful save.
+  cloud.ctx.writeFile = async () => null;
+  const dead = await cloud.api('POST', '/api/nodes/n1/file', { path: '/x', content: 'mine' });
+  assert.equal(dead.status, 504);
+});

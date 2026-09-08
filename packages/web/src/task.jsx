@@ -723,7 +723,7 @@ export function ConversationMessages({ messages, task = null, isCreator = false,
   );
 }
 
-export function TaskPane({ taskId, user, onClose }) {
+export function TaskPane({ taskId, user, onClose, onOpenFiles }) {
   const task = state.tasks.get(taskId);
   // Visibility can be team-wide, but actions stay creator-only (see the
   // hub-core.mjs guard this mirrors) — falls back to true if owner_user_id
@@ -997,6 +997,12 @@ export function TaskPane({ taskId, user, onClose }) {
             <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{label}</button>
           ))}
         </nav>
+        {/* Opens a file browser for this task's node, starting in its own
+            working directory — the pane tiles alongside the conversation so
+            you can read the code while the agent talks about it. */}
+        {onOpenFiles && task.node_id && (
+          <button type="button" className="ghost" title="浏览这台机器上的文件" onClick={() => onOpenFiles(task.node_id)}>📁 文件</button>
+        )}
         {onClose && <button type="button" className="ghost pane-close-btn" onClick={onClose} aria-label="关闭">✕</button>}
       </header>
 

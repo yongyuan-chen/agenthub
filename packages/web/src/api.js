@@ -51,6 +51,14 @@ export const api = {
   saveSettings: (settings) => req('POST', '/api/settings', settings),
   recentRepos: () => req('GET', '/api/recent-repos'),
   browseNode: (nodeId, path) => req('GET', `/api/nodes/${nodeId}/browse?path=${encodeURIComponent(path)}`),
+  // File browser. taskId with no path asks the node to start in that task's
+  // own working directory — only it knows the worktree path.
+  listNodeFiles: (nodeId, path = '', taskId = '') =>
+    req('GET', `/api/nodes/${nodeId}/files?path=${encodeURIComponent(path)}&taskId=${encodeURIComponent(taskId)}`),
+  readNodeFile: (nodeId, path) =>
+    req('GET', `/api/nodes/${nodeId}/file?path=${encodeURIComponent(path)}`),
+  writeNodeFile: (nodeId, path, content, expectedMtime) =>
+    req('POST', `/api/nodes/${nodeId}/file`, { path, content, expectedMtime }),
   listNodeSessions: (nodeId, path) => req('GET', `/api/nodes/${nodeId}/sessions?path=${encodeURIComponent(path)}`),
   switchSession: (taskId, sessionId) => req('POST', `/api/tasks/${taskId}/switch-session`, { sessionId }),
   switchModel: (taskId, modelProfileId) => req('POST', `/api/tasks/${taskId}/switch-model`, { modelProfileId }),

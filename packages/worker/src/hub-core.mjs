@@ -12,7 +12,7 @@
 //   listSessions(nodeId, path)    -> Promise<{sessions}|null> (same shape, lists existing claude sessions for a path)
 //   push(payload, ownerUserId)    -> void    (web push fan-out, fire and forget)
 //   now()                         -> epoch ms
-import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES } from '../../shared/protocol.mjs';
+import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
 import * as accounts from './accounts.mjs';
 import { hashPassword } from './auth.mjs';
 
@@ -2027,6 +2027,66 @@ export async function api(ctx, method, pathname, body) {
     const result = await ctx.browseNode(nodeId, path);
     if (!result) return ok({ entries: [] });
     return ok({ entries: result.entries || [] });
+  }
+
+  // ---- file browser ----
+  // Owner-only, matching /browse above: a project member can create tasks on a
+  // shared node, but reading and writing its filesystem is the machine
+  // owner's own business. Every one of these needs the node to be on a build
+  // that has the handlers at all, hence the FEATURE_FILE_IO gate — without it
+  // the request would simply never be answered and the user would watch a
+  // spinner until the askNode timeout.
+  const fileNodeGuard = async (nodeId) => {
+    const node = await q(ctx.db, 'SELECT id FROM nodes WHERE id = ? AND owner_user_id = ?', nodeId, userId).first();
+    if (!node) return err(404, 'node not found');
+    if (!(await nodeSupports(ctx.db, nodeId, FEATURE_FILE_IO))) {
+      return err(409, '这台节点还没升级到支持文件浏览,等它自动更新后重试');
+    }
+    return null;
+  };
+
+  if (method === 'GET' && route[0] === 'nodes' && route.length === 3 && route[2] === 'files') {
+    const nodeId = route[1];
+    const denied = await fileNodeGuard(nodeId);
+    if (denied) return denied;
+    const result = await ctx.listDir(nodeId, body?.path || '', body?.taskId || null);
+    if (!result) return err(504, '节点没有响应');
+    return ok({
+      path: result.path, parent: result.parent ?? null,
+      entries: result.entries || [], truncated: !!result.truncated, error: result.error ?? null,
+    });
+  }
+
+  if (method === 'GET' && route[0] === 'nodes' && route.length === 3 && route[2] === 'file') {
+    const nodeId = route[1];
+    const denied = await fileNodeGuard(nodeId);
+    if (denied) return denied;
+    if (!body?.path) return err(400, 'path required');
+    const result = await ctx.readFile(nodeId, body.path);
+    if (!result) return err(504, '节点没有响应');
+    if (result.error) return err(404, result.error);
+    return ok({
+      path: result.path, content: result.content ?? '', encoding: result.encoding || 'utf8',
+      binary: !!result.binary, size: result.size ?? 0, mtime: result.mtime ?? null,
+      truncated: !!result.truncated,
+    });
+  }
+
+  if (method === 'POST' && route[0] === 'nodes' && route.length === 3 && route[2] === 'file') {
+    const nodeId = route[1];
+    const denied = await fileNodeGuard(nodeId);
+    if (denied) return denied;
+    if (!body?.path) return err(400, 'path required');
+    if (typeof body.content !== 'string') return err(400, 'content required');
+    if (body.content.length > MAX_FILE_READ_BYTES) return err(413, '文件太大');
+    const result = await ctx.writeFile(nodeId, body.path, body.content, body.expectedMtime ?? null);
+    if (!result) return err(504, '节点没有响应');
+    // A conflict is a normal outcome, not a failure: the agent changed the
+    // file while it was open. 409 lets the frontend offer reload-or-overwrite
+    // instead of just reporting "save failed".
+    if (result.conflict) return err(409, JSON.stringify({ conflict: true, mtime: result.mtime ?? null }));
+    if (!result.ok) return err(400, result.error || 'write failed');
+    return ok({ mtime: result.mtime ?? null, size: result.size ?? 0 });
   }
 
   if (method === 'GET' && route[0] === 'nodes' && route.length === 3 && route[2] === 'sessions') {

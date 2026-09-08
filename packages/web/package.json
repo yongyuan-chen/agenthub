@@ -8,13 +8,22 @@
     "install:offline": "node extract-cache.mjs && npm install --omit=optional --no-audit --no-fund --no-save ./vendor/*.tgz"
   },
   "dependencies": {
+    "@codemirror/lang-css": "^6.3.1",
+    "@codemirror/lang-html": "^6.4.12",
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/lang-json": "^6.0.2",
+    "@codemirror/lang-markdown": "^6.5.2",
+    "@codemirror/lang-python": "^6.2.1",
+    "@codemirror/state": "^6.7.4",
+    "@codemirror/view": "^6.43.11",
+    "codemirror": "^6.0.2",
     "marked": "17.0.6",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "scheduler": "0.27.0"
   },
   "devDependencies": {
-    "esbuild": "0.28.1",
-    "@esbuild/darwin-arm64": "0.28.1"
+    "@esbuild/darwin-arm64": "0.28.1",
+    "esbuild": "0.28.1"
   }
 }
