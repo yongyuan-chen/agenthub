@@ -365,6 +365,12 @@ export async function absorbEvent(ctx, nodeId, { taskId, seq, ev }) {
     if (prev !== ev.status) {
       notifyStatus(ctx, { ...task, status: ev.status, last_error: extra.error }, extra);
     }
+    // The turn just ended — hand the agent whatever the human queued while it
+    // was busy. Keyed on the transition, not the new status alone, so a
+    // repeated 'running' heartbeat can't release anything mid-turn.
+    if (BUSY_STATUSES.has(prev) && !BUSY_STATUSES.has(ev.status)) {
+      await releaseNextQueuedMessage(ctx, { ...task, status: ev.status });
+    }
   } else if (ev.k === 'session' && fresh) {
     await q(ctx.db, 'UPDATE tasks SET session_id = ?, updated_at = ? WHERE id = ?', ev.sessionId, now, taskId).run();
     await broadcastTask(ctx, taskId);
@@ -600,7 +606,36 @@ function userMessagePayload(row) {
 // deliberately not also durable_cmds, whose ack means "the node wrote it
 // down", a weaker signal than the one used here ("the node put it in the
 // conversation") and one that would double-send on every reconnect.
-async function acceptUserMessage(ctx, task, clientMessageId, text, images, senderUserId) {
+// A turn is in flight. Sending into one isn't an error — the CLI accepts the
+// write — but the human loses all control of it: it's already gone by the time
+// they realise the agent was about to do the thing they were trying to
+// redirect, and there's nothing left to edit or take back. Holding it here
+// instead keeps it editable and cancellable until the turn actually ends.
+const BUSY_STATUSES = new Set(['running', 'starting']);
+const isTaskBusy = (task) => BUSY_STATUSES.has(task?.status);
+
+// Exactly one, deliberately: delivering it puts the task straight back into
+// 'running', so anything else still queued has to wait for *that* turn to end
+// too. Draining the whole queue at once would dump every held message into a
+// single turn, which is the opposite of what queueing them was for.
+async function releaseNextQueuedMessage(ctx, task) {
+  const row = await q(ctx.db,
+    "SELECT * FROM outbound_messages WHERE task_id = ? AND state = 'queued' ORDER BY created_at LIMIT 1",
+    task.id).first();
+  if (!row) return false;
+  const now = ctx.now();
+  await q(ctx.db,
+    "UPDATE outbound_messages SET state = 'pending', updated_at = ? WHERE task_id = ? AND client_message_id = ?",
+    now, task.id, row.client_message_id).run();
+  const released = { ...row, state: 'pending', updated_at: now };
+  const teamIds = await taskTeamIds(ctx, task.id);
+  fanOutToTeamsOrOwner(ctx, { t: 'pending_msg', taskId: task.id, pending: pendingRowToWire(released) },
+    task.owner_user_id, teamIds);
+  await deliverPendingMessage(ctx, released);
+  return true;
+}
+
+async function acceptUserMessage(ctx, task, clientMessageId, text, images, senderUserId, { queue = false } = {}) {
   const now = ctx.now();
   const existing = await q(ctx.db,
     'SELECT * FROM outbound_messages WHERE task_id = ? AND client_message_id = ?',
@@ -608,12 +643,13 @@ async function acceptUserMessage(ctx, task, clientMessageId, text, images, sende
   // Same id arriving twice is a retry of one send (a re-sent fetch, an
   // impatient second click), not two messages — keep the original row so the
   // text can never be queued, and therefore answered, twice.
+  const hold = queue && isTaskBusy(task);
   if (!existing) {
     await q(ctx.db,
       `INSERT INTO outbound_messages (task_id, client_message_id, node_id, sender_user_id, payload, state, attempts, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
       task.id, clientMessageId, task.node_id, senderUserId ?? null,
-      JSON.stringify({ text, images }), now, now).run();
+      JSON.stringify({ text, images }), hold ? 'queued' : 'pending', now, now).run();
   }
   const row = existing ?? await q(ctx.db,
     'SELECT * FROM outbound_messages WHERE task_id = ? AND client_message_id = ?',
@@ -624,6 +660,9 @@ async function acceptUserMessage(ctx, task, clientMessageId, text, images, sende
   // via GET /messages, so an in-flight message is never invisible content.
   fanOutToTeamsOrOwner(ctx, { t: 'pending_msg', taskId: task.id, pending: pendingRowToWire(row) },
     task.owner_user_id, teamIds);
+  // Held for the current turn — nothing goes on the wire, and the row stays
+  // editable until releaseNextQueuedMessage picks it up.
+  if (row.state === 'queued') return { queued: true, held: true };
   const delivered = await deliverPendingMessage(ctx, row);
   // A node that can't echo the id back can never settle this row, and
   // retrying it would make that node re-run the turn for real — burning relay
@@ -1204,11 +1243,20 @@ export async function api(ctx, method, pathname, body) {
         await dispatch(ctx, task.node_id, { t: 'user_message', taskId, text: body.text || '', images });
         return ok({ delivery: 'dispatched' });
       }
-      const { queued } = await acceptUserMessage(ctx, task, clientMessageId, body.text || '', images, userId);
+      // queue=true asks for the message to be held if a turn is already in
+      // flight (the default the composer sends). An explicit false is "send it
+      // into the running turn anyway", which is the old behaviour and what
+      // 关闭排队 falls back to.
+      const { queued, held } = await acceptUserMessage(
+        ctx, task, clientMessageId, body.text || '', images, userId,
+        { queue: body?.queue !== false },
+      );
       // 'queued' is an honest answer, not a failure: the message is durable
       // and will be delivered when the node comes back. The frontend shows it
       // as a still-in-flight bubble rather than pretending it's been answered.
-      return ok({ delivery: queued ? 'queued' : 'sent', clientMessageId });
+      // 'held' distinguishes "waiting for this turn to finish" from "waiting
+      // for the node to come back" — same row, very different explanation.
+      return ok({ delivery: held ? 'held' : queued ? 'queued' : 'sent', clientMessageId });
     }
     if (method === 'POST' && action === 'retry-message') {
       // Same creator/member gate as sending (see messageAllowed above) — a
@@ -1218,6 +1266,40 @@ export async function api(ctx, method, pathname, body) {
       if (!isValidClientMessageId(clientMessageId)) return err(400, 'invalid clientMessageId');
       const retried = await retryOutboundMessage(ctx, task, clientMessageId);
       if (!retried) return err(404, 'no pending message with that id');
+      return ok({});
+    }
+    // Editing and cancelling only ever apply to a message still held for the
+    // current turn. The state check is the whole guarantee: once a row has
+    // been released it is on its way to the node (or already answered), and
+    // rewriting it then would change a message the agent has arguably already
+    // read. Racing the release simply loses — the row is no longer 'queued',
+    // so both routes 404 rather than silently doing nothing.
+    if ((method === 'POST' || method === 'DELETE') && action === 'queued-message') {
+      if (!isCreator) return err(403, 'only the creator can change queued messages');
+      const clientMessageId = body?.clientMessageId ?? route[3];
+      if (!isValidClientMessageId(clientMessageId)) return err(400, 'invalid clientMessageId');
+      const row = await q(ctx.db,
+        "SELECT * FROM outbound_messages WHERE task_id = ? AND client_message_id = ? AND state = 'queued'",
+        taskId, clientMessageId).first();
+      if (!row) return err(404, 'no queued message with that id');
+      const teamIds = await taskTeamIds(ctx, taskId);
+      if (method === 'DELETE') {
+        await q(ctx.db, 'DELETE FROM outbound_messages WHERE task_id = ? AND client_message_id = ?',
+          taskId, clientMessageId).run();
+        // Same removal channel the delivery path uses, so every viewer drops
+        // the bubble the same way; 'cancelled' only distinguishes why.
+        fanOutToTeamsOrOwner(ctx, { t: 'pending_settled', taskId, clientMessageId, state: 'cancelled' },
+          task.owner_user_id, teamIds);
+        return ok({});
+      }
+      const text = typeof body?.text === 'string' ? body.text : null;
+      if (text === null || !text.trim()) return err(400, 'text required');
+      const payload = { ...JSON.parse(row.payload), text };
+      await q(ctx.db, 'UPDATE outbound_messages SET payload = ?, updated_at = ? WHERE task_id = ? AND client_message_id = ?',
+        JSON.stringify(payload), ctx.now(), taskId, clientMessageId).run();
+      fanOutToTeamsOrOwner(ctx,
+        { t: 'pending_msg', taskId, pending: pendingRowToWire({ ...row, payload: JSON.stringify(payload) }) },
+        task.owner_user_id, teamIds);
       return ok({});
     }
     if (method === 'POST' && action === 'decision') {

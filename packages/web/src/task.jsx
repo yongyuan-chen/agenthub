@@ -589,6 +589,56 @@ function PendingMessage({ pending, canRetry, onRetry, onImageClick }) {
   );
 }
 
+// A message the user sent while a turn was still running. It is real and
+// durable (a row in outbound_messages) but has not been handed to the agent
+// yet, which is the entire point: until the turn ends it can still be
+// rewritten or taken back.
+function QueuedMessage({ pending, canEdit, onEdit, onCancel }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(pending.text || '');
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  const commit = () => {
+    setEditing(false);
+    const next = draft.trim();
+    if (!next || next === pending.text) { setDraft(pending.text || ''); return; }
+    onEdit(pending.clientMessageId, next);
+  };
+
+  return (
+    <div className="queued-msg">
+      <div className="queued-msg-head">
+        <span className="queued-msg-badge">排队中</span>
+        {editing ? (
+          <textarea
+            className="queued-msg-input" autoFocus rows={2} value={draft}
+            onChange={e => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur(); }
+              if (e.key === 'Escape') { setDraft(pending.text || ''); setEditing(false); }
+            }}
+          />
+        ) : (
+          <span className="queued-msg-text" title={pending.text}>{pending.text}</span>
+        )}
+        {canEdit && !editing && (
+          <span className="queued-msg-actions">
+            <button type="button" className="ghost" title="取消这条" onClick={() => onCancel(pending.clientMessageId)}>取消</button>
+            <button type="button" className="ghost" onClick={() => setMenuOpen(v => !v)} aria-label="更多">⋯</button>
+            {menuOpen && (
+              <span className="queued-msg-menu">
+                <button type="button" className="ghost" onClick={() => { setMenuOpen(false); setDraft(pending.text || ''); setEditing(true); }}>编辑消息</button>
+              </span>
+            )}
+          </span>
+        )}
+      </div>
+      <div className="muted queued-msg-note">当前回合结束后自动发送</div>
+    </div>
+  );
+}
+
 export function Message({ task, msg, resultByToolId, isCreator, onImageClick }) {
   switch (msg.role) {
     case 'user':
@@ -654,7 +704,23 @@ export function TaskPane({ taskId, user, onClose }) {
   const isCreator = !task?.owner_user_id || task.owner_user_id === user?.id;
   const messages = taskMessages(taskId);
   const pendingMessages = taskPendingMessages(taskId);
+  // Held-for-this-turn messages are shown as an editable strip above the
+  // composer, not as conversation bubbles — they aren't part of the
+  // transcript yet, and rendering them inline implies the agent has seen them.
+  const queuedMessages = pendingMessages.filter(p => p.state === 'queued');
+  const inFlightMessages = pendingMessages.filter(p => p.state !== 'queued');
   const [tab, setTab] = useState('chat');
+  // Queueing is on by default. Turning it off is a per-conversation choice
+  // about how *this* agent should be interrupted, so it lives next to the
+  // composer and persists locally rather than becoming an account setting.
+  const [queueEnabled, setQueueEnabled] = useState(
+    () => localStorage.getItem(`agenthub_queue_off_${taskId}`) !== '1',
+  );
+  const setQueue = (on) => {
+    setQueueEnabled(on);
+    if (on) localStorage.removeItem(`agenthub_queue_off_${taskId}`);
+    else localStorage.setItem(`agenthub_queue_off_${taskId}`, '1');
+  };
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [sendError, setSendError] = useState(null);
@@ -775,7 +841,7 @@ export function TaskPane({ taskId, user, onClose }) {
     // coming back later still shows what happened. Attachments are left
     // intact on failure too, same reasoning — nothing lost, easy to retry.
     try {
-      await api.sendMessage(taskId, t, images, clientMessageId);
+      const res = await api.sendMessage(taskId, t, images, clientMessageId, queueEnabled);
       // The composer only clears once the cloud has *stored* the send. Until
       // then the text stays where the user can see (and re-send) it — the
       // old code cleared on a 200 that only meant "handed to a socket",
@@ -789,7 +855,11 @@ export function TaskPane({ taskId, user, onClose }) {
       // one has already landed — the store drops a pending entry whose
       // message it already has.
       upsertPendingMessage(taskId, {
-        clientMessageId, text: t, images, state: 'pending', createdAt: Date.now(),
+        // 'held' means the server is holding it until the current turn ends —
+        // a different bubble from 'pending' (on its way to the node), so the
+        // optimistic copy has to agree with what the broadcast will say.
+        clientMessageId, text: t, images,
+        state: res?.delivery === 'held' ? 'queued' : 'pending', createdAt: Date.now(),
       });
       bump();
     } catch (e2) { setSendError(e2.message || '发送失败'); }
@@ -800,6 +870,17 @@ export function TaskPane({ taskId, user, onClose }) {
   const retryPending = async (clientMessageId) => {
     setSendError(null);
     try { await api.retryMessage(taskId, clientMessageId); } catch (e2) { setSendError(e2.message || '重发失败'); }
+  };
+
+  const editQueued = async (clientMessageId, newText) => {
+    setSendError(null);
+    try { await api.editQueuedMessage(taskId, clientMessageId, newText); }
+    catch (e2) { setSendError(e2.message || '修改失败'); }
+  };
+  const cancelQueued = async (clientMessageId) => {
+    setSendError(null);
+    try { await api.cancelQueuedMessage(taskId, clientMessageId); }
+    catch (e2) { setSendError(e2.message || '取消失败'); }
   };
 
   const startRename = () => { setTitleDraft(task.title); setEditingTitle(true); };
@@ -867,7 +948,7 @@ export function TaskPane({ taskId, user, onClose }) {
               messages={messages} task={task} isCreator={isCreator} onImageClick={setLightboxSrc}
               hideEmpty={pendingMessages.length > 0}
             />
-            {pendingMessages.map(pending => (
+            {inFlightMessages.map(pending => (
               <PendingMessage
                 key={pending.clientMessageId} pending={pending}
                 canRetry={task.lease !== 'human'} onRetry={retryPending} onImageClick={setLightboxSrc}
@@ -932,6 +1013,30 @@ export function TaskPane({ taskId, user, onClose }) {
             <div className="review-bar">
               <span className="err">⚠️ 上一条消息发送失败:{sendError} — 消息还在输入框里,可以重试</span>
               <button className="ghost" onClick={() => setSendError(null)}>知道了</button>
+            </div>
+          )}
+          {/* Queued strip sits directly on top of the composer, the way Codex
+              shows it — it belongs to "what I'm about to send", not to the
+              transcript above. */}
+          {!!queuedMessages.length && (
+            <div className="queued-strip">
+              {queuedMessages.map(pending => (
+                <QueuedMessage
+                  key={pending.clientMessageId} pending={pending} canEdit={isCreator}
+                  onEdit={editQueued} onCancel={cancelQueued}
+                />
+              ))}
+              {isCreator && (
+                <button type="button" className="ghost link queued-strip-off" onClick={() => setQueue(false)}>
+                  关闭排队(以后直接发给正在运行的 agent)
+                </button>
+              )}
+            </div>
+          )}
+          {!queueEnabled && isCreator && task.status === 'running' && (
+            <div className="queued-strip queued-strip-notice">
+              <span className="muted">排队已关闭 — 消息会直接插进正在运行的回合</span>
+              <button type="button" className="ghost link" onClick={() => setQueue(true)}>重新开启排队</button>
             </div>
           )}
           <form

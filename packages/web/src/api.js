@@ -96,9 +96,19 @@ export const api = {
   // cloud stores it before answering, keeps redelivering until the node
   // echoes that same id back, and collapses a retry of the same id onto the
   // one message instead of sending it twice. See hub-core's outbound_messages.
-  sendMessage: (id, text, images, clientMessageId) =>
-    req('POST', `/api/tasks/${id}/message`, { text, clientMessageId, ...(images?.length ? { images } : {}) }),
+  // queue=false means "send it into the running turn anyway" (关闭排队);
+  // omitted defaults to queueing on the server, so an older cached frontend
+  // keeps the behaviour it was written against.
+  sendMessage: (id, text, images, clientMessageId, queue = true) =>
+    req('POST', `/api/tasks/${id}/message`, { text, clientMessageId, queue, ...(images?.length ? { images } : {}) }),
   retryMessage: (id, clientMessageId) => req('POST', `/api/tasks/${id}/retry-message`, { clientMessageId }),
+  editQueuedMessage: (id, clientMessageId, text) =>
+    req('POST', `/api/tasks/${id}/queued-message`, { clientMessageId, text }),
+  // The id goes in the path, not a body: the worker only parses JSON for
+  // POST/PUT, so a DELETE body is silently dropped (it reads query params
+  // instead). Same shape as the other DELETE routes here.
+  cancelQueuedMessage: (id, clientMessageId) =>
+    req('DELETE', `/api/tasks/${id}/queued-message/${encodeURIComponent(clientMessageId)}`),
   decision: (id, requestId, behavior, message, updatedInput, autoApprove, forceAll) =>
     req('POST', `/api/tasks/${id}/decision`, { requestId, behavior, message, updatedInput, autoApprove, forceAll }),
   cancel: (id) => req('POST', `/api/tasks/${id}/cancel`, {}),

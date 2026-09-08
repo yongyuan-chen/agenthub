@@ -4752,3 +4752,94 @@ test('scheduled tasks: each backend reads only its own schedule store', async ()
   exec.manager.shutdown();
   exec.link.stop();
 });
+
+// Sending into a turn that is already running used to hand the text straight
+// to the CLI, where the human immediately lost all control of it — nothing to
+// edit, nothing to take back, and no indication it was even waiting. These
+// cover the queue that replaces that: held while busy, released one at a time
+// when the turn ends, and editable/cancellable only for as long as it is
+// genuinely still held.
+test('queued messages: a send during a running turn is held, not dispatched', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-test', 'tester', 'x', 0, now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('n1', 'h', 'user-test', 'online', now).run();
+  await cloud.db.prepare(`INSERT INTO tasks (id, title, spec, node_id, owner_user_id, status, lease, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind('t1', 'busy task', 'spec', 'n1', 'user-test', 'running', 'daemon', now, now).run();
+
+  // The socket also carries acks and other traffic; only user_message
+  // payloads are "the queue actually released something".
+  const sent = [];
+  cloud.ctx.sendToNode = (nodeId, payload) => { if (payload.t === 'user_message') sent.push(payload); return true; };
+
+  const res = await cloud.api('POST', '/api/tasks/t1/message', { text: '继续', clientMessageId: 'm-1' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.delivery, 'held', 'server reports it is holding the message');
+  assert.equal(sent.length, 0, 'nothing goes to the node while the turn is running');
+  let row = await cloud.db.prepare('SELECT state FROM outbound_messages WHERE client_message_id = ?').bind('m-1').first();
+  assert.equal(row.state, 'queued');
+
+  // A second one queues behind it rather than replacing it.
+  await cloud.api('POST', '/api/tasks/t1/message', { text: '然后跑测试', clientMessageId: 'm-2' });
+  assert.equal(sent.length, 0);
+
+  // Editing rewrites the held text; cancelling drops one entirely.
+  const edit = await cloud.api('POST', '/api/tasks/t1/queued-message', { clientMessageId: 'm-1', text: '先别继续,改成 A' });
+  assert.equal(edit.status, 200);
+  row = await cloud.db.prepare('SELECT payload FROM outbound_messages WHERE client_message_id = ?').bind('m-1').first();
+  assert.equal(JSON.parse(row.payload).text, '先别继续,改成 A');
+  // Path, not body: the worker only parses a JSON body for POST/PUT.
+  const del = await cloud.api('DELETE', '/api/tasks/t1/queued-message/m-2');
+  assert.equal(del.status, 200);
+  assert.equal((await cloud.db.prepare('SELECT COUNT(*) AS c FROM outbound_messages WHERE task_id = ?').bind('t1').first()).c, 1);
+
+  // The turn ends -> exactly the held message goes out, now as a real send.
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 1, ev: { k: 'status', status: 'review' } });
+  assert.equal(sent.length, 1, 'the queue releases when the turn ends');
+  assert.equal(sent[0].text, '先别继续,改成 A', 'the edited text is what actually gets sent');
+  row = await cloud.db.prepare('SELECT state FROM outbound_messages WHERE client_message_id = ?').bind('m-1').first();
+  assert.equal(row.state, 'pending');
+
+  // Once released it is on its way to the agent — rewriting it then would
+  // change a message that has arguably already been read.
+  const lateEdit = await cloud.api('POST', '/api/tasks/t1/queued-message', { clientMessageId: 'm-1', text: '太晚了' });
+  assert.equal(lateEdit.status, 404);
+});
+
+test('queued messages: releases one per turn, and queue=false bypasses holding entirely', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-test', 'tester', 'x', 0, now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('n1', 'h', 'user-test', 'online', now).run();
+  await cloud.db.prepare(`INSERT INTO tasks (id, title, spec, node_id, owner_user_id, status, lease, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind('t1', 'busy task', 'spec', 'n1', 'user-test', 'running', 'daemon', now, now).run();
+  const sent = [];
+  cloud.ctx.sendToNode = (nodeId, payload) => { if (payload.t === 'user_message') sent.push(payload); return true; };
+
+  await cloud.api('POST', '/api/tasks/t1/message', { text: 'A', clientMessageId: 'm-a' });
+  await cloud.api('POST', '/api/tasks/t1/message', { text: 'B', clientMessageId: 'm-b' });
+  await cloud.api('POST', '/api/tasks/t1/message', { text: 'C', clientMessageId: 'm-c' });
+
+  // Draining all three at once would dump them into a single turn, which is
+  // the opposite of what holding them was for.
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 1, ev: { k: 'status', status: 'review' } });
+  assert.deepEqual(sent.map(s => s.text), ['A'], 'only the oldest is released');
+
+  // Next turn starts and ends -> the next one goes.
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 2, ev: { k: 'status', status: 'running' } });
+  assert.deepEqual(sent.map(s => s.text), ['A'], 'a turn starting releases nothing');
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 3, ev: { k: 'status', status: 'review' } });
+  assert.deepEqual(sent.map(s => s.text), ['A', 'B']);
+
+  // 关闭排队: an explicit queue:false interrupts the running turn as before.
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 4, ev: { k: 'status', status: 'running' } });
+  const direct = await cloud.api('POST', '/api/tasks/t1/message', { text: 'NOW', clientMessageId: 'm-now', queue: false });
+  assert.equal(direct.body.delivery, 'sent');
+  assert.equal(sent[sent.length - 1].text, 'NOW', 'it goes straight through despite the running turn');
+});
