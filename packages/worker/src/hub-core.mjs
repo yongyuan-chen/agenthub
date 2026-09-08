@@ -674,10 +674,19 @@ const isTaskBusy = (task) => BUSY_STATUSES.has(task?.status);
 // 'running', so anything else still queued has to wait for *that* turn to end
 // too. Draining the whole queue at once would dump every held message into a
 // single turn, which is the opposite of what queueing them was for.
-async function releaseNextQueuedMessage(ctx, task) {
-  const row = await q(ctx.db,
-    "SELECT * FROM outbound_messages WHERE task_id = ? AND state = 'queued' ORDER BY created_at LIMIT 1",
-    task.id).first();
+// clientMessageId picks a specific held message instead of the oldest — that's
+// 直接发送, the per-message "don't wait for the turn to end, send this one
+// now". Everything after the lookup is identical: releasing early and
+// releasing on schedule are the same operation, they just differ on which row
+// and when.
+async function releaseNextQueuedMessage(ctx, task, clientMessageId = null) {
+  const row = clientMessageId
+    ? await q(ctx.db,
+      "SELECT * FROM outbound_messages WHERE task_id = ? AND client_message_id = ? AND state = 'queued'",
+      task.id, clientMessageId).first()
+    : await q(ctx.db,
+      "SELECT * FROM outbound_messages WHERE task_id = ? AND state = 'queued' ORDER BY created_at LIMIT 1",
+      task.id).first();
   if (!row) return false;
   const now = ctx.now();
   await q(ctx.db,
@@ -1366,6 +1375,13 @@ export async function api(ctx, method, pathname, body) {
         fanOutToTeamsOrOwner(ctx, { t: 'pending_settled', taskId, clientMessageId, state: 'cancelled' },
           task.owner_user_id, teamIds);
         return ok({});
+      }
+      // 直接发送: hand this one to the agent right now, mid-turn. Same thing
+      // the release-on-turn-end path does, just triggered by the human instead
+      // of by the status transition.
+      if (body?.sendNow) {
+        await releaseNextQueuedMessage(ctx, task, clientMessageId);
+        return ok({ delivery: 'sent' });
       }
       const text = typeof body?.text === 'string' ? body.text : null;
       if (text === null || !text.trim()) return err(400, 'text required');

@@ -617,7 +617,7 @@ function PendingMessage({ pending, canRetry, onRetry, onImageClick }) {
 // durable (a row in outbound_messages) but has not been handed to the agent
 // yet, which is the entire point: until the turn ends it can still be
 // rewritten or taken back.
-function QueuedMessage({ pending, canEdit, onEdit, onCancel }) {
+function QueuedMessage({ pending, canEdit, onEdit, onCancel, onSendNow }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(pending.text || '');
   const [menuOpen, setMenuOpen] = useState(false);
@@ -648,6 +648,10 @@ function QueuedMessage({ pending, canEdit, onEdit, onCancel }) {
         )}
         {canEdit && !editing && (
           <span className="queued-msg-actions">
+            <button
+              type="button" className="queued-msg-send" title="不等这个回合结束,现在就发给 agent"
+              onClick={() => onSendNow(pending.clientMessageId)}
+            >直接发送</button>
             <button type="button" className="ghost" title="取消这条" onClick={() => onCancel(pending.clientMessageId)}>取消</button>
             <button type="button" className="ghost" onClick={() => setMenuOpen(v => !v)} aria-label="更多">⋯</button>
             {menuOpen && (
@@ -924,6 +928,11 @@ export function TaskPane({ taskId, user, onClose }) {
     try { await api.editQueuedMessage(taskId, clientMessageId, newText); }
     catch (e2) { setSendError(e2.message || '修改失败'); }
   };
+  const sendQueuedNow = async (clientMessageId) => {
+    setSendError(null);
+    try { await api.sendQueuedMessageNow(taskId, clientMessageId); }
+    catch (e2) { setSendError(e2.message || '发送失败'); }
+  };
   const cancelQueued = async (clientMessageId) => {
     setSendError(null);
     try { await api.cancelQueuedMessage(taskId, clientMessageId); }
@@ -1073,7 +1082,7 @@ export function TaskPane({ taskId, user, onClose }) {
               {queuedMessages.map(pending => (
                 <QueuedMessage
                   key={pending.clientMessageId} pending={pending} canEdit={isCreator}
-                  onEdit={editQueued} onCancel={cancelQueued}
+                  onEdit={editQueued} onCancel={cancelQueued} onSendNow={sendQueuedNow}
                 />
               ))}
               {isCreator && (

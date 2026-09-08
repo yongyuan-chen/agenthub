@@ -4869,6 +4869,17 @@ test('queued messages: releases one per turn, and queue=false bypasses holding e
   await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 3, ev: { k: 'status', status: 'review' } });
   assert.deepEqual(sent.map(s => s.text), ['A', 'B']);
 
+  // 直接发送: release one specific held message mid-turn, leaving the rest
+  // queued — a per-message escape hatch, not a mode change.
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 5, ev: { k: 'status', status: 'running' } });
+  const now2 = await cloud.api('POST', '/api/tasks/t1/queued-message', { clientMessageId: 'm-c', sendNow: true });
+  assert.equal(now2.status, 200);
+  assert.deepEqual(sent.map(s => s.text), ['A', 'B', 'C'], 'the chosen message goes out despite the running turn');
+  assert.equal(
+    (await cloud.db.prepare("SELECT COUNT(*) AS c FROM outbound_messages WHERE task_id = ? AND state = 'queued'").bind('t1').first()).c,
+    0, 'nothing else was released with it',
+  );
+
   // 关闭排队: an explicit queue:false interrupts the running turn as before.
   await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 4, ev: { k: 'status', status: 'running' } });
   const direct = await cloud.api('POST', '/api/tasks/t1/message', { text: 'NOW', clientMessageId: 'm-now', queue: false });

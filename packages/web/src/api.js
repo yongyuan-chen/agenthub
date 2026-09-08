@@ -108,6 +108,10 @@ export const api = {
   retryMessage: (id, clientMessageId) => req('POST', `/api/tasks/${id}/retry-message`, { clientMessageId }),
   editQueuedMessage: (id, clientMessageId, text) =>
     req('POST', `/api/tasks/${id}/queued-message`, { clientMessageId, text }),
+  // 直接发送 — release this one held message into the running turn now,
+  // without changing the conversation's queueing preference.
+  sendQueuedMessageNow: (id, clientMessageId) =>
+    req('POST', `/api/tasks/${id}/queued-message`, { clientMessageId, sendNow: true }),
   // The id goes in the path, not a body: the worker only parses JSON for
   // POST/PUT, so a DELETE body is silently dropped (it reads query params
   // instead). Same shape as the other DELETE routes here.
