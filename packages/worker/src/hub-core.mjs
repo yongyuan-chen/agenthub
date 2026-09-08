@@ -1519,6 +1519,12 @@ export async function api(ctx, method, pathname, body) {
     if (ctx.teamId) {
       await q(ctx.db, 'INSERT OR IGNORE INTO node_teams (node_id, team_id) VALUES (?, ?)', registeredId, ctx.teamId).run();
     }
+    // Tell any open browser about it right away. Enrollment used to be silent,
+    // so a freshly installed machine only showed up once its daemon connected
+    // and markNodeOnline() broadcast — leaving the first-run wizard, which
+    // promises the machine "will appear here automatically", staring at an
+    // empty list for however long the daemon took to start.
+    await broadcastNode(ctx, registeredId, userId);
     // The installer must use the id we actually registered, not the one it
     // asked for — under autoName they differ whenever there was a collision.
     return ok({ id: registeredId });

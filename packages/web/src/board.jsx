@@ -2,36 +2,71 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { api, getToken } from './api.js';
 import {
-  buildNodeInstallCommand, nodeDisplayName, nodeLabels, nodeProjectLabels,
-  nodeRepairCommands,
+  buildNodeInstallCommand, buildNodeInstallPrompt, nodeDisplayName, nodeLabels,
+  nodeProjectLabels, nodeRepairCommands,
 } from './node-enrollment.js';
 import { state, bump, taskInScope } from './store.js';
 import { ModalBackdrop } from './modal.jsx';
 
-export function AddNodeModal({ onClose }) {
-  const [copied, setCopied] = useState(false);
+// The install command plus the AI-assist fallback. Shared by the "add node"
+// modal and the first-run wizard so both stay in step — onboarding is exactly
+// this panel with a heading around it, not a second copy of it.
+export function NodeInstallPanel() {
   const [os, setOs] = useState('unix'); // 'unix' | 'windows'
+  const [copied, setCopied] = useState('');
+  const [showPrompt, setShowPrompt] = useState(false);
   const token = useRef(getToken()).current;
+  const shared = { os, origin: location.origin, token, teamId: state.activeTeamId };
+  // No node id is passed: the installer derives one from the target machine's
+  // hostname + OS username, and the server steps past any collision (see the
+  // autoName branch in hub-core.mjs).
+  const cmd = buildNodeInstallCommand(shared);
+  const prompt = buildNodeInstallPrompt(shared);
 
+  const copy = async (what, text) => {
+    try { await navigator.clipboard.writeText(text); setCopied(what); setTimeout(() => setCopied(''), 2000); }
+    catch { /* clipboard unavailable, user can select manually */ }
+  };
+
+  return (
+    <>
+      <nav className="tabs">
+        <button type="button" className={os === 'unix' ? 'active' : ''} onClick={() => setOs('unix')}>macOS / Linux</button>
+        <button type="button" className={os === 'windows' ? 'active' : ''} onClick={() => setOs('windows')}>Windows</button>
+      </nav>
+      <textarea readOnly rows={4} value={cmd} onClick={e => e.target.select()} />
+      <button type="button" onClick={() => copy('cmd', cmd)}>{copied === 'cmd' ? '已复制 ✓' : '复制命令'}</button>
+
+      <div className="install-fallback">
+        <button type="button" className="ghost link" onClick={() => setShowPrompt(v => !v)}>
+          {showPrompt ? '收起' : '装不上?让 AI 帮你装 →'}
+        </button>
+        {showPrompt && (
+          <>
+            <p className="muted">
+              把下面这段话发给那台机器上的 Claude Code(或任何能执行命令的 AI),它会自己装、自己排错、装完验证。
+            </p>
+            <p className="err">
+              ⚠️ 这段话里带着你的登录令牌,拿到的人可以操作你的账号。只发给你自己机器上的 AI,别贴到公开的地方。
+            </p>
+            <textarea readOnly rows={7} value={prompt} onClick={e => e.target.select()} />
+            <button type="button" className="ghost" onClick={() => copy('prompt', prompt)}>
+              {copied === 'prompt' ? '已复制 ✓' : '复制这段 prompt'}
+            </button>
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
+export function AddNodeModal({ onClose }) {
   // Whichever scope is active right now (个人 / a specific team) becomes the
   // node's permanent binding at enrollment — nodes aren't auto-shared with
   // every team the registering user happens to belong to (see hub-core.mjs's
   // team-sharing redesign notes), so this is the only place that decision
   // gets made.
   const activeTeam = state.teams.find(t => t.id === state.activeTeamId);
-  // No node id is passed: the installer derives one from the target machine's
-  // hostname + OS username, and the server steps past any collision (see the
-  // autoName branch in hub-core.mjs). This modal used to ask the user to
-  // invent an id up front, which meant it also had to show their existing
-  // nodes, validate the format, and get a checkbox ticked to acknowledge that
-  // a clash would silently hijack another machine — a lot of ceremony to push
-  // a naming problem onto someone who has no way to answer it from a browser.
-  const cmd = buildNodeInstallCommand({ os, origin: location.origin, token, teamId: state.activeTeamId });
-
-  const copy = async () => {
-    try { await navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 2000); }
-    catch { /* clipboard unavailable, user can select manually */ }
-  };
 
   return createPortal(
     <ModalBackdrop onClose={onClose}>
@@ -45,16 +80,7 @@ export function AddNodeModal({ onClose }) {
           这台机器会加入:<b>{activeTeam ? activeTeam.name : '个人'}</b>
           {activeTeam ? '(项目成员都能用它建任务)' : '(只有你自己能用)'} — 切换左侧项目 tab 可改变这里。
         </p>
-
-        <nav className="tabs">
-          <button type="button" className={os === 'unix' ? 'active' : ''} onClick={() => setOs('unix')}>macOS / Linux</button>
-          <button type="button" className={os === 'windows' ? 'active' : ''} onClick={() => setOs('windows')}>Windows</button>
-        </nav>
-        <textarea
-          readOnly rows={4} value={cmd}
-          onClick={e => e.target.select()}
-        />
-        <button type="button" onClick={copy}>{copied ? '已复制 ✓' : '复制命令'}</button>
+        <NodeInstallPanel />
         <div className="modal-actions">
           <button type="button" className="ghost" onClick={onClose}>关闭</button>
         </div>

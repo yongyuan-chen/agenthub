@@ -43,8 +43,8 @@ const TABS = (isAdmin) => [
   ...(isAdmin ? [{ id: 'team', label: '项目管理' }, { id: 'admin', label: '管理员' }] : []),
 ];
 
-export function SettingsModal({ user, onClose }) {
-  const [tab, setTab] = useState('general');
+export function SettingsModal({ user, onClose, initialTab = 'general' }) {
+  const [tab, setTab] = useState(initialTab);
   const tabs = TABS(user?.isAdmin);
 
   return (
@@ -121,7 +121,11 @@ function GeneralSection() {
 // pull its own model list, and exactly one flagged "默认" — that flagged
 // one is what's mirrored to users.api_base_url/api_key/api_model and
 // auto-pushed to every node (see hub-core.mjs's set-default route).
-function ModelProfilesSection() {
+// onChange fires whenever the profile list is (re)loaded, so a caller can
+// track "does this account have a relay yet" without duplicating the fetch —
+// the first-run wizard uses it to advance to the next step the moment one is
+// saved.
+export function ModelProfilesSection({ onChange }) {
   const [profiles, setProfiles] = useState(null);
   const [editingId, setEditingId] = useState(null); // null = the form adds a new profile
   const [name, setName] = useState('');
@@ -136,7 +140,9 @@ function ModelProfilesSection() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
-  const load = () => api.modelProfiles().then(r => setProfiles(r.profiles || [])).catch(() => setProfiles([]));
+  const load = () => api.modelProfiles()
+    .then(r => { const list = r.profiles || []; setProfiles(list); onChange?.(list); })
+    .catch(() => setProfiles([]));
   useEffect(() => { load(); }, []);
 
   const resetForm = () => { setEditingId(null); setName(''); setBaseUrl(''); setApiKey(''); setModel(''); setBackend('claude'); };

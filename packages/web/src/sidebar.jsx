@@ -89,7 +89,7 @@ function TeamSwitcher({ onSwitchTeam, onManageMembers, onCreateProject }) {
   );
 }
 
-export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect, user, pushState, onEnablePush, onOpenSettings, onLogout, onSwitchTeam }) {
+export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect, user, pushState, onEnablePush, onOpenSettings, onLogout, onSwitchTeam, setupIncomplete, onResumeSetup }) {
   const [showAddNode, setShowAddNode] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const [showNodeManage, setShowNodeManage] = useState(false);
@@ -114,6 +114,11 @@ export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect,
       <div className="sidebar-top">
         <div className="brand">AgentHub</div>
         <button className="new-chat-btn" onClick={onNewDraft}>+ 新对话</button>
+        {/* Dismissing the first-run wizard shouldn't strand anyone: while the
+            account still lacks a relay or a machine, this is the way back. */}
+        {setupIncomplete && (
+          <button type="button" className="setup-resume-btn" onClick={onResumeSetup}>⚠ 还没完成设置 — 继续</button>
+        )}
         <a className="supervisor-link" href="#/supervisor">🧭 总控 agent</a>
       </div>
       <TeamSwitcher onSwitchTeam={onSwitchTeam} onManageMembers={setManageMembersTeam} onCreateProject={() => setShowCreateProject(true)} />

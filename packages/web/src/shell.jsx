@@ -51,7 +51,7 @@ function loadPanesMap() {
   return {};
 }
 
-export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings, onLogout, onSwitchTeam }) {
+export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings, onLogout, onSwitchTeam, setupIncomplete, onResumeSetup }) {
   // Scoped to the currently active personal/project view — state.tasks can
   // also hold a task resolved purely to satisfy a direct link outside that
   // scope (see the URL-driven-focus effect below), which must never count
@@ -464,6 +464,8 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
         onOpenSettings={onOpenSettings}
         onLogout={onLogout}
         onSwitchTeam={(teamId) => { onSwitchTeam(teamId); setNavOpen(false); setSwitcherOpen(false); setSwitcherQuery(''); }}
+        setupIncomplete={setupIncomplete}
+        onResumeSetup={onResumeSetup}
       />
       {navOpen && <div className="sidebar-backdrop" onClick={() => setNavOpen(false)} />}
       <main className="main-pane">

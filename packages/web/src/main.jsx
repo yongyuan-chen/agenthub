@@ -6,6 +6,7 @@ import { AuthScreen } from './login.jsx';
 import { SettingsModal } from './settings.jsx';
 import { AppShell } from './shell.jsx';
 import { SupervisorPage } from './supervisor.jsx';
+import { OnboardingModal, useSetupStatus } from './onboarding.jsx';
 
 function useStore() {
   return useSyncExternalStore(subscribe, getVersion);
@@ -32,6 +33,19 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [pushState, setPushState] = useState(localStorage.getItem('agenthub_push') || 'off');
   const wsRef = useRef(null);
+  // First-run setup. Deliberately session-scoped rather than persisted: an
+  // account still missing a relay or a machine literally cannot start a
+  // conversation, so re-offering the wizard on the next visit is help, not
+  // nagging. Dismissing it stays dismissed for as long as the tab is open,
+  // and the sidebar keeps a way back in.
+  const { hasModel, refresh: refreshSetup } = useSetupStatus(authed);
+  const [setupDismissed, setSetupDismissed] = useState(false);
+  // Once the wizard is up it stays up until dismissed, even after both steps
+  // go green. Unmounting it the instant setup completes made it vanish
+  // mid-flow, right after the user pasted an install command — no
+  // confirmation that the machine actually arrived, just a window that
+  // disappeared.
+  const [setupOpened, setSetupOpened] = useState(false);
 
   // REST fallback so a broken WS still shows data — same calls used at
   // mount, extracted so switchTeam() can re-run them against the new scope
@@ -91,6 +105,20 @@ function App() {
       state.sourceStatus[scopeKey] = { loading: false, error: error.message || '历史会话扫描失败', unavailableNodeIds: [] };
       if (scopeKeyOf(state.activeTeamId) === scopeKey) bump();
     });
+  };
+
+  // Nodes only, sharing loadScopedData's cache handling. The setup wizard
+  // polls this while it waits for a machine to finish installing, so it does
+  // not depend on the WS being healthy to notice.
+  const refreshNodes = () => {
+    const scopeKey = scopeKeyOf(state.activeTeamId);
+    const userGeneration = state.userGeneration;
+    return api.nodes().then(r => {
+      if (state.userGeneration !== userGeneration) return;
+      const nodes = new Map(r.nodes.map(n => [n.id, n]));
+      state.scopeCache[scopeKey] = { ...(state.scopeCache[scopeKey] || {}), nodes };
+      if (scopeKeyOf(state.activeTeamId) === scopeKey) { state.nodes = nodes; bump(); }
+    }).catch(() => {});
   };
 
   useEffect(() => {
@@ -195,6 +223,17 @@ function App() {
   // outside AppShell's per-scope board rather than as another pane inside it.
   if (hash.startsWith('#/supervisor')) return <SupervisorPage />;
 
+  // Gated on state.loaded so the wizard can't flash up during the first fetch,
+  // when "no nodes" only means "not loaded yet". hasModel === null is the same
+  // guard for the relay check.
+  const hasNode = state.nodes.size > 0;
+  const setupIncomplete = hasModel === false || (state.loaded && !hasNode);
+  const showOnboarding = authed && !setupDismissed && hasModel !== null && state.loaded && (setupIncomplete || setupOpened);
+
+  if (showOnboarding && !setupOpened) setSetupOpened(true);
+  // A logout must not leave the next account's wizard latched open.
+  if (!authed && setupOpened) setSetupOpened(false);
+
   const m = hash.match(/^#\/task\/([A-Za-z0-9]+)$/);
   return (
     <>
@@ -206,8 +245,23 @@ function App() {
         onOpenSettings={() => setShowSettings(true)}
         onLogout={logout}
         onSwitchTeam={switchTeam}
+        setupIncomplete={setupIncomplete}
+        onResumeSetup={() => setSetupDismissed(false)}
       />
-      {showSettings && <SettingsModal user={user} onClose={() => setShowSettings(false)} />}
+      {showSettings && (
+        <SettingsModal
+          user={user}
+          onClose={() => { setShowSettings(false); refreshSetup(); }}
+        />
+      )}
+      {showOnboarding && (
+        <OnboardingModal
+          hasModel={!!hasModel} hasNode={hasNode}
+          onClose={() => { setSetupDismissed(true); setSetupOpened(false); }}
+          onDone={refreshSetup}
+          onPollNodes={refreshNodes}
+        />
+      )}
     </>
   );
 }

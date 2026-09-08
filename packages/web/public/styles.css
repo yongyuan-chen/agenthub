@@ -75,6 +75,11 @@ button.allow { background: var(--green); }
 button.allow:hover { background: #35753f; }
 button.deny { background: var(--red); }
 button.deny:hover { background: #9c1616; }
+/* `ghost deny` asks for a *quiet* destructive action (the per-row 删除 links),
+   but .deny's solid fill won on order alone, turning every one of them into a
+   loud red block in an otherwise calm list. */
+button.ghost.deny { background: transparent; color: var(--red); border-color: rgba(185, 28, 28, .35); }
+button.ghost.deny:hover { background: rgba(185, 28, 28, .08); border-color: rgba(185, 28, 28, .55); color: #9c1616; }
 input, textarea, select {
   background: var(--bg); color: var(--fg); border: 1px solid var(--border-strong);
   border-radius: 10px; padding: 9px 11px; font-size: 14px; font-family: inherit; width: 100%;
@@ -330,7 +335,13 @@ button.sidebar-btn:hover { background: rgba(255, 255, 255, .68); color: var(--br
 .modal label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--muted); }
 .row2 { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; }
 .row-inline { flex-direction: row !important; align-items: center; gap: 8px !important; }
-.row-inline input[type="checkbox"] { width: auto; accent-color: var(--brand); }
+/* The exception was checkbox-only, so the global `input { width: 100% }` still
+   caught radios — a radio stretched to the full row width, pushing its own
+   label onto the next line and leaving the dot floating in the middle. Found
+   in the backend picker (Claude Code / Codex). */
+.row-inline input[type="checkbox"],
+.row-inline input[type="radio"] { width: auto; accent-color: var(--brand); }
+.row-inline label { flex-direction: row; align-items: center; gap: 6px; white-space: nowrap; }
 input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 .admin-section { border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; margin: 0; }
@@ -872,3 +883,45 @@ button.mobile-switcher-close:hover { background: var(--bg3); color: var(--fg); }
 }
 .sv-tool-actions { display: flex; gap: 8px; margin-top: 8px; }
 .sv-composer { margin: 0 18px 18px; }
+
+/* ---- first-run setup wizard ---- */
+button.setup-resume-btn {
+  width: 100%; text-align: left; font-size: 13px; font-weight: 500;
+  background: rgba(217, 160, 60, .14); color: #8a5c0f;
+  border: 1px solid rgba(181, 122, 21, .34); box-shadow: none;
+}
+button.setup-resume-btn:hover { background: rgba(217, 160, 60, .22); border-color: rgba(181, 122, 21, .5); }
+
+.onboarding-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.onboarding-step { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: var(--bg2); }
+.onboarding-step.current { border-color: rgba(var(--brand-rgb), .4); background: #fff; box-shadow: 0 6px 18px rgba(19, 57, 43, .05); }
+.onboarding-step.done { background: rgba(63, 138, 82, .05); border-color: rgba(63, 138, 82, .22); }
+button.onboarding-step-head {
+  width: 100%; display: flex; align-items: center; gap: 11px; padding: 12px 14px;
+  background: none; color: var(--fg); text-align: left; border: 0; border-radius: 0; box-shadow: none;
+}
+button.onboarding-step-head:hover { background: rgba(var(--brand-rgb), .05); }
+.onboarding-step-mark {
+  flex-shrink: 0; width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 12.5px; font-weight: 700; background: var(--bg3); color: var(--muted);
+}
+.onboarding-step.current .onboarding-step-mark { background: var(--brand); color: #fff; }
+.onboarding-step.done .onboarding-step-mark { background: var(--green); color: #fff; }
+.onboarding-step-title { font-weight: 600; font-size: 14px; }
+.onboarding-step-head .muted { margin-left: auto; text-align: right; }
+.onboarding-step-body {
+  padding: 4px 14px 14px; display: flex; flex-direction: column; gap: 10px;
+  border-top: 1px solid var(--border);
+}
+/* The embedded model form is a settings <fieldset>; inside the wizard it is
+   the whole content of a step, so its own frame would be a box in a box. */
+.onboarding-step-body .admin-section { border: 0; padding: 0; }
+.onboarding-step-body .admin-section legend { display: none; }
+
+/* ---- "let an AI install it" fallback in the node install panel ---- */
+.install-fallback {
+  margin-top: 4px; padding-top: 10px; border-top: 1px dashed var(--border);
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-start;
+}
+.install-fallback textarea { font-size: 12px; line-height: 1.55; }
+.install-fallback .err { line-height: 1.5; }
