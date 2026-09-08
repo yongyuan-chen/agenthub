@@ -94,7 +94,7 @@ function TeamSwitcher({ onSwitchTeam, onManageMembers, onCreateProject }) {
   );
 }
 
-export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect, user, pushState, onEnablePush, onOpenSettings, onLogout, onSwitchTeam, setupIncomplete, onResumeSetup }) {
+export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect, user, pushState, onEnablePush, onOpenSettings, onLogout, onSwitchTeam, setupIncomplete, onResumeSetup, onCollapse }) {
   const [showAddNode, setShowAddNode] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const [showNodeManage, setShowNodeManage] = useState(false);
@@ -117,7 +117,13 @@ export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect,
     <>
     <aside ref={asideRef} id="app-sidebar" className={`sidebar ${open ? 'open' : ''}`} aria-hidden={mobileClosed} inert={mobileClosed ? '' : undefined}>
       <div className="sidebar-top">
-        <div className="brand">AgentHub</div>
+        <div className="brand">
+          AgentHub
+          {onCollapse && (
+            <button type="button" className="ghost sidebar-collapse-btn" onClick={onCollapse}
+              title="收起侧边栏" aria-label="收起侧边栏">⇤</button>
+          )}
+        </div>
         <button className="new-chat-btn" onClick={onNewDraft}>+ 新对话</button>
         {/* Dismissing the first-run wizard shouldn't strand anyone: while the
             account still lacks a relay or a machine, this is the way back. */}

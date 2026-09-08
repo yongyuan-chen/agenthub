@@ -72,6 +72,11 @@ function Editor({ file, onChange, onSave }) {
       const lang = languageFor(mods, file.path);
       const extensions = [
         mods.cm.basicSetup,
+        // basicSetup does not wrap. Without this a long line is simply cut off
+        // at the pane's edge and can only be read by scrolling sideways —
+        // which for prose-heavy files (a CLAUDE.md, a README) means most of
+        // the content is invisible by default.
+        mods.cmView.EditorView.lineWrapping,
         mods.cmView.EditorView.updateListener.of(u => { if (u.docChanged) onChange(u.state.doc.toString()); }),
         mods.cmView.keymap.of([{
           key: 'Mod-s',
@@ -155,12 +160,21 @@ function TreeLevel({ dir, depth, dirs, expanded, activePath, onToggle, onOpenFil
   );
 }
 
-export function FilePane({ nodeId, taskId, onClose }) {
+export function FilePane({ nodeId, taskId, onClose, maximized, onToggleMaximize }) {
   const [root, setRoot] = useState('');            // the folder the tree is rooted at
   const [rootParent, setRootParent] = useState(null);
   const [dirs, setDirs] = useState(() => new Map()); // path -> {entries, truncated, error, loading}
   const [expanded, setExpanded] = useState(() => new Set());
   const [listError, setListError] = useState('');
+  // Hiding the tree hands its 246px to the editor. Remembered because it's a
+  // working preference ("I'm reading code now, not navigating"), unlike
+  // maximizing which is a momentary gesture.
+  const [treeOpen, setTreeOpen] = useState(() => localStorage.getItem('agenthub_filetree_off') !== '1');
+  const toggleTree = () => setTreeOpen(v => {
+    if (v) localStorage.setItem('agenthub_filetree_off', '1');
+    else localStorage.removeItem('agenthub_filetree_off');
+    return !v;
+  });
   const [file, setFile] = useState(null);         // {path, content, mtime, binary, truncated, loadedAt}
   const [draft, setDraft] = useState('');
   const [dirty, setDirty] = useState(false);
@@ -267,10 +281,20 @@ export function FilePane({ nodeId, taskId, onClose }) {
           <h2>📁 {node?.name || nodeId}</h2>
           <div className="muted file-pane-path" title={root}>{root ? shortPath(root) : '…'}</div>
         </div>
+        <button type="button" className="ghost pane-tree-btn" onClick={toggleTree}
+          title={treeOpen ? '收起文件树' : '展开文件树'} aria-label={treeOpen ? '收起文件树' : '展开文件树'}>
+          {treeOpen ? '◧' : '▤'}
+        </button>
         {file && dirty && <span className="chip st-waiting">未保存</span>}
         {file && (
           <button type="button" disabled={!dirty || saving} onClick={() => save(false)}>
             {saving ? '保存中…' : '保存'}
+          </button>
+        )}
+{onToggleMaximize && (
+          <button type="button" className="ghost pane-max-btn" onClick={onToggleMaximize}
+            title={maximized ? '还原' : '最大化(占满工作区)'} aria-label={maximized ? '还原' : '最大化'}>
+            {maximized ? '⤡' : '⤢'}
           </button>
         )}
         {onClose && <button type="button" className="ghost pane-close-btn" onClick={onClose} aria-label="关闭">✕</button>}
@@ -290,7 +314,7 @@ export function FilePane({ nodeId, taskId, onClose }) {
       )}
 
       <div className="file-body">
-        <nav className="file-tree">
+        {treeOpen && <nav className="file-tree">
           {listError && <div className="err file-tree-error">{listError}</div>}
           {/* Climbing out of the root re-roots the tree rather than nesting
               upward — a tree whose root drifts toward / gets unusable fast. */}
@@ -307,7 +331,7 @@ export function FilePane({ nodeId, taskId, onClose }) {
               activePath={file?.path || null} onToggle={toggleDir} onOpenFile={openFile}
             />
           )}
-        </nav>
+        </nav>}
 
         <section className="file-view">
           {!file && <div className="empty">从左边选一个文件</div>}

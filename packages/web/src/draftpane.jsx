@@ -17,7 +17,7 @@ function deriveTitle(text) {
 // A pane slot with no task yet: pick a project path (or take the account
 // default), type the first message, and sending it is what actually creates
 // the task — no upfront title/spec form to get through first.
-export function DraftPane({ onCreated, onClose }) {
+export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
@@ -152,6 +152,12 @@ export function DraftPane({ onCreated, onClose }) {
     <div className="task-pane draft-pane">
       <header className="pane-header">
         <div className="task-head"><h2>新对话</h2></div>
+        {onToggleMaximize && (
+          <button type="button" className="ghost pane-max-btn" onClick={onToggleMaximize}
+            title={maximized ? '还原' : '最大化(占满工作区)'} aria-label={maximized ? '还原' : '最大化'}>
+            {maximized ? '⤡' : '⤢'}
+          </button>
+        )}
         {onClose && <button type="button" className="ghost pane-close-btn" onClick={onClose} aria-label="关闭">✕</button>}
       </header>
 

@@ -4,7 +4,7 @@ import { state, cacheForScope, scopeKeyOf, bump } from './store.js';
 import { fmtAge } from './format.js';
 import { ConversationMessages } from './task.jsx';
 
-export function ConversationSourcePane({ source, onActivated, onClose }) {
+export function ConversationSourcePane({ source, onActivated, onClose, maximized, onToggleMaximize }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
@@ -151,6 +151,12 @@ export function ConversationSourcePane({ source, onActivated, onClose }) {
             <span className="muted">{source.nodeId} · {fmtAge(source.mtime)} 前</span>
           </div>
         </div>
+        {onToggleMaximize && (
+          <button type="button" className="ghost pane-max-btn" onClick={onToggleMaximize}
+            title={maximized ? '还原' : '最大化(占满工作区)'} aria-label={maximized ? '还原' : '最大化'}>
+            {maximized ? '⤡' : '⤢'}
+          </button>
+        )}
         {onClose && <button type="button" className="ghost pane-close-btn" onClick={onClose} aria-label="关闭">✕</button>}
       </header>
       <div

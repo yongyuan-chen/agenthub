@@ -70,8 +70,23 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
   const tasks = [...state.tasks.values()].filter(taskInScope);
   const scope = scopeKey(state.activeTeamId);
   const [navOpen, setNavOpen] = useState(false);
+  // Desktop-only: collapsing hands the sidebar's 278px to the panes. A working
+  // preference, so it persists — unlike maximizing. On mobile the sidebar is
+  // already a drawer and this does nothing.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem('agenthub_sidebar_collapsed') === '1',
+  );
+  const toggleSidebar = () => setSidebarCollapsed(v => {
+    if (v) localStorage.removeItem('agenthub_sidebar_collapsed');
+    else localStorage.setItem('agenthub_sidebar_collapsed', '1');
+    return !v;
+  });
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [switcherQuery, setSwitcherQuery] = useState('');
+  // Which pane (if any) is temporarily filling the workspace. Not persisted
+  // and not per-scope: maximizing is a "right now I want to read this" gesture,
+  // not a layout preference worth restoring on the next visit.
+  const [maximizedPane, setMaximizedPane] = useState(null);
   const [panesByScope, setPanesByScope] = useState(loadPanesMap);
   const [activePaneByScope, setActivePaneByScope] = useState(loadActivePanes);
   useEffect(() => {
@@ -406,6 +421,7 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
     setNavOpen(false); setSwitcherOpen(false);
   };
   const closePane = (id) => {
+    setMaximizedPane(m => (m === id ? null : m));
     setOpenPanes(p => {
       const index = p.indexOf(id);
       const next = p.filter(x => x !== id);
@@ -469,7 +485,7 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
   const activeTeamName = state.teams.find(team => team.id === state.activeTeamId)?.name || '个人';
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
       <Sidebar
         open={navOpen}
         selectedTaskId={activePaneId}
@@ -484,6 +500,7 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
         onSwitchTeam={(teamId) => { onSwitchTeam(teamId); setNavOpen(false); setSwitcherOpen(false); setSwitcherQuery(''); }}
         setupIncomplete={setupIncomplete}
         onResumeSetup={onResumeSetup}
+        onCollapse={toggleSidebar}
       />
       {navOpen && <div className="sidebar-backdrop" onClick={() => setNavOpen(false)} />}
       <main className="main-pane">
@@ -497,11 +514,19 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
           </button>
           <button type="button" className="ghost mobile-new-btn" onClick={newDraft} aria-label="新对话">＋</button>
         </div>
-        <button className="nav-toggle" onClick={() => setNavOpen(!navOpen)} aria-label="会话列表">☰</button>
-        <div className="workspace" onDragOver={e => e.preventDefault()} onDrop={onWorkspaceDrop}>
+        {/* Doubles as the way back: on desktop it un-collapses the sidebar,
+            on mobile it opens the drawer (the CSS decides which is visible). */}
+        <button
+          className="nav-toggle" aria-label="显示侧边栏"
+          onClick={() => (sidebarCollapsed ? toggleSidebar() : setNavOpen(!navOpen))}
+        >☰</button>
+        <div
+          className={`workspace${maximizedPane && openPanes.includes(maximizedPane) ? ' has-maximized' : ''}`}
+          onDragOver={e => e.preventDefault()} onDrop={onWorkspaceDrop}
+        >
           {openPanes.map(id => (
             <div
-              className={`pane ${id === activePaneId ? 'pane-selected pane-mobile-active' : 'pane-mobile-inactive'}`} key={id}
+              className={`pane ${id === activePaneId ? 'pane-selected pane-mobile-active' : 'pane-mobile-inactive'}${id === maximizedPane ? ' pane-maximized' : ''}`} key={id}
               ref={el => { if (el) paneRefs.current.set(id, el); else paneRefs.current.delete(id); }}
               onPointerDownCapture={() => {
                 if (activePaneId === id) return;
@@ -510,17 +535,18 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
               }}
             >
               {isFiles(id)
-                ? <FilePane {...parseFilesPane(id)} onClose={() => closePane(id)} />
+                ? <FilePane {...parseFilesPane(id)} onClose={() => closePane(id)} maximized={id === maximizedPane} onToggleMaximize={() => setMaximizedPane(m => (m === id ? null : id))} />
                 : isDraft(id)
-                ? <DraftPane onCreated={(realId) => replacePane(id, realId)} onClose={() => closePane(id)} />
+                ? <DraftPane onCreated={(realId) => replacePane(id, realId)} onClose={() => closePane(id)} maximized={id === maximizedPane} onToggleMaximize={() => setMaximizedPane(m => (m === id ? null : id))} />
                 : isSource(id)
                   ? (state.conversationSources.has(id.slice(7))
-                      ? <ConversationSourcePane source={state.conversationSources.get(id.slice(7))} onActivated={(realId) => replacePane(id, realId)} onClose={() => closePane(id)} />
+                      ? <ConversationSourcePane source={state.conversationSources.get(id.slice(7))} onActivated={(realId) => replacePane(id, realId)} onClose={() => closePane(id)} maximized={id === maximizedPane} onToggleMaximize={() => setMaximizedPane(m => (m === id ? null : id))} />
                       : null)
                   : (state.tasks.has(id)
                       ? <TaskPane
                           taskId={id} user={user} onClose={() => closePane(id)}
                           onOpenFiles={(nodeId) => addPane(`files:${nodeId}:${id}`)}
+                          maximized={id === maximizedPane} onToggleMaximize={() => setMaximizedPane(m => (m === id ? null : id))}
                         />
                       : null)}
             </div>

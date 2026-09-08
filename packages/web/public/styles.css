@@ -1027,3 +1027,34 @@ button.file-entry.is-dir { font-weight: 500; }
   .file-body { flex-direction: column; }
   .file-tree { width: auto; max-height: 38%; border-right: 0; border-bottom: 1px solid var(--border); }
 }
+
+/* ---- collapse / maximize ---- */
+button.sidebar-collapse-btn {
+  margin-left: auto; padding: 2px 8px; font-size: 13px; line-height: 1.4;
+  border-color: transparent; background: transparent; color: var(--muted);
+}
+button.sidebar-collapse-btn:hover { background: rgba(255, 255, 255, .7); color: var(--brand-ink); }
+.app-shell.sidebar-collapsed .sidebar { display: none; }
+/* The card's negative left margin exists to tuck under the sidebar; with no
+   sidebar there is nothing to tuck under and it would clip off-screen. */
+.app-shell.sidebar-collapsed .main-pane { margin-left: 6px; }
+.app-shell.sidebar-collapsed .nav-toggle { display: block; }
+/* The toggle is absolutely positioned over the workspace, so whichever pane
+   sits at the left edge has to make room for it or its title renders underneath
+   (found live: "filetest" showing as "letest"). Maximized panes are at the
+   left edge too, and are not necessarily :first-child. */
+.app-shell.sidebar-collapsed .workspace > .pane:first-child .pane-header,
+.app-shell.sidebar-collapsed .workspace.has-maximized > .pane-maximized .pane-header { padding-left: 60px; }
+
+button.pane-max-btn, button.pane-tree-btn { padding: 5px 9px; font-size: 13px; line-height: 1.3; }
+/* Maximize is presentational only — the other panes stay mounted (and keep
+   their scroll position, their editor, their in-flight requests), they are
+   just not shown. */
+.workspace.has-maximized > .pane:not(.pane-maximized) { display: none; }
+.workspace.has-maximized > .pane-maximized { grid-column: 1 / -1; grid-row: 1 / -1; }
+@media (max-width: 720px) {
+  /* One pane at a time already, so maximizing is a no-op — and the sidebar is
+     a drawer, not a column. */
+  button.pane-max-btn, button.sidebar-collapse-btn { display: none; }
+  .app-shell.sidebar-collapsed .nav-toggle { display: none; }
+}

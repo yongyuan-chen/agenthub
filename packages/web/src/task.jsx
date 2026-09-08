@@ -723,7 +723,7 @@ export function ConversationMessages({ messages, task = null, isCreator = false,
   );
 }
 
-export function TaskPane({ taskId, user, onClose, onOpenFiles }) {
+export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onToggleMaximize }) {
   const task = state.tasks.get(taskId);
   // Visibility can be team-wide, but actions stay creator-only (see the
   // hub-core.mjs guard this mirrors) — falls back to true if owner_user_id
@@ -1002,6 +1002,12 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles }) {
             you can read the code while the agent talks about it. */}
         {onOpenFiles && task.node_id && (
           <button type="button" className="ghost" title="浏览这台机器上的文件" onClick={() => onOpenFiles(task.node_id)}>📁 文件</button>
+        )}
+{onToggleMaximize && (
+          <button type="button" className="ghost pane-max-btn" onClick={onToggleMaximize}
+            title={maximized ? '还原' : '最大化(占满工作区)'} aria-label={maximized ? '还原' : '最大化'}>
+            {maximized ? '⤡' : '⤢'}
+          </button>
         )}
         {onClose && <button type="button" className="ghost pane-close-btn" onClick={onClose} aria-label="关闭">✕</button>}
       </header>
