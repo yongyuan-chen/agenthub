@@ -7,6 +7,7 @@ import {
 import { renderMarkdown } from './md.js';
 import { STATUS_META } from './board.jsx';
 import { fmtAge, fmtDuration } from './format.js';
+import { RUNNING_STATUSES, useElapsed } from './elapsed.js';
 import { SessionPicker } from './sessionpicker.jsx';
 import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
 
@@ -545,33 +546,18 @@ function ThinkingRow({ msg }) {
 // and the model's next turn reads as the UI being stuck, especially since
 // that gap is routinely 10-30s (found live: user submitted an AskUserQuestion
 // answer, saw zero feedback for ~30s, assumed it had frozen).
-// Statuses where a turn is actually in flight — mirrors hub-core.mjs's
-// BUSY_STATUSES, which is what decides when run_started_at gets stamped.
-const RUNNING_STATUSES = new Set(['running', 'starting']);
-
-// Ticks once a second so the header can show how long the current turn has
-// been going. Anchored to the server's run_started_at rather than to when
-// this pane mounted: opening the conversation (or a second device) mid-run
-// shows the real elapsed time instead of restarting from zero.
-function useElapsed(since, active) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active || !since) return undefined;
-    setNow(Date.now());
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [active, since]);
-  if (!active || !since) return null;
-  return Math.max(0, now - since);
-}
-
-function ThinkingIndicator() {
+// The elapsed time is repeated here, at the bottom of the conversation, and
+// not only in the header chip: while a turn is running this is where the eye
+// already is, and "is it stuck or just slow" is a question you ask staring at
+// the dots, not at the top of the page.
+function ThinkingIndicator({ elapsed }) {
   return (
     <div className="msg-row assistant thinking-indicator">
       <div className="msg-col">
         <span className="thinking-dots" aria-label="正在生成回复">
           <span></span><span></span><span></span>
         </span>
+        {elapsed !== null && <span className="muted run-timer thinking-elapsed">{fmtDuration(elapsed)}</span>}
       </div>
     </div>
   );
@@ -1025,7 +1011,7 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
                 canRetry={task.lease !== 'human'} onRetry={retryPending} onImageClick={setLightboxSrc}
               />
             ))}
-            {task.status === 'running' && <ThinkingIndicator />}
+            {task.status === 'running' && <ThinkingIndicator elapsed={elapsed} />}
           </div>
           {!atBottom && (
             <button className="jump-latest" onClick={() => { setAtBottom(true); scrollToBottom('smooth'); }}>

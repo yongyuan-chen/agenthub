@@ -3,7 +3,8 @@ import { createPortal } from 'react-dom';
 import { api } from './api.js';
 import { state, bump, taskInScope, cacheForScope, scopeKeyOf, isTaskUnread, unreadForScope } from './store.js';
 import { STATUS_META, AddNodeModal, ArchivedModal, NodeManageModal, ProjectMembersModal, CreateProjectModal } from './board.jsx';
-import { fmtAge } from './format.js';
+import { fmtAge, fmtDuration } from './format.js';
+import { RUNNING_STATUSES, elapsedOf, useNow } from './elapsed.js';
 import { ModalBackdrop } from './modal.jsx';
 
 // A conversation can be shared with several projects at once — toggling one
@@ -108,6 +109,9 @@ export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect,
   }, [open]);
   const mobileClosed = !open && matchMedia('(max-width: 720px)').matches;
   const tasks = [...state.tasks.values()].filter(t => !t.archived_at && taskInScope(t)).sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
+  // One clock for the whole list, and only while something is actually
+  // running — see the row's timer below.
+  const now = useNow(tasks.some(t => RUNNING_STATUSES.has(t.status) && t.run_started_at));
   const sources = [...state.conversationSources.values()].sort((a, b) => (b.mtime ?? 0) - (a.mtime ?? 0));
   const nodes = [...state.nodes.values()];
   const sourceStatus = state.sourceStatus[state.activeTeamId || 'personal'] || {};
@@ -142,6 +146,7 @@ export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect,
           // way); team view needs the actual creator check, since actions
           // are creator-only even when the task is visible to the whole team.
           const isMine = !state.activeTeamId || t.owner_user_id === user?.id;
+          const runElapsed = elapsedOf(t, now);
           return (
             <a
               key={t.id} href={`#/task/${t.id}`}
@@ -158,7 +163,17 @@ export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect,
                   <span className="chip owner-chip" title="创建者">{t.owner_username}</span>
                 )}
                 <span className={`chip ${meta.cls}`}>{meta.label}</span>
-                <span className="muted">{fmtAge(t.updated_at)}</span>
+                {/* While a turn is running, "多久以前" is meaningless here:
+                    cost/usage events bump updated_at every second or so, so
+                    the row flickered between 0s and 1s forever (reported as a
+                    broken timer, which is fair — it looked like one). Show
+                    the actual turn duration instead, the same value the
+                    conversation's own header shows. */}
+                {runElapsed !== null
+                  ? <span className="muted run-timer" title="本轮已运行时间">⏱ {fmtDuration(runElapsed)}</span>
+                  /* A turn that started before this shipped has no stamp to
+                     count from — show nothing rather than the churning age. */
+                  : !RUNNING_STATUSES.has(t.status) && <span className="muted">{fmtAge(t.updated_at)}</span>}
               </span>
               {/* Row actions overlay the row's right edge and only appear on
                   hover/focus (always-on where there's no hover, see the CSS).

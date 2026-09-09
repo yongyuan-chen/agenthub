@@ -9,6 +9,7 @@ import { sendWebPush } from '../packages/worker/src/push.mjs';
 import { listDirs } from '../packages/executor/src/cloudlink.mjs';
 import { buildClaudeArgs } from '../packages/executor/src/session.mjs';
 import { fmtDuration } from '../packages/web/src/format.js';
+import { elapsedOf, RUNNING_STATUSES } from '../packages/web/src/elapsed.js';
 
 test('Claude CLI arguments never impose AgentHub turn or cost limits', () => {
   const base = [
@@ -140,4 +141,20 @@ test('fmtDuration rolls seconds up at 60, then minutes up at 60', () => {
   assert.equal(fmtDuration(7_530_000), '2h05m', 'minutes stay zero-padded so widths line up');
   assert.equal(fmtDuration(undefined), '0s', 'a result card with no duration must not render NaN');
   assert.equal(fmtDuration(-5_000), '0s');
+});
+
+test('elapsedOf only counts a turn that is actually running and has a start stamp', () => {
+  const now = 1_000_000;
+  assert.equal(elapsedOf({ status: 'running', run_started_at: now - 94_000 }, now), 94_000);
+  assert.equal(elapsedOf({ status: 'starting', run_started_at: now - 1_000 }, now), 1_000);
+  // Finished: the row goes back to showing how long ago it last changed.
+  assert.equal(elapsedOf({ status: 'review', run_started_at: now - 94_000 }, now), null);
+  // Running, but started before run_started_at existed — nothing to count
+  // from, and falling back to updated_at is exactly the flicker this fixes.
+  assert.equal(elapsedOf({ status: 'running', run_started_at: null }, now), null);
+  // Clock skew between the node's stamp and this browser must not print a
+  // negative duration.
+  assert.equal(elapsedOf({ status: 'running', run_started_at: now + 5_000 }, now), 0);
+  assert.equal(elapsedOf(null, now), null);
+  assert.deepEqual([...RUNNING_STATUSES].sort(), ['running', 'starting']);
 });

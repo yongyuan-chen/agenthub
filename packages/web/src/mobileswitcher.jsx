@@ -1,17 +1,26 @@
 import React, { useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { STATUS_META } from './board.jsx';
-import { fmtAge } from './format.js';
+import { fmtAge, fmtDuration } from './format.js';
+import { RUNNING_STATUSES, elapsedOf, useNow } from './elapsed.js';
 
-function rowMeta(item) {
+function rowMeta(item, now) {
   if (item.kind === 'source') return { label: '历史 · 未接入', cls: 'source-chip', age: fmtAge(item.mtime) };
   if (item.kind === 'draft') return { label: '草稿', cls: '', age: '' };
   const status = STATUS_META[item.status] || { label: item.status, cls: '' };
-  return { label: status.label, cls: status.cls, age: fmtAge(item.updated_at) };
+  // Same rule as the sidebar: a running turn shows its own duration, because
+  // updated_at churns every second while it runs and "0s / 1s / 0s" is not a
+  // time anyone can read.
+  const elapsed = elapsedOf(item, now);
+  if (elapsed !== null) return { label: status.label, cls: status.cls, age: `⏱ ${fmtDuration(elapsed)}` };
+  return {
+    label: status.label, cls: status.cls,
+    age: RUNNING_STATUSES.has(item.status) ? '' : fmtAge(item.updated_at),
+  };
 }
 
-function ConversationRow({ item, active, open, onSelect, onClose }) {
-  const meta = rowMeta(item);
+function ConversationRow({ item, now, active, open, onSelect, onClose }) {
+  const meta = rowMeta(item, now);
   return (
     <div className={`mobile-switcher-row ${active ? 'active' : ''}`}>
       <button type="button" className="mobile-switcher-select" onClick={() => onSelect(item.paneId)}>
@@ -54,6 +63,7 @@ export function MobileConversationSwitcher({ openItems, allItems, activePaneId, 
   const filteredOpen = openItems.filter(matches);
   const filtered = allItems.filter(matches);
   const openIds = new Set(openItems.map(item => item.paneId));
+  const now = useNow(allItems.some(item => RUNNING_STATUSES.has(item.status) && item.run_started_at));
 
   return createPortal(
     <div className="mobile-sheet-backdrop" onClick={onClose}>
@@ -66,9 +76,9 @@ export function MobileConversationSwitcher({ openItems, allItems, activePaneId, 
         <input ref={inputRef} value={query} onChange={event => onQuery(event.target.value)} placeholder="搜索当前项目对话…" />
         <div className="mobile-sheet-list">
           {!!filteredOpen.length && <div className="mobile-sheet-section">已打开</div>}
-          {filteredOpen.map(item => <ConversationRow key={item.paneId} item={item} active={item.paneId === activePaneId} open onSelect={onSelect} onClose={onClosePane} />)}
+          {filteredOpen.map(item => <ConversationRow key={item.paneId} item={item} now={now} active={item.paneId === activePaneId} open onSelect={onSelect} onClose={onClosePane} />)}
           <div className="mobile-sheet-section">当前范围全部对话</div>
-          {filtered.filter(item => !openIds.has(item.paneId)).map(item => <ConversationRow key={item.paneId} item={item} active={false} open={false} onSelect={onSelect} />)}
+          {filtered.filter(item => !openIds.has(item.paneId)).map(item => <ConversationRow key={item.paneId} item={item} now={now} active={false} open={false} onSelect={onSelect} />)}
           {!filtered.length && <div className="empty">没有匹配的对话</div>}
         </div>
       </section>
