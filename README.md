@@ -51,7 +51,31 @@ phone / browser ──HTTPS/WS──► Cloudflare Worker (board + API + push)
 
 ---
 
-## Deploy it with an AI agent
+## Getting started
+
+### Use the hosted instance — recommended
+
+**https://agenthub.win/** is already running and open for sign-ups. Nothing to deploy:
+
+1. Create an account.
+2. **Add node** in the UI hands you a one-line install command with your token already in
+   it. Run it on each machine you want agents working on — macOS, Linux or Windows.
+3. **Settings → Models**: save your Anthropic-compatible relay base URL and key. It syncs
+   out to every node from there.
+4. Add the site to your phone's home screen so approval pushes arrive.
+
+Hosted doesn't mean your work is hosted. Your repos stay on your own machines, and your
+relay API key is written only to each node's local config — the server relays messages and
+approvals, and never sees either.
+
+### Or run your own
+
+The whole server side is a Cloudflare Worker plus a D1 database, and both fit inside
+Cloudflare's free tier — hosting this costs nothing. The one thing you can't skip is a
+**domain already managed by Cloudflare**: setup binds the Worker to a custom domain on
+that zone, so the domain needs to be in the same Cloudflare account.
+
+#### Deploy it with an AI agent
 
 The fastest way to stand this up is to let a coding agent do it. Open Claude Code (or any
 agent with shell access) in an empty directory and paste this:
@@ -99,11 +123,10 @@ sign in, open Settings -> Models, save my API relay's base URL and key (it syncs
 node automatically), then add the site to my phone's home screen and enable push.
 ````
 
----
+#### Deploy it yourself
 
-## Deploy it yourself
-
-Needs Node ≥ 22.5, git, and the claude and/or codex CLI.
+Needs Node ≥ 22.5, git, the claude and/or codex CLI, and a Cloudflare account with your
+domain's zone in it.
 
 ```bash
 git clone https://github.com/yongyuan-chen/agenthub
