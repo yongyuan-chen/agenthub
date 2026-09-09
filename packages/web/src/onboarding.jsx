@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { api } from './api.js';
-import { state } from './store.js';
 import { ModalBackdrop } from './modal.jsx';
 import { ModelProfilesSection } from './settings.jsx';
 import { NodeInstallPanel } from './board.jsx';
@@ -12,19 +11,17 @@ import { NodeInstallPanel } from './board.jsx';
 // button — so a new user lands on an empty board with no indication that the
 // "+ 新对话" button they're drawn to will fail. This walks them through both,
 // and gets out of the way permanently once they're done.
-export function OnboardingModal({ hasModel, hasNode, onClose, onDone, onPollNodes }) {
+export function OnboardingModal({ hasModel, nodeCount, onClose, onDone, onPollNodes }) {
   // Start on whichever step is actually outstanding, so someone who already
   // has a relay configured isn't made to click past it.
   const [step, setStep] = useState(hasModel ? 2 : 1);
-  const nodeCount = state.nodes.size;
+  const hasNode = nodeCount > 0;
 
-  // The node list arrives over the WS as soon as the machine enrolls, so the
-  // wizard can confirm success on its own instead of asking the user whether
-  // it worked. It also polls while waiting, so a dropped WS doesn't leave the
-  // step stuck on "waiting" after the install has actually succeeded.
-  useEffect(() => { if (nodeCount > 0 && step === 2) onDone?.(); }, [nodeCount]);
+  // Polls while waiting on step 2, so the wizard can confirm the install
+  // succeeded on its own instead of asking the user whether it worked — and
+  // so a dropped WS doesn't leave it stuck on "waiting" forever.
   useEffect(() => {
-    if (hasNode || step !== 2 || !onPollNodes) return;
+    if (hasNode || step !== 2 || !onPollNodes) return undefined;
     const timer = setInterval(onPollNodes, 5000);
     return () => clearInterval(timer);
   }, [hasNode, step, onPollNodes]);
@@ -97,20 +94,34 @@ export function OnboardingModal({ hasModel, hasNode, onClose, onDone, onPollNode
   );
 }
 
-// Whether this account still needs the wizard. Model profiles aren't in the
-// shared store (only Settings ever needed them), so they're fetched here;
-// nodes already stream into state via the WS.
+// Whether this account still needs the wizard: both halves in one
+// account-wide answer (GET /api/setup-status).
+//
+// It used to read the machine half off state.nodes — the *scoped* node list —
+// which made the wizard pop up at accounts that were long since set up:
+//   - state.loaded flips as soon as GET /tasks lands, while GET /nodes is
+//     still in flight, so every load had a window where "loaded, and no
+//     machines" was momentarily true. One render in that window latched the
+//     wizard open (it deliberately stays up until dismissed), and it then
+//     rendered its own all-green "设置完成 🎉" screen.
+//   - viewing a project with no machine bound to it reads as "no machines"
+//     even with several on the account.
+// Both disappear when the question is asked of the account, once, atomically.
 export function useSetupStatus(authed) {
-  const [hasModel, setHasModel] = useState(null); // null = still unknown
+  // null = still unknown; nothing may conclude "not set up" from this yet.
+  const [status, setStatus] = useState({ hasModel: null, nodeCount: null });
+  const load = () => api.setupStatus()
+    .then(r => setStatus({ hasModel: !!r.hasModel, nodeCount: r.nodeCount ?? 0 }))
+    // A failed check must not pop a setup wizard at someone whose account is
+    // fine — treat unknown as "configured" and stay quiet.
+    .catch(() => setStatus({ hasModel: true, nodeCount: 1 }));
   useEffect(() => {
-    if (!authed) { setHasModel(null); return; }
+    if (!authed) { setStatus({ hasModel: null, nodeCount: null }); return undefined; }
     let cancelled = false;
-    api.modelProfiles()
-      .then(r => { if (!cancelled) setHasModel((r.profiles || []).length > 0); })
-      // A failed check must not pop a setup wizard at someone whose account is
-      // fine — treat unknown as "configured" and stay quiet.
-      .catch(() => { if (!cancelled) setHasModel(true); });
+    api.setupStatus()
+      .then(r => { if (!cancelled) setStatus({ hasModel: !!r.hasModel, nodeCount: r.nodeCount ?? 0 }); })
+      .catch(() => { if (!cancelled) setStatus({ hasModel: true, nodeCount: 1 }); });
     return () => { cancelled = true; };
   }, [authed]);
-  return { hasModel, refresh: () => api.modelProfiles().then(r => setHasModel((r.profiles || []).length > 0)).catch(() => {}) };
+  return { ...status, refresh: load };
 }

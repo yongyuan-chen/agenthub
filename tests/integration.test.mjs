@@ -5083,3 +5083,47 @@ test('node files: a save that lost a race with the agent comes back as a conflic
   const dead = await cloud.api('POST', '/api/nodes/n1/file', { path: '/x', content: 'mine' });
   assert.equal(dead.status, 504);
 });
+
+test('setup-status: answers for the whole account, not the project being viewed', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)')
+    .bind('user-test', 'alice', 'x', now).run();
+  await cloud.db.prepare('INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)').bind('team-s', '空项目', now).run();
+  await cloud.db.prepare('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)')
+    .bind('team-s', 'user-test', 'owner', now).run();
+  const teamCtx = { ...cloud.ctx, teamId: 'team-s' };
+
+  let status = await cloud.api('GET', '/api/setup-status', {});
+  assert.deepEqual(status.body.hasModel, false);
+  assert.equal(status.body.nodeCount, 0);
+
+  // Legacy relay credentials (pre-profiles) still count as configured — the
+  // profile list route lazily migrates them, so claiming "no model" here
+  // would pop the wizard at an account that works fine.
+  await cloud.db.prepare('UPDATE users SET api_base_url = ?, api_key = ? WHERE id = ?')
+    .bind('https://relay.example/v1', 'sk-x', 'user-test').run();
+  assert.equal((await cloud.api('GET', '/api/setup-status', {})).body.hasModel, true);
+
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mine', await sha256Hex('t'), 'user-test', now).run();
+
+  // A project with no machine bound to it is not "this account has no
+  // machine" — this is what used to pop the wizard on every scope switch.
+  status = await core.api(teamCtx, 'GET', '/api/setup-status', {});
+  assert.equal(status.body.nodeCount, 1, '项目视角下也要看到账号名下的机器');
+  assert.deepEqual((await core.api(teamCtx, 'GET', '/api/nodes', {})).body.nodes, [], '而节点列表本身仍然是按视角过滤的');
+
+  // A teammate's machine shared into a project I'm in counts too: I can
+  // create conversations on it, so the wizard has nothing left to ask me.
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)')
+    .bind('user-bob', 'bob', 'x', now).run();
+  await cloud.db.prepare('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)')
+    .bind('team-s', 'user-bob', 'member', now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('bobs', await sha256Hex('t2'), 'user-bob', now).run();
+  await cloud.db.prepare('INSERT INTO node_teams (node_id, team_id) VALUES (?, ?)').bind('bobs', 'team-s').run();
+  assert.equal((await cloud.api('GET', '/api/setup-status', {})).body.nodeCount, 2);
+  assert.equal((await core.api({ ...cloud.ctx, userId: 'user-bob' }, 'GET', '/api/setup-status', {})).body.nodeCount, 1,
+    'bob 只看得到自己的和项目里的那一台(同一台),不会数上别人的私人机器');
+});

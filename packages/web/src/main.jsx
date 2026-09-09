@@ -38,7 +38,7 @@ function App() {
   // conversation, so re-offering the wizard on the next visit is help, not
   // nagging. Dismissing it stays dismissed for as long as the tab is open,
   // and the sidebar keeps a way back in.
-  const { hasModel, refresh: refreshSetup } = useSetupStatus(authed);
+  const { hasModel, nodeCount, refresh: refreshSetup } = useSetupStatus(authed);
   const [setupDismissed, setSetupDismissed] = useState(false);
   // Once the wizard is up it stays up until dismissed, even after both steps
   // go green. Unmounting it the instant setup completes made it vanish
@@ -255,12 +255,13 @@ function App() {
   // outside AppShell's per-scope board rather than as another pane inside it.
   if (hash.startsWith('#/supervisor')) return <SupervisorPage />;
 
-  // Gated on state.loaded so the wizard can't flash up during the first fetch,
-  // when "no nodes" only means "not loaded yet". hasModel === null is the same
-  // guard for the relay check.
-  const hasNode = state.nodes.size > 0;
-  const setupIncomplete = hasModel === false || (state.loaded && !hasNode);
-  const showOnboarding = authed && !setupDismissed && hasModel !== null && state.loaded && (setupIncomplete || setupOpened);
+  // Both halves come from one account-wide answer (see useSetupStatus), so
+  // "not set up" is only ever concluded from a complete picture — never from
+  // a half-loaded one, and never from a project that happens to have no
+  // machine bound to it.
+  const setupKnown = hasModel !== null && nodeCount !== null;
+  const setupIncomplete = setupKnown && (!hasModel || nodeCount === 0);
+  const showOnboarding = authed && !setupDismissed && setupKnown && (setupIncomplete || setupOpened);
 
   if (showOnboarding && !setupOpened) setSetupOpened(true);
   // A logout must not leave the next account's wizard latched open.
@@ -288,10 +289,13 @@ function App() {
       )}
       {showOnboarding && (
         <OnboardingModal
-          hasModel={!!hasModel} hasNode={hasNode}
+          hasModel={!!hasModel} nodeCount={nodeCount ?? 0}
           onClose={() => { setSetupDismissed(true); setSetupOpened(false); }}
           onDone={refreshSetup}
-          onPollNodes={refreshNodes}
+          // Refreshes both the account-wide status the wizard renders and the
+          // sidebar's scoped node list, so a machine that finishes installing
+          // shows up in both places without a reload.
+          onPollNodes={() => { refreshSetup(); refreshNodes(); }}
         />
       )}
     </>

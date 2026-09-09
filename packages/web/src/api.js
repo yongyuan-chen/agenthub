@@ -65,6 +65,8 @@ export const api = {
   getLayout: () => req('GET', '/api/layout'),
   saveLayout: (panes, teamId = state.activeTeamId) => req('POST', '/api/layout', { panes }, { teamId }),
   modelProfiles: () => req('GET', '/api/model-profiles'),
+  // Account-wide, not scoped to the current project — see hub-core's route.
+  setupStatus: () => req('GET', '/api/setup-status', undefined, { skipTeamHeader: true }),
   createModelProfile: (p) => req('POST', '/api/model-profiles', p),
   updateModelProfile: (id, p) => req('PUT', `/api/model-profiles/${id}`, p),
   deleteModelProfile: (id) => req('DELETE', `/api/model-profiles/${id}`),

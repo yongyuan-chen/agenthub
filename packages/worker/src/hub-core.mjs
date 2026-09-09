@@ -1863,6 +1863,32 @@ export async function api(ctx, method, pathname, body) {
     }
   }
 
+  // Can this account work at all: does it have a relay to call, and a machine
+  // to run on. Deliberately account-wide rather than scoped like GET /nodes —
+  // the first-run wizard asks "is this account set up", and a project you
+  // happen to be viewing that has no machine bound to it is not the same
+  // question. Answering both halves in one response also means the frontend
+  // never sees a moment where it knows one and not the other (which is how
+  // the wizard used to pop up at fully-configured accounts).
+  if (method === 'GET' && route[0] === 'setup-status' && route.length === 1) {
+    const [profiles, legacy, nodes] = await Promise.all([
+      q(ctx.db, 'SELECT COUNT(*) AS n FROM model_profiles WHERE owner_user_id = ?', userId).first(),
+      // Same lazy-migration case GET /model-profiles handles: credentials
+      // configured before profiles existed still count as "has a relay".
+      q(ctx.db, 'SELECT api_base_url, api_key FROM users WHERE id = ?', userId).first(),
+      q(ctx.db,
+        `SELECT COUNT(*) AS n FROM nodes
+         WHERE owner_user_id = ?
+            OR id IN (SELECT node_id FROM node_teams
+                      WHERE team_id IN (SELECT team_id FROM team_members WHERE user_id = ?))`,
+        userId, userId).first(),
+    ]);
+    return ok({
+      hasModel: (profiles?.n ?? 0) > 0 || !!(legacy?.api_base_url && legacy?.api_key),
+      nodeCount: nodes?.n ?? 0,
+    });
+  }
+
   if (route[0] === 'model-profiles' && route.length === 1) {
     if (method === 'GET') {
       // Lazy migration: an account that configured relay credentials before
