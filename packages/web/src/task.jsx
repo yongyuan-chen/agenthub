@@ -988,30 +988,41 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
             {task.lease === 'human' && <span className="chip st-waiting">IDE 接管中</span>}
             <ModelChip task={task} isCreator={isCreator} />
             <span className="muted">{task.node_id}</span>
-            {task.backend !== 'codex' && <span className="muted">${(task.cost_usd ?? 0).toFixed(3)}</span>}
+            {/* A conversation that hasn't spent anything yet has nothing to
+                say here — $0.000 is a chip's worth of width for no
+                information, and width is the scarce thing in a tiled pane.
+                The 信息 tab always shows it. */}
+            {task.backend !== 'codex' && (task.cost_usd ?? 0) > 0
+              && <span className="muted">${task.cost_usd.toFixed(3)}</span>}
             {!!task.context_tokens && (task.backend === 'codex'
               ? <span className="chip ctx-chip ctx-ok" title={`当前上下文约 ${task.context_tokens.toLocaleString()} tokens`}>上下文 {task.context_tokens.toLocaleString()} tokens</span>
               : <ContextChip tokens={task.context_tokens} />)}
           </div>
         </div>
-        <nav className="tabs">
-          {[['chat', '对话'], ['diff', '变更'], ['info', '信息']].map(([k, label]) => (
-            <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{label}</button>
-          ))}
-        </nav>
-        {/* Opens a file browser for this task's node, starting in its own
-            working directory — the pane tiles alongside the conversation so
-            you can read the code while the agent talks about it. */}
-        {onOpenFiles && task.node_id && (
-          <button type="button" className="ghost" title="浏览这台机器上的文件" onClick={() => onOpenFiles(task.node_id)}>📁 文件</button>
-        )}
-{onToggleMaximize && (
-          <button type="button" className="ghost pane-max-btn" onClick={onToggleMaximize}
-            title={maximized ? '还原' : '最大化(占满工作区)'} aria-label={maximized ? '还原' : '最大化'}>
-            {maximized ? '⤡' : '⤢'}
-          </button>
-        )}
-        {onClose && <button type="button" className="ghost pane-close-btn" onClick={onClose} aria-label="关闭">✕</button>}
+        {/* Tabs and pane buttons travel together: as one flex item they wrap
+            onto a single shared line when the pane is narrow, instead of the
+            tabs staying up beside the title and the buttons dropping onto a
+            line of their own. */}
+        <div className="pane-header-actions">
+          <nav className="tabs">
+            {[['chat', '对话'], ['diff', '变更'], ['info', '信息']].map(([k, label]) => (
+              <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{label}</button>
+            ))}
+          </nav>
+          {/* Opens a file browser for this task's node, starting in its own
+              working directory — the pane tiles alongside the conversation so
+              you can read the code while the agent talks about it. */}
+          {onOpenFiles && task.node_id && (
+            <button type="button" className="ghost" title="浏览这台机器上的文件" onClick={() => onOpenFiles(task.node_id)}>📁 文件</button>
+          )}
+          {onToggleMaximize && (
+            <button type="button" className="ghost pane-max-btn" onClick={onToggleMaximize}
+              title={maximized ? '还原' : '最大化(占满工作区)'} aria-label={maximized ? '还原' : '最大化'}>
+              {maximized ? '⤡' : '⤢'}
+            </button>
+          )}
+          {onClose && <button type="button" className="ghost pane-close-btn" onClick={onClose} aria-label="关闭">✕</button>}
+        </div>
       </header>
 
       {tab === 'chat' && (

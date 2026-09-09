@@ -392,7 +392,16 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
   backdrop-filter: blur(18px) saturate(108%);
   position: sticky; top: 0; z-index: 10; flex-wrap: wrap;
 }
-.task-head { flex: 1; min-width: 0; }
+/* A pane is often much narrower than the window (two or three tiled side by
+   side), and this row has to hold the title block *and* the tabs *and* the
+   pane buttons. Without a floor, the title block was the only flexible item,
+   so it got squeezed to ~150px and stacked every status chip on its own line
+   — a 225px-tall header over a 480px-wide pane, a quarter of it gone before
+   the first message (reported live, with a screenshot). A min-width makes the
+   flex row wrap instead: title and chips get the pane's full width, tabs and
+   buttons drop to their own line. */
+.task-head { flex: 1; min-width: 240px; }
+.pane-header-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .task-head h2 { margin: 0 0 3px; font-size: 15.5px; font-weight: 600; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .task-head h2.editable-title { cursor: text; border-bottom: 1px dashed transparent; }
 .task-head h2.editable-title:hover { border-bottom-color: rgba(var(--brand-rgb), .5); }
@@ -796,6 +805,7 @@ button.mobile-switcher-close:hover { background: var(--bg3); color: var(--fg); }
   .pane-mobile-active { display: flex; height: 100%; }
   .pane-header { gap: 8px; padding: 10px 12px; }
   .task-head { flex-basis: 100%; }
+  .pane-header-actions { flex: 1; }
   .tabs { flex: 1; width: auto; justify-content: stretch; }
   .tabs button { flex: 1; padding: 9px 12px; }
   .team-switcher { flex: none; width: 100%; }
