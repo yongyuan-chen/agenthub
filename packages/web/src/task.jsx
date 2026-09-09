@@ -270,13 +270,29 @@ function AskUserQuestionCard({ input, isActive, busy, onDecide }) {
 function PermCard({ task, msg, isCreator }) {
   const { requestId, toolName, input, description } = msg.content;
   const pending = task.pending_request ? JSON.parse(task.pending_request) : null;
+  // A decision this browser has already submitted successfully. The task row
+  // doesn't clear pending_request until the node has actually applied it and
+  // reported back, so between the HTTP response and that broadcast the card
+  // still looks undecided — the buttons went dark on click and then lit back
+  // up before finally settling on 已处理 (reported live, and it reads like
+  // the click didn't take). Once the cloud has accepted the decision it is
+  // durable (dispatch falls back to pending_cmds for an offline node), so
+  // there is nothing left for the human to do here either way.
+  const [submitted, setSubmitted] = useState(false);
   // Deciding is a mutating action — creator-only, same as every other
   // action, even though the request card itself is visible to the whole team.
-  const isActive = pending?.requestId === requestId && task.status === 'waiting_human' && isCreator;
+  const isActive = pending?.requestId === requestId && task.status === 'waiting_human' && isCreator && !submitted;
   const [busy, setBusy] = useState(false);
   const act = async (behavior, updatedInput, autoApprove, forceAll) => {
     setBusy(true);
-    try { await api.decision(task.id, requestId, behavior, undefined, updatedInput, autoApprove, forceAll); } catch (e) { alert(e.message); }
+    try {
+      await api.decision(task.id, requestId, behavior, undefined, updatedInput, autoApprove, forceAll);
+      setSubmitted(true);
+    } catch (e) {
+      // A decision that never reached the cloud is the one case where the
+      // buttons must come back — nothing was recorded, so this is a retry.
+      alert(e.message);
+    }
     setBusy(false);
   };
 
