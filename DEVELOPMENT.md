@@ -201,7 +201,11 @@ queued ──► starting ──► running ──► waiting_human ──► ru
 
 - **CloudLink**:与 Worker 的 WebSocket。注册(`node_id` + token)、心跳(每 20s)、收指令、发事件(经 outbox)。
 - **SessionManager**:每个 running 任务对应一个 SDK 会话。
-- **WorktreeManager**:任务启动时 `git worktree add ../wt-<taskId> -b task/<taskId>`(仓库不存在则先 clone);任务 done/cancelled 后保留 worktree 与分支(用户手动清理或 v2 做回收)。无 repo 的任务在 `~/agenthub/scratch/<taskId>` 下建纯目录。
+- **WorktreeManager**(`worktree.mjs` 的 `prepareWorkspace`):按"这台机器上是否已经有目录可用"分流。
+  - **本地路径**(填的仓库是一台机器上真实存在的目录):**原地使用,一条 git 命令都不执行** —— 不 clone、不建 worktree、不建分支、不切分支。agent 就在用户自己的目录里干活,文件浏览器(用 taskId 解析到同一个 dir)展示的也正是这个真实路径。是不是 git 仓库不影响这条规则。
+  - **远程 URL**:本地无处可去,才 clone 到 `~/agenthub/repos/<sha256(repoUrl)前12位>` 并 `git worktree add ~/agenthub/wt-<taskId> -b task/<taskId>`;任务结束后保留 worktree 与分支(用户手动清理)。`baseBranch` 只在这条路径上有意义。
+  - **无 repo**:在 `~/agenthub/scratch/<taskId>` 下建纯目录并 `git init`。
+  - 派生规则:`collectDiff` 会跑 `git add -A`,所以 `_publishDiff` 只在 **workRoot 之下**的目录(scratch/worktree,见 `isManagedDir`)采集 diff —— 绝不在用户自己的仓库里暂存他们的未跟踪文件。原地任务与 resume 任务因此没有「变更」可看,这是刻意的取舍。
 - **TerminalGateway**:按需拉起 ttyd 绑定某任务的 worktree 目录(127.0.0.1 随机端口),通过 cloudflared tunnel 暴露,返回一次性 URL。v1 可以只实现"在服务器上打印如何手动 attach 的命令",完整 ttyd 集成放低优先级。
 
 ### 6.2 会话生命周期(核心逻辑)
@@ -251,7 +255,8 @@ for await (const msg of stream) { handleMessage(task, msg); }
 POST   /api/login                    # 校验用户 token,签发短期 JWT(或直接用 token,v1 从简)
 GET    /api/tasks                    # 列表(D1)
 POST   /api/tasks                    # 创建任务 {title, spec, repo_url?, node_id}
-GET    /api/tasks/:id/messages?after_seq=  # 历史消息分页(D1)
+GET    /api/tasks/:id/messages?after_seq=   # 向后取增量(断线重连补齐)
+GET    /api/tasks/:id/messages?before_seq=  # 向前取一页 + hasMore(打开对话 / 上翻历史);0 = 最新一页
 POST   /api/tasks/:id/message        # 用户发消息(转发 DO → executor)
 POST   /api/tasks/:id/decision       # 允许/拒绝工具调用
 POST   /api/tasks/:id/lease          # 申请/归还会话租约(§8)
@@ -292,6 +297,18 @@ GET    /ws/executor                  # executor WS(node token 认证),转交 Hub
   3. 接管期间看板对该卡只读(仍可看历史),状态显示"IDE 接管中"。
 - 用户点 **"归还"**:lease 回 `daemon`,daemon 下次驱动前先读取会话文件同步 IDE 期间产生的新消息(通过 `--resume` 自然获得完整上下文;消息展示层面,v1 允许 IDE 期间的消息在看板上缺失,标注"此段在 IDE 中进行"即可,完整回填放 v2)。
 
+### 8.1 分支到新对话
+
+任意一条 AI 回复下方可以「分支」出一个继承了到该回复为止全部上下文的新对话,原对话不受影响。
+
+agent 的记忆在 CLI 自己写的会话文件里,不在 D1 的 `messages` 表里(那张表只是给前端渲染用的投影),所以分支必须真的去 fork 磁盘上那个文件 —— 往 `messages` 里插几行历史只会做出一个"看着有历史、agent 却什么都不记得"的对话。
+
+因此这个功能会**往用户真实的 `~/.claude/projects` / `~/.codex/sessions` 里写一个新会话文件**,和接管外部会话的流程写在同一批目录下。好处是分支出来的会话用户可以自己 `claude --resume <新 id>` 打开;代价是 AgentHub 在用户的 CLI 会话列表里多留了一条记录。
+
+切分只发生在**用户回合的边界**上:在 `tool_use` 和它的 `tool_result` 之间截断会产出一个 API 直接拒绝的非法上下文。回合数是**从尾部倒数**的(云端数"分支点之后还有几条 user 消息",节点据此丢掉最后几个回合),因为被接管的对话在 D1 里只有尾部一段,正着数会错位。
+
+新对话**复用父对话的工作目录**(带 `session_id` 创建的任务不建 worktree,直接在给定目录里跑 —— `--resume` 要求 cwd 与会话创建时一致),所以父子同时干活会改到同一批文件,创建后会在前端提示一次。
+
 ---
 
 ## 9. 前端设计(Pages)
@@ -305,13 +322,13 @@ GET    /ws/executor                  # executor WS(node token 认证),转交 Hub
 
 ### 9.2 聊天面板渲染要求(体验核心,对标 VS Code 插件)
 
-- 消息按 `seq` 排序,虚拟滚动(历史可能数千条),支持无限上翻与"跳到最新"。
+- 消息按 `seq` 排序。打开对话只取最新一页(`before_seq=0`,60 条),上翻到接近顶部时按 `before_seq` 再取一页并补偿滚动位置;store 里保存的是一段**连续**窗口(见 `setMessageWindow`),重开时若新的一页和旧窗口接不上就整段丢弃重来,不留看不见的空洞。
 - `assistant` 文本:markdown 渲染(代码块高亮)。
 - `tool_use`/`tool_result`:默认折叠为单行(图标 + 工具名 + 参数摘要,如 `Bash: pytest -x`),点击展开完整输入输出;Edit/Write 类工具展开后显示 diff 格式。
 - `waiting_human` 决策请求:醒目卡片 + 允许/拒绝按钮。
 - `result`:总结卡片(耗时、成本、改动文件统计)。
 - 实时性:WS 收到新消息即追加;若用户正在上翻历史,不强制滚动到底部,显示"有新消息 ↓"浮标。
-- 断线重连后按 `after_seq` 拉增量。
+- 断线重连后按 `after_seq` 拉增量(从窗口最新一条往后,和上翻用的 `before_seq` 互不影响)。
 
 ### 9.3 Diff 视图
 

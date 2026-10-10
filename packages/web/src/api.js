@@ -106,6 +106,11 @@ export const api = {
   getTask: (id) => req('GET', `/api/tasks/${id}`),
   createTask: (t) => req('POST', '/api/tasks', t),
   messages: (id, afterSeq = 0) => req('GET', `/api/tasks/${id}/messages?after_seq=${afterSeq}&limit=1000`),
+  // Backwards page, used to open a conversation (beforeSeq 0 = "the newest
+  // ones") and then to walk up its history one screenful at a time. Answers
+  // with hasMore so the client knows whether anything older is left.
+  messagesBefore: (id, beforeSeq = 0, limit = 60) =>
+    req('GET', `/api/tasks/${id}/messages?before_seq=${beforeSeq}&limit=${limit}`),
   // clientMessageId makes the send durable and idempotent end-to-end: the
   // cloud stores it before answering, keeps redelivering until the node
   // echoes that same id back, and collapses a retry of the same id onto the
@@ -132,6 +137,9 @@ export const api = {
   cancel: (id) => req('POST', `/api/tasks/${id}/cancel`, {}),
   retryTask: (id, opts) => req('POST', `/api/tasks/${id}/retry`, opts || {}),
   resyncSession: (id) => req('POST', `/api/tasks/${id}/resync`, {}),
+  // seq identifies the assistant reply to branch under; the new conversation
+  // inherits everything up to and including the turn that reply belongs to.
+  branchTask: (id, seq) => req('POST', `/api/tasks/${id}/branch`, { seq }),
   markDone: (id) => req('POST', `/api/tasks/${id}/done`, {}),
   lease: (id, lease) => req('POST', `/api/tasks/${id}/lease`, { lease }),
   archiveTask: (id) => req('POST', `/api/tasks/${id}/archive`, {}),
@@ -148,6 +156,9 @@ export const api = {
   addNodeTeam: (id, teamId) => req('POST', `/api/nodes/${id}/teams/${teamId}`),
   removeNodeTeam: (id, teamId) => req('DELETE', `/api/nodes/${id}/teams/${teamId}`),
   renameNode: (id, name) => req('POST', `/api/nodes/${id}/rename`, { name }),
+  // backend omitted = every installed CLI on that machine.
+  upgradeNodeCli: (id, backend) => req('POST', `/api/nodes/${id}/cli-upgrade`, { backend: backend ?? null }),
+  setNodeAutoUpgrade: (id, enabled) => req('POST', `/api/nodes/${id}/auto-upgrade`, { enabled }),
   vapid: () => req('GET', '/api/vapid'),
   subscribePush: (subscription) => req('POST', '/api/push/subscribe', { subscription }),
 };

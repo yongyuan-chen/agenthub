@@ -1,8 +1,8 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { api } from './api.js';
-import { state, bump, taskInScope, cacheForScope, scopeKeyOf, isTaskUnread, unreadForScope } from './store.js';
-import { STATUS_META, AddNodeModal, ArchivedModal, NodeManageModal, ProjectMembersModal, CreateProjectModal } from './board.jsx';
+import { state, bump, taskInScope, cacheForScope, scopeKeyOf, isTaskUnread, unreadForScope, runningForScope } from './store.js';
+import { STATUS_META, AddNodeModal, ArchivedModal, NodeManageModal, ProjectMembersModal, CreateProjectModal, nodeCliOutdated } from './board.jsx';
 import { fmtAge, fmtDuration } from './format.js';
 import { RUNNING_STATUSES, elapsedOf, useNow } from './elapsed.js';
 import { ModalBackdrop } from './modal.jsx';
@@ -75,17 +75,24 @@ function TeamSwitcher({ onSwitchTeam, onManageMembers, onCreateProject }) {
   // isn't something to act on per-unit, and a tab strip that reflows as
   // counts change is worse than one that doesn't.
   const dot = (teamId) => unreadForScope(teamId) > 0 ? <i className="unread-dot" aria-label="有新动静" /> : null;
+  // "有 agent 正在这个项目里干活", so you don't have to click through every tab
+  // to find out. Also a count-free indicator, and for the same reason as the
+  // dot: how *many* turns are in flight isn't actionable per-unit, and a
+  // number that changes would reflow the wrapping tab strip.
+  const running = (teamId) => runningForScope(teamId) > 0
+    ? <span className="running-dots" aria-label="有对话正在运行" title="有对话正在运行"><span /><span /><span /></span>
+    : null;
   return (
     <nav className="tabs team-switcher">
       <button
         type="button" className={!state.activeTeamId ? 'active' : ''}
         onClick={() => onSwitchTeam(null)}
-      >个人{dot(null)}</button>
+      >个人{dot(null)}{running(null)}</button>
       {state.teams.map(t => (
         <button
           key={t.id} type="button" className={state.activeTeamId === t.id ? 'active' : ''}
           onClick={() => onSwitchTeam(t.id)}
-        >{t.name}{dot(t.id)}</button>
+        >{t.name}{dot(t.id)}{running(t.id)}</button>
       ))}
       {activeTeam?.role === 'owner' && (
         <button type="button" className="ghost" title="管理项目成员" onClick={() => onManageMembers(activeTeam)}>⚙</button>
@@ -232,16 +239,27 @@ export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect,
 
       <div className="sidebar-footer">
         <div className="node-strip">
-          {nodes.map(n => (
-            <span
-              key={n.id} className={`node-chip ${n.status}`}
-              title={n.status === 'online'
-                ? `最后心跳 ${fmtAge(n.last_heartbeat_at)} 前`
-                : `节点离线(最后心跳 ${fmtAge(n.last_heartbeat_at)} 前)— 打开「节点管理」查看修复指引`}
-            >
-              <i className={`dot ${n.status === 'online' ? 'online' : ''}`} />{n.name || n.id}
-            </span>
-          ))}
+          {nodes.map(n => {
+            // Quiet marker, not a warning: an outdated CLI still works right
+            // up until a model rejects its request body, so this is a nudge
+            // toward 节点管理, not something to interrupt anyone over. Auto-
+            // upgrade normally clears it on its own within the hour.
+            const outdated = nodeCliOutdated(n);
+            return (
+              <span
+                key={n.id} className={`node-chip ${n.status}`}
+                title={[
+                  n.status === 'online'
+                    ? `最后心跳 ${fmtAge(n.last_heartbeat_at)} 前`
+                    : `节点离线(最后心跳 ${fmtAge(n.last_heartbeat_at)} 前)— 打开「节点管理」查看修复指引`,
+                  outdated ? 'agent CLI 有新版本可升级 — 打开「节点管理」查看' : '',
+                ].filter(Boolean).join('\n')}
+              >
+                <i className={`dot ${n.status === 'online' ? 'online' : ''}`} />{n.name || n.id}
+                {outdated && <span className="node-chip-upgrade">⬆</span>}
+              </span>
+            );
+          })}
           {!nodes.length && <span className="muted">无节点</span>}
           {!state.wsConnected && <span className="chip st-failed">连接断开</span>}
         </div>

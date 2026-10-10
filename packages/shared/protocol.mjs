@@ -51,7 +51,11 @@ export const DEFAULT_BACKEND = 'claude';
 
 // ---- Executor -> Cloud messages ----
 // {t:'hello', nodeId, protocolVersion, backends:['claude','codex'], features:['message-ack'],
+//             cliVersions:{claude:'2.1.105', codex:'0.144.6'},
 //             tasks:[{taskId, status, lastSeq, sessionId, costUsd, lease}]}
+//    cliVersions -> what each installed agent CLI reports for `--version`. Separate from
+//    `backends` (which only answers installed-or-not) because a CLI old enough still runs,
+//    still looks healthy, and still gets dispatched work it will fail — see cli-upgrade.mjs.
 // {t:'hb'}
 // {t:'ev', taskId, seq, ev}
 //    ev.k = 'msg'     -> {k, role, content, ts}         role: user|assistant|tool_use|tool_result|system|result|perm_request|diff
@@ -60,11 +64,22 @@ export const DEFAULT_BACKEND = 'claude';
 //    ev.k = 'status'  -> {k, status, extra?, ts}        extra: {error?, pendingRequest?, lease?}
 //    ev.k = 'session' -> {k, sessionId, ts}
 //    ev.k = 'cost'    -> {k, costUsd, ts}               cumulative
+// {t:'cli_versions', versions, upgrades}                  CLI inventory changed — sent the moment an
+//                                                          upgrade starts/finishes/fails instead of waiting
+//                                                          for the next reconnect. versions is hello's
+//                                                          cliVersions; upgrades is {backend: {state, error?,
+//                                                          from?, to?, at}} with state pending|running|ok|failed.
 // {t:'browse_result', requestId, entries}                 reply to a cloud-initiated {t:'browse'}
 // {t:'list_project_sessions_result', requestId, sessions} reply to read-only batch history discovery
 // {t:'read_project_session_result', requestId, events}    bounded read-only history mapped to AgentHub message events
 // ---- Cloud -> Executor messages ----
-// {t:'hello_ok', tasks:[{taskId, lastSeq}], provider?}
+// {t:'hello_ok', tasks:[{taskId, lastSeq}], provider?, cliLatest?, cliAutoUpgrade?}
+//    cliLatest {claude,codex} -> the newest published version of each agent CLI, fetched and
+//      cached cloud-side (see packages/worker/src/cli-releases.mjs). The node never talks to a
+//      package registry itself: one cached answer serves every node, and nodes on unreliable
+//      links to registry.npmjs.org still learn they're behind.
+//    cliAutoUpgrade -> whether this node may upgrade its CLIs on its own. Cloud-owned and
+//      re-asserted on every hello, like permission_mode and the provider override.
 // {t:'ack', taskId, seq}
 // {t:'start_task', task:{id,title,spec,images?,repoUrl,baseBranch,permissionMode,sessionId,sourceCwd?,provider?,backend?}}
 //    task.provider (optional) -> {baseUrl,apiKey,model} pins this task to a specific model
@@ -84,6 +99,14 @@ export const DEFAULT_BACKEND = 'claude';
 // {t:'cancel', taskId}
 // {t:'lease', taskId, lease}                              lease: daemon|human
 // {t:'config', provider}                                  live relay-credential push (see hub-core.mjs pushConfigToUser)
+// {t:'cli_policy', latest, autoUpgrade}                    live push of hello_ok's cliLatest/cliAutoUpgrade — sent when
+//                                                          the owner flips the toggle, and from the Hub alarm when a new
+//                                                          CLI release appears. Without the latter a node that stays
+//                                                          connected for days would never hear about a release at all.
+// {t:'upgrade_cli', backend?}                              run `<cli> update` now (the UI's 「立即升级」). Queued, not
+//                                                          refused, while a turn is generating: replacing a binary out
+//                                                          from under a live process is undefined on POSIX and refused
+//                                                          on Windows. Absent backend = every installed CLI.
 // {t:'set_provider_override', taskId, provider, backend?} pin/unpin a task's model profile mid-conversation; provider
 //                                                          {baseUrl,apiKey,model} or null = revert to node default.
 //                                                          Spawn-time env — takes effect from the next turn's spawn.
@@ -103,6 +126,15 @@ export const DEFAULT_BACKEND = 'claude';
 //                                                          lock, NOT a security control: the agent is very likely editing
 //                                                          these same files, and an unconditional write would silently
 //                                                          discard whatever it just did.
+// {t:'fork_session', requestId, taskId, sessionId, dropTrailingTurns, newSessionId}
+//                                                          answered by fork_session_result: {ok, sessionId, cwd, keptTurns,
+//                                                          anchorText, error?}. Copies a prefix of the task's on-disk agent
+//                                                          transcript to a brand-new session id, dropping the last
+//                                                          dropTrailingTurns user turns — the only way to branch a
+//                                                          conversation, since the agent's real context lives in that file
+//                                                          and not in the cloud's messages table. cwd is echoed back
+//                                                          because only the node knows where the task actually works, and
+//                                                          the branch has to resume in that same directory.
 // ---- Cloud -> Frontend messages ----
 // {t:'snapshot', tasks, nodes}
 // {t:'task', task}
@@ -146,10 +178,24 @@ export function isValidClientMessageId(value) {
 // (the file browser). Nothing degrades gracefully here — a node without it
 // simply has no such handler and would never answer — so the cloud refuses the
 // request with "this node needs upgrading" rather than hanging until timeout.
+// SESSION_FORK: this node can fork a task's transcript into a new session id
+// (branching a conversation). Same all-or-nothing shape as FILE_IO — an older
+// node has no handler and would never answer — and the consequence of not
+// gating is worse here than a hung spinner: the branch would be created
+// pointing at a session file that does not exist.
+// CLI_UPGRADE: this node reports its agent-CLI versions and understands
+// 'upgrade_cli'/'cli_policy'. An older node reports no versions and has no
+// handler, so the cloud hides the upgrade controls for it rather than
+// offering a button that silently does nothing — the same reasoning as
+// FILE_IO, minus the hung spinner (there's no request/response here).
 export const FEATURE_MESSAGE_ACK = 'message-ack';
 export const FEATURE_TASK_IMAGES = 'task-images';
 export const FEATURE_FILE_IO = 'file-io';
-export const EXECUTOR_FEATURES = [FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO];
+export const FEATURE_SESSION_FORK = 'session-fork';
+export const FEATURE_CLI_UPGRADE = 'cli-upgrade';
+export const EXECUTOR_FEATURES = [
+  FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_CLI_UPGRADE,
+];
 
 // Caps for the file browser, shared so the executor and the cloud agree.
 // A file's bytes travel as JSON over the node WebSocket and then over the
@@ -164,6 +210,56 @@ export const MAX_DIR_ENTRIES = 2000;
 // node that will never accept it (local DB wiped, task gone) surfaces as a
 // retryable failure instead of silently pending forever.
 export const OUTBOUND_MESSAGE_TTL_MS = 24 * 3600_000;
+
+// ---- agent-CLI version comparison ----
+//
+// Shared because three places have to reach the same verdict about whether a
+// node is behind: the executor (decides whether to run an installer), the
+// worker, and the UI (renders 最新 vs 可升级). Two implementations of "is this
+// version older" would eventually disagree, and the visible symptom would be a
+// node showing 可升级 forever while refusing to upgrade.
+//
+// `claude --version` -> "2.1.105 (Claude Code)"
+// `codex --version`  -> "codex-cli 0.144.6"
+// Both are covered by "first dotted-numeric run in the string", which is also
+// why the prerelease tail is optional — nothing here should choke on a
+// 0.158.0-alpha.6 someone installed deliberately.
+export const CLI_VERSION_RE = /(\d+)\.(\d+)\.(\d+)(?:[-+.]([0-9A-Za-z][0-9A-Za-z.]*))?/;
+
+export function parseVersion(text) {
+  const m = CLI_VERSION_RE.exec(String(text ?? ''));
+  return m ? m[0] : null;
+}
+
+// Numeric-segment comparison with one prerelease rule: same numbers but one
+// side carries a suffix -> the suffixed one is older (0.158.0-alpha.6 <
+// 0.158.0). Returns null when either side doesn't parse, which every caller
+// treats as "don't act" rather than as a comparison result.
+export function compareVersions(a, b) {
+  const pa = CLI_VERSION_RE.exec(String(a ?? ''));
+  const pb = CLI_VERSION_RE.exec(String(b ?? ''));
+  if (!pa || !pb) return null;
+  for (let i = 1; i <= 3; i++) {
+    const d = Number(pa[i]) - Number(pb[i]);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  const sa = pa[4] ?? '';
+  const sb = pb[4] ?? '';
+  if (sa === sb) return 0;
+  if (!sa) return 1;   // 1.0.0 > 1.0.0-alpha
+  if (!sb) return -1;
+  return sa < sb ? -1 : 1;
+}
+
+// Deliberately false when either version is unparsable: an upgrade is a real
+// mutation of the user's machine, and "I couldn't read one of the numbers" is
+// not a reason to run an installer. Also false when the node is *ahead* of the
+// published target (someone installed a newer build by hand) — otherwise that
+// machine would sit on 可升级 forever, re-running an installer that correctly
+// does nothing.
+export function isOutdated(current, latest) {
+  return compareVersions(current, latest) === -1;
+}
 
 const ULID_CHARS = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 

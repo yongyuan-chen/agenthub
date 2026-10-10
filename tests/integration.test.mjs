@@ -7,13 +7,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 import { makeD1 } from './d1-shim.mjs';
 import * as core from '../packages/worker/src/hub-core.mjs';
 import { LocalDb } from '../packages/executor/src/db.mjs';
 import { SessionManager } from '../packages/executor/src/manager.mjs';
 import { CloudLink } from '../packages/executor/src/cloudlink.mjs';
-import { sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, PROTOCOL_VERSION, OUTBOUND_MESSAGE_TTL_MS } from '../packages/shared/protocol.mjs';
+import { sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, PROTOCOL_VERSION, OUTBOUND_MESSAGE_TTL_MS, FEATURE_CLI_UPGRADE } from '../packages/shared/protocol.mjs';
 import * as accounts from '../packages/worker/src/accounts.mjs';
 import { nativeSessionFile } from '../packages/executor/src/sessions.mjs';
 
@@ -60,6 +61,7 @@ function makeCloud() {
       if (msg.t === 'hello') await core.handleHello(ctx, nodeId, msg);
       else if (msg.t === 'hb') await core.handleHeartbeat(ctx, nodeId);
       else if (msg.t === 'ev') await core.absorbEvent(ctx, nodeId, msg);
+      else if (msg.t === 'cli_versions') await core.handleCliVersions(ctx, nodeId, msg);
       else if (msg.t === 'durable_cmd_ack') await core.ackDurableCommand(ctx, nodeId, msg.commandKey);
     }).catch(e => { throw e; });
     return chain;
@@ -1542,6 +1544,109 @@ test('model-profiles: editing updates in place; editing the default re-mirrors a
   assert.equal(u.api_model, 'model-a2');
 });
 
+test('model-profiles: editing one reaches its pinned cards immediately, not on the next reconnect', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare(
+    `INSERT INTO users (id, username, password_hash, api_base_url, api_key, api_model, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind('user-test', 'alice', 'x', 'https://relay.example/v1', 'sk-default', 'model-default', now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-edit', await sha256Hex('tok-mac-edit'), 'user-test', now).run();
+
+  const prof = await cloud.api('POST', '/api/model-profiles',
+    { name: '中转站', baseUrl: 'https://old-relay.example', apiKey: 'sk-old', model: 'model-old' });
+  const profileId = prof.body.profile.id;
+
+  const relaysSeen = [];
+  const exec = makeExecutor(cloud, 'mac-edit', async (session, opts) => {
+    await sleep(5);
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } });
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  const origFactory = exec.manager.sessionFactory;
+  exec.manager.sessionFactory = (opts) => { relaysSeen.push(opts.config.provider.baseUrl); return origFactory(opts); };
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+
+  const res = await cloud.api('POST', '/api/tasks',
+    { title: 't', spec: '第一轮', nodeId: 'mac-edit', modelProfileId: profileId });
+  const taskId = res.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 3000, 'review turn 1');
+  assert.deepEqual(relaysSeen, ['https://old-relay.example'], 'first spawn used the pinned profile');
+
+  // Edit the profile itself — no per-card 切换模型, no node reconnect. The
+  // card holds its own copy of these credentials, so this is the push that
+  // used to be missing.
+  const edit = await cloud.api('PUT', `/api/model-profiles/${profileId}`,
+    { name: '中转站', baseUrl: 'https://new-relay.example', apiKey: 'sk-new', model: 'model-new' });
+  assert.equal(edit.status, 200);
+  await until(() => JSON.parse(exec.db.getTask(taskId).provider_override || 'null')?.baseUrl === 'https://new-relay.example',
+    3000, 'pinned card picked up the edited profile while still connected');
+
+  await cloud.api('POST', `/api/tasks/${taskId}/message`, { text: '第二轮' });
+  await until(() => relaysSeen.length >= 2, 3000, 'second spawn happened');
+  assert.equal(relaysSeen[1], 'https://new-relay.example', 'next turn runs on the edited URL');
+  assert.equal(JSON.parse(exec.db.getTask(taskId).provider_override).apiKey, 'sk-new');
+  exec.link.stop();
+});
+
+test('model-profiles: an edit landing mid-generation retires the stale process before the next turn', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare(
+    `INSERT INTO users (id, username, password_hash, api_base_url, api_key, api_model, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind('user-test', 'alice', 'x', 'https://relay.example/v1', 'sk-default', 'model-default', now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-midgen', await sha256Hex('tok-mac-midgen'), 'user-test', now).run();
+
+  const prof = await cloud.api('POST', '/api/model-profiles',
+    { name: '中转站', baseUrl: 'https://old-relay.example', apiKey: 'sk-old', model: 'model-old' });
+  const profileId = prof.body.profile.id;
+
+  const relaysSeen = [];
+  let releaseTurn1;
+  const turn1Blocked = new Promise((resolve) => { releaseTurn1 = resolve; });
+  let turn = 0;
+  const exec = makeExecutor(cloud, 'mac-midgen', async (session, opts) => {
+    turn++;
+    if (turn === 1) await turn1Blocked;   // hold the session 'busy' across the edit
+    else await sleep(5);
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } });
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  const origFactory = exec.manager.sessionFactory;
+  exec.manager.sessionFactory = (opts) => { relaysSeen.push(opts.config.provider.baseUrl); return origFactory(opts); };
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+
+  const res = await cloud.api('POST', '/api/tasks',
+    { title: 't', spec: '第一轮', nodeId: 'mac-midgen', modelProfileId: profileId });
+  const taskId = res.body.task.id;
+  await until(() => exec.manager.sessions.get(taskId)?.busy === true, 3000, 'turn 1 generating');
+  const turn1Session = exec.manager.sessions.get(taskId);
+
+  const edit = await cloud.api('PUT', `/api/model-profiles/${profileId}`,
+    { name: '中转站', baseUrl: 'https://new-relay.example', apiKey: 'sk-new', model: 'model-new' });
+  assert.equal(edit.status, 200);
+  await until(() => turn1Session.providerStale === true, 3000, 'stale marked instead of killed');
+  assert.equal(turn1Session.alive, true, 'the turn the user is watching is not destroyed mid-generation');
+
+  releaseTurn1();
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 3000, 'turn 1 finished');
+
+  // The next turn must not reuse the process whose env still points at the
+  // old relay — it gets a fresh spawn on the edited URL.
+  await cloud.api('POST', `/api/tasks/${taskId}/message`, { text: '第二轮' });
+  await until(() => relaysSeen.length >= 2, 3000, 'stale session retired and respawned');
+  assert.equal(turn1Session.alive, false, 'stale process killed');
+  assert.equal(relaysSeen[1], 'https://new-relay.example');
+  exec.link.stop();
+});
+
 test('tasks: modelProfileId pins the dispatched start_task to that profile; unknown id 404s', async () => {
   const cloud = makeCloud();
   const now = Date.now();
@@ -2445,25 +2550,23 @@ test('userMessage: a message sent while a decision is pending is kept, but not f
   forwarded.length = 0;
 
   const msg = await cloud.api('POST', `/api/tasks/${taskId}/message`, { text: '继续', clientMessageId: 'cm-blocked' });
-  assert.equal(msg.status, 200, 'dispatch itself is accepted — the refusal happens executor-side, as a system message');
-  await until(async () => {
-    const m = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
-    return m.body.messages.some(x => x.role === 'system' && x.content.text.includes('请先在请求卡片里选择'));
-  }, 3000, 'system note explaining why nothing was sent');
+  assert.equal(msg.status, 200);
+  assert.equal(msg.body.delivery, 'held',
+    '决策没做完之前 CLI 根本收不了普通消息 — 握在队列里,等这一轮真的结束再发');
 
   const after = await core.getTask(cloud.ctx, taskId);
   assert.equal(after.status, 'waiting_human', 'status must not silently flip to running');
   assert.equal(after.pending_request, pendingBefore, 'the original pending decision must survive untouched');
   assert.deepEqual(forwarded, [], 'the plain message was never forwarded to the blocked CLI');
 
-  // ...but it is still *kept*. Dropping the text (the original behavior here)
-  // is the same "我发的消息不见了" failure as losing it in transit — the user
-  // typed something and got a system note where their words should be.
+  // ...and it is still *kept*, editable, exactly where the user can see it.
+  // Dropping the text is the same "我发的消息不见了" failure as losing it in
+  // transit; so is quietly requiring them to type it again.
   const msgs = await cloud.api('GET', `/api/tasks/${taskId}/messages`, {});
-  const kept = msgs.body.messages.find(m => m.role === 'user' && m.content.text === '继续');
-  assert.ok(kept, 'the message the user typed is preserved in the conversation');
-  assert.equal(kept.content.clientMessageId, 'cm-blocked');
-  assert.equal(msgs.body.pending.length, 0, 'and its pending bubble is retired, since the node did record it');
+  const held = msgs.body.pending.find(p => p.clientMessageId === 'cm-blocked');
+  assert.ok(held, 'the message the user typed is still there');
+  assert.equal(held.text, '继续');
+  assert.equal(held.state, 'queued');
 
   // Resolve the still-outstanding decision before tearing down — otherwise
   // its real decisionTimeoutMs timer (60s in this harness's config) keeps
@@ -4341,6 +4444,91 @@ test('scheduled tasks: a recurring job older than 7 days is deleted, visibly, wi
   exec.link.stop();
 });
 
+// Regression, found live 2026-09-22: once tasks work in the real project
+// directory instead of a private worktree, several cards share one
+// .claude/scheduled_tasks.json — and the fire bookkeeping is per task, so a
+// single watchdog cron written in one conversation injected its prompt into
+// six at once. Ownership comes off the CLI's own createdBySessionId stamp.
+test('scheduled tasks: a cron job in a shared project directory fires only in the conversation that created it', async () => {
+  const cloud = makeCloud();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-cronshare', await sha256Hex('tok-mac-cronshare'), 'user-test', Date.now()).run();
+
+  const sent = [];  // [taskId, text]
+  const exec = makeExecutor(cloud, 'mac-cronshare', async (session, opts, text) => {
+    sent.push([opts.taskId, text]);
+    await sleep(10);
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 50, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+
+  // One real project folder, three cards pointed at it — exactly the shape
+  // the board produces now that a local path is used in place.
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-shared-'));
+  const ids = [];
+  for (const title of ['看护', '路人甲', '路人乙']) {
+    const res = await cloud.api('POST', '/api/tasks', { title, spec: '开始', nodeId: 'mac-cronshare', repoUrl: project });
+    ids.push(res.body.task.id);
+  }
+  const [ownerId, ...bystanders] = ids;
+  await until(async () => (await Promise.all(ids.map(id => core.getTask(cloud.ctx, id)))).every(t => t?.status === 'review'),
+    5000, 'all three creation turns settle');
+  for (const id of ids) assert.equal(exec.db.getTask(id).dir, project, 'all three really do share one directory');
+
+  const file = path.join(project, '.claude', 'scheduled_tasks.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const write = (job) => fs.writeFileSync(file, JSON.stringify({ tasks: [job] }));
+  const firesOf = (id) => sent.filter(([taskId, text]) => taskId === id && text === '巡检训练进度').length;
+
+  write({
+    id: 'watchdog', cron: '* * * * *', prompt: '巡检训练进度', createdAt: Date.now() - 120_000, recurring: true,
+    createdBySessionId: exec.db.getTask(ownerId).session_id, createdByPid: 999999,
+  });
+  exec.manager._sweepScheduledTasks();
+  await until(() => firesOf(ownerId) === 1, 5000, 'the creating conversation fires');
+  await sleep(50);
+  assert.equal(firesOf(ownerId), 1, 'and exactly once');
+  for (const id of bystanders) assert.equal(firesOf(id), 0, '每个旁观卡片都不该被注入');
+
+  // An unstamped job (hand-written, or predating the stamp) has nothing to
+  // attribute it to. In a shared folder that means nobody fires it — far
+  // better than guessing, and it stays in the file rather than being eaten.
+  sent.length = 0;
+  write({ id: 'legacy', cron: '* * * * *', prompt: '没有署名的任务', createdAt: Date.now() - 120_000, recurring: true });
+  exec.manager._sweepScheduledTasks();
+  await sleep(100);
+  assert.equal(sent.filter(([, text]) => text === '没有署名的任务').length, 0, 'an unowned job in a shared folder fires nowhere');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).tasks.map(j => j.id), ['legacy'], 'and is left in the file, not deleted by a card that does not own it');
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('scheduled tasks: an unstamped job still fires when the task has the directory to itself', async () => {
+  // The other half of the rule above: a worktree task (or any card that is
+  // the only one in its directory) must keep working exactly as before,
+  // including for jobs written before createdBySessionId existed.
+  const sentTexts = [];
+  const { cloud, exec, taskId, file } = await makeCronTaskFixture('mac-cronsolo', async (session, opts, text) => {
+    sentTexts.push(text);
+    await sleep(10);
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 50, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  fs.writeFileSync(file, JSON.stringify({ tasks: [{
+    id: 'unstamped', cron: '* * * * *', prompt: '老格式也要能跑', createdAt: Date.now() - 120_000, recurring: true,
+  }] }));
+
+  exec.manager._sweepScheduledTasks();
+  await until(() => sentTexts.includes('老格式也要能跑'), 5000, 'a solo task fires an unstamped job');
+
+  exec.manager.shutdown();
+  exec.link.stop();
+  assert.ok(taskId && cloud);
+});
+
 test('retry after a pre-send failure (no relay config) still sends the original spec instead of resuming silently idle', async () => {
   const cloud = makeCloud();
   await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
@@ -5007,6 +5195,70 @@ test('unread: finishing marks the conversation and its project; looking at it cl
   cloud.setNow(null);
 });
 
+// The "运行中" indicator on the 个人 / project tabs rides the same response as
+// the unread dots. Unlike unread it isn't per-viewer — a turn is in flight for
+// everyone who can see the conversation — but the *visibility* rules have to
+// match exactly, or a project tab would light up for a run in someone else's
+// personal conversation.
+test('running: 项目 tab 上的运行中指示器', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  for (const [id, name] of [['user-test', 'alice'], ['user-bob', 'bob']]) {
+    await cloud.db.prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)')
+      .bind(id, name, 'x', now).run();
+  }
+  await cloud.db.prepare('INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)').bind('team-r', '项目', now).run();
+  for (const uid of ['user-test', 'user-bob']) {
+    await cloud.db.prepare('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)')
+      .bind('team-r', uid, uid === 'user-test' ? 'owner' : 'member', now).run();
+  }
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('n1', 'h', 'user-test', 'online', now).run();
+  await cloud.db.prepare('INSERT INTO node_teams (node_id, team_id) VALUES (?, ?)').bind('n1', 'team-r').run();
+  for (const [id, title] of [['t-personal', '私人对话'], ['t-team', '项目对话']]) {
+    await cloud.db.prepare(`INSERT INTO tasks (id, title, spec, node_id, owner_user_id, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, title, 'spec', 'n1', 'user-test', 'running', now, now).run();
+  }
+  await cloud.db.prepare('INSERT INTO task_teams (task_id, team_id) VALUES (?, ?)').bind('t-team', 'team-r').run();
+  const teamCtx = { ...cloud.ctx, teamId: 'team-r' };
+  const bobCtx = { ...cloud.ctx, userId: 'user-bob', teamId: 'team-r' };
+
+  let running = (await cloud.api('GET', '/api/unread', {})).body.running;
+  assert.equal(running.personal, 1, '自己的个人对话在跑');
+  assert.equal(running['team-r'], 1, '项目 tab 也要亮');
+
+  // Not per-viewer: bob sees the project's run too, but nothing of alice's
+  // personal conversation — same scoping as the unread counts.
+  const bobRunning = (await core.api(bobCtx, 'GET', '/api/unread', {})).body.running;
+  assert.equal(bobRunning['team-r'], 1, '队友看到的是同一个「在跑」');
+  assert.equal(bobRunning.personal ?? 0, 0, '别人的个人对话不该点亮队友的个人 tab');
+
+  // 'starting' counts too — it's in BUSY_STATUSES, which is what stamps
+  // run_started_at, so the indicator and the run timer agree on when a turn
+  // begins instead of the icon lagging behind the clock.
+  cloud.setNow(now + 1000);
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't-team', seq: 1, ev: { k: 'status', status: 'starting' } });
+  assert.equal((await cloud.api('GET', '/api/unread', {})).body.running['team-r'], 1, 'starting 也算在跑');
+
+  // Turn ends → the tab goes dark, and only that tab.
+  cloud.setNow(now + 2000);
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't-team', seq: 2, ev: { k: 'status', status: 'review' } });
+  running = (await cloud.api('GET', '/api/unread', {})).body.running;
+  assert.equal(running['team-r'] ?? 0, 0, '跑完就灭(计数为 0 的项目直接不出现在响应里)');
+  assert.equal(running.personal, 1, '还在跑的那个不受影响');
+
+  // An archived conversation stuck in 'running' (its node died mid-turn, say)
+  // must not keep the personal tab animating forever.
+  await cloud.api('POST', '/api/tasks/t-personal/archive', {});
+  assert.equal((await cloud.api('GET', '/api/unread', {})).body.running.personal, 0, '归档的不算');
+
+  // Unread still works alongside it — one response, two independent counts.
+  assert.equal((await core.api(teamCtx, 'GET', '/api/unread', {})).body.unread['team-r'], 1,
+    '项目对话刚进 review,未读红点该亮着');
+
+  cloud.setNow(null);
+});
+
 // The file browser reaches into a real machine's filesystem through the cloud,
 // so the gates matter more than the happy path: only the machine's owner, and
 // only nodes that actually have the handlers (an older one would never answer
@@ -5126,4 +5378,444 @@ test('setup-status: answers for the whole account, not the project being viewed'
   assert.equal((await cloud.api('GET', '/api/setup-status', {})).body.nodeCount, 2);
   assert.equal((await core.api({ ...cloud.ctx, userId: 'user-bob' }, 'GET', '/api/setup-status', {})).body.nodeCount, 1,
     'bob 只看得到自己的和项目里的那一台(同一台),不会数上别人的私人机器');
+});
+
+// ---- branching a conversation ----
+// The branch route's whole job is ordering: fork the on-disk transcript on the
+// node FIRST, and only create the task if that worked. A task whose session_id
+// points at a transcript that doesn't exist can never be resumed.
+async function branchFixture(nodeId) {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind(nodeId, await sha256Hex(`tok-${nodeId}`), 'user-test', 'online', now).run();
+  await cloud.db.prepare('INSERT INTO node_capabilities (node_id, protocol_version, backends, updated_at) VALUES (?, ?, ?, ?)')
+    .bind(nodeId, PROTOCOL_VERSION, JSON.stringify(['claude']), now).run();
+  await cloud.db.prepare('INSERT INTO node_features (node_id, features, updated_at) VALUES (?, ?, ?)')
+    .bind(nodeId, JSON.stringify(['message-ack', 'session-fork']), now).run();
+
+  const create = await cloud.api('POST', '/api/tasks', { title: '原对话', spec: '第一问', nodeId, repoUrl: '/repo/src' });
+  const taskId = create.body.task.id;
+  await cloud.db.prepare('UPDATE tasks SET session_id = ? WHERE id = ?').bind('src-session', taskId).run();
+  const rows = [
+    [1, 'user', { text: '第一问' }], [2, 'assistant', { text: '第一答' }],
+    [3, 'user', { text: '第二问' }], [4, 'assistant', { text: '第二答' }],
+  ];
+  for (const [seq, role, content] of rows) {
+    await cloud.db.prepare('INSERT INTO messages (id, task_id, seq, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(`${taskId}:${seq}`, taskId, seq, role, JSON.stringify(content), now).run();
+  }
+  return { cloud, taskId };
+}
+
+test('branch: forks the transcript on the node, then creates a task resuming the fork in the same directory', async () => {
+  const { cloud, taskId } = await branchFixture('mac-branch');
+  const asked = [];
+  cloud.ctx.forkSession = async (...args) => {
+    asked.push(args);
+    return { ok: true, sessionId: args[4], cwd: '/repo/src', keptTurns: 1, anchorText: '第一问' };
+  };
+
+  // Branching under the *first* reply: one user turn (第二问) comes after it,
+  // so the node is told to drop one trailing turn.
+  const res = await cloud.api('POST', `/api/tasks/${taskId}/branch`, { seq: 2 });
+  assert.equal(res.status, 200);
+  const [nodeId, forkedTaskId, sessionId, dropTrailingTurns, newSessionId] = asked[0];
+  assert.deepEqual([nodeId, forkedTaskId, sessionId, dropTrailingTurns], ['mac-branch', taskId, 'src-session', 1]);
+
+  const branched = res.body.task;
+  assert.equal(branched.session_id, newSessionId);
+  assert.notEqual(branched.id, taskId);
+  assert.equal(branched.repo_url, '/repo/src', 'the branch works where its parent works');
+  assert.equal(branched.title, '原对话 (分支)');
+  assert.equal(branched.spec, '', 'nothing to say yet — the history is the whole content');
+  // Shared working directory is a real consequence the user has to be told about.
+  assert.equal(res.body.warnings.length, 1);
+  assert.match(res.body.warnings[0], /共用工作目录/);
+  // The parent is untouched, still on its own session.
+  assert.equal((await core.getTask(cloud.ctx, taskId)).session_id, 'src-session');
+});
+
+test('branch: a failed fork creates no task, and an unbranchable/unsupported conversation is refused up front', async () => {
+  const { cloud, taskId } = await branchFixture('mac-branch-fail');
+  const countTasks = async () => (await cloud.db.prepare('SELECT COUNT(*) AS n FROM tasks').bind().first()).n;
+  const before = await countTasks();
+
+  cloud.ctx.forkSession = async () => ({ ok: false, error: '找不到源会话的记录文件' });
+  const failed = await cloud.api('POST', `/api/tasks/${taskId}/branch`, { seq: 2 });
+  assert.equal(failed.status, 409);
+  assert.match(failed.body.error, /找不到源会话/);
+  assert.equal(await countTasks(), before, 'no half-created shell conversation left behind');
+
+  // Node never answered.
+  cloud.ctx.forkSession = async () => null;
+  assert.equal((await cloud.api('POST', `/api/tasks/${taskId}/branch`, { seq: 2 })).status, 504);
+  assert.equal(await countTasks(), before);
+
+  // A conversation that has never spawned has no transcript to fork.
+  await cloud.db.prepare('UPDATE tasks SET session_id = NULL WHERE id = ?').bind(taskId).run();
+  const noSession = await cloud.api('POST', `/api/tasks/${taskId}/branch`, { seq: 2 });
+  assert.equal(noSession.status, 409);
+  assert.match(noSession.body.error, /还没有会话记录/);
+
+  // An executor that predates the feature has no fork_session handler and
+  // simply never answers, so this has to be refused here rather than waited
+  // out as a 20-second timeout.
+  await cloud.db.prepare('UPDATE tasks SET session_id = ? WHERE id = ?').bind('src-session', taskId).run();
+  await cloud.db.prepare('UPDATE node_features SET features = ? WHERE node_id = ?')
+    .bind(JSON.stringify(['message-ack']), 'mac-branch-fail').run();
+  const oldNode = await cloud.api('POST', `/api/tasks/${taskId}/branch`, { seq: 2 });
+  assert.equal(oldNode.status, 409);
+  assert.match(oldNode.body.error, /还不支持分支/);
+});
+
+test('branch: an anchor the node cut somewhere else is reported, not silently accepted', async () => {
+  const { cloud, taskId } = await branchFixture('mac-branch-drift');
+  cloud.ctx.forkSession = async (...args) => ({ ok: true, sessionId: args[4], cwd: '/repo/src', keptTurns: 1, anchorText: '完全不同的一句话' });
+  const res = await cloud.api('POST', `/api/tasks/${taskId}/branch`, { seq: 2 });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.warnings.length, 2);
+  assert.match(res.body.warnings[1], /分支点可能有偏差/);
+});
+
+// ---- opening a conversation: newest page first, older pages on demand ----
+// The frontend opens a pane with before_seq (newest page) and walks up from
+// there as the user scrolls; the reconnect backfill still uses after_seq. Both
+// directions have to come off the same route without disturbing each other.
+test('messages: before_seq pages a conversation backwards from its newest message', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-paging', await sha256Hex('tok-mac-paging'), 'user-test', now).run();
+  const create = await cloud.api('POST', '/api/tasks', { title: '很长的对话', spec: 'x', nodeId: 'mac-paging' });
+  const taskId = create.body.task.id;
+  for (let seq = 1; seq <= 25; seq++) {
+    await cloud.db.prepare('INSERT INTO messages (id, task_id, seq, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(`${taskId}:${seq}`, taskId, seq, 'assistant', JSON.stringify({ text: `第 ${seq} 条` }), now + seq).run();
+  }
+  const seqs = res => res.body.messages.map(m => m.seq);
+
+  // Opening: the tail, oldest-first so it renders top-to-bottom as-is.
+  const newest = await cloud.api('GET', `/api/tasks/${taskId}/messages`, { before_seq: 0, limit: 10 });
+  assert.deepEqual(seqs(newest), [16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
+  assert.equal(newest.body.hasMore, true);
+  assert.equal(newest.body.messages[0].content.text, '第 16 条', 'content still comes back decoded');
+
+  // Scrolling up: the page before the oldest one on screen.
+  const older = await cloud.api('GET', `/api/tasks/${taskId}/messages`, { before_seq: 16, limit: 10 });
+  assert.deepEqual(seqs(older), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+  assert.equal(older.body.hasMore, true);
+
+  // The last (partial) page says so, so the client stops asking.
+  const oldest = await cloud.api('GET', `/api/tasks/${taskId}/messages`, { before_seq: 6, limit: 10 });
+  assert.deepEqual(seqs(oldest), [1, 2, 3, 4, 5]);
+  assert.equal(oldest.body.hasMore, false);
+
+  // A page that exactly empties the log must not claim there's more behind it.
+  assert.equal((await cloud.api('GET', `/api/tasks/${taskId}/messages`, { before_seq: 6, limit: 5 })).body.hasMore, false);
+
+  // The reconnect backfill is untouched: forward, from a known seq.
+  const forward = await cloud.api('GET', `/api/tasks/${taskId}/messages`, { after_seq: 20 });
+  assert.deepEqual(seqs(forward), [21, 22, 23, 24, 25]);
+  assert.equal((await cloud.api('GET', `/api/tasks/${taskId}/messages`, {})).body.messages.length, 25);
+});
+
+test('queued messages: a permission request pauses the turn, it does not end it', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)')
+    .bind('user-test', 'tester', 'x', now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('n1', 'h', 'user-test', 'online', now).run();
+  await cloud.db.prepare(`INSERT INTO tasks (id, title, spec, node_id, owner_user_id, status, lease, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind('t1', '排队', 'spec', 'n1', 'user-test', 'running', 'daemon', now, now).run();
+  const sent = [];
+  cloud.ctx.sendToNode = (nodeId, payload) => { if (payload.t === 'user_message') sent.push(payload); return true; };
+
+  await cloud.api('POST', '/api/tasks/t1/message', { text: '复制 ai 回复的按钮也加上', clientMessageId: 'm-1' });
+  assert.deepEqual(sent, [], 'held while the turn runs');
+
+  // The agent asks for permission. The CLI is still inside that tool call and
+  // a plain message can't reach it — releasing here is what put the human in
+  // front of "已记录但还没发给 agent,请重发".
+  await core.absorbEvent(cloud.ctx, 'n1', {
+    taskId: 't1', seq: 1,
+    ev: { k: 'status', status: 'waiting_human', extra: { pendingRequest: { requestId: 'r1', toolName: 'Bash' } } },
+  });
+  assert.deepEqual(sent, [], '等待决策不是回合结束,不能把排队的消息放出去');
+  let row = await cloud.db.prepare('SELECT state FROM outbound_messages WHERE client_message_id = ?').bind('m-1').first();
+  assert.equal(row.state, 'queued');
+
+  // A message typed *while* the card is up is held for the same reason,
+  // instead of being delivered into a refusal.
+  await cloud.api('POST', '/api/tasks/t1/message', { text: '顺便改下配色', clientMessageId: 'm-2' });
+  assert.deepEqual(sent, [], '决策期间新发的消息同样排队');
+
+  // Decision made, the turn resumes: still not an ending.
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 2, ev: { k: 'status', status: 'running', extra: { clearPending: true } } });
+  assert.deepEqual(sent, [], '继续跑也不是结束');
+
+  // The turn actually ends -> the oldest queued message goes, one per turn.
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 3, ev: { k: 'status', status: 'review' } });
+  assert.deepEqual(sent.map(s => s.text), ['复制 ai 回复的按钮也加上']);
+  row = await cloud.db.prepare('SELECT state FROM outbound_messages WHERE client_message_id = ?').bind('m-2').first();
+  assert.equal(row.state, 'queued', '第二条继续等下一轮');
+
+  // 直接发送 still overrides the hold — the one escape hatch, and it works
+  // during a pending decision too.
+  const sendNow = await cloud.api('POST', '/api/tasks/t1/queued-message', { clientMessageId: 'm-2', sendNow: true });
+  assert.equal(sendNow.status, 200);
+  assert.deepEqual(sent.map(s => s.text), ['复制 ai 回复的按钮也加上', '顺便改下配色']);
+});
+
+// A task pointed at a path that already exists runs directly in it (see
+// worktree.mjs's prepareWorkspace) — so the diff collector, which opens with
+// `git add -A`, is now aimed at real project repos rather than throwaway
+// worktrees. Staging a user's untracked files behind their back is a change
+// they'd only discover at their next commit, so it must not happen at all.
+test('in-place task: no diff is collected in a user directory, and their git index is left alone', async () => {
+  const cloud = makeCloud();
+  const exec = makeExecutor(cloud, 'node-inplace', async () => {});
+  const setupRepo = (dir) => {
+    execFileSync('git', ['init', '-q'], { cwd: dir });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir });
+    fs.writeFileSync(path.join(dir, 'tracked.py'), 'print(1)\n');
+    execFileSync('git', ['add', '-A'], { cwd: dir });
+    execFileSync('git', ['commit', '-q', '-m', 'initial'], { cwd: dir });
+  };
+  const diffEvents = (taskId) => exec.db.unackedAfter(taskId, 0)
+    .map(r => JSON.parse(r.payload)).filter(e => e.role === 'diff');
+
+  // The user's own project, with work in progress they never asked us to stage.
+  const userRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-userrepo-'));
+  setupRepo(userRepo);
+  fs.writeFileSync(path.join(userRepo, 'scratch-notes.txt'), 'not mine to stage\n');
+  exec.db.upsertTask({ taskId: 'inplace-1', title: 't', spec: '', dir: userRepo, repoUrl: userRepo });
+
+  exec.manager._publishDiff('inplace-1');
+
+  assert.equal(
+    execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: userRepo, encoding: 'utf8' }).trim(), '',
+    'nothing was staged — `git add -A` never ran in the user\'s repo',
+  );
+  assert.equal(
+    execFileSync('git', ['status', '--porcelain'], { cwd: userRepo, encoding: 'utf8' }).trim(), '?? scratch-notes.txt',
+    'their untracked file is still exactly as untracked as they left it',
+  );
+  assert.deepEqual(diffEvents('inplace-1'), [], 'no diff event either');
+
+  // The guard must not be so broad that it kills diffs for workspaces we own.
+  const wt = path.join(exec.workRoot, 'wt-managed-1');
+  fs.mkdirSync(wt, { recursive: true });
+  setupRepo(wt);
+  fs.writeFileSync(path.join(wt, 'agent-wrote-this.txt'), 'hello\n');
+  exec.db.upsertTask({ taskId: 'managed-1', title: 't', spec: '', dir: wt });
+
+  exec.manager._publishDiff('managed-1');
+
+  const managed = diffEvents('managed-1');
+  assert.equal(managed.length, 1, 'a worktree under workRoot still reports its diff');
+  assert.match(managed[0].content.stat, /agent-wrote-this\.txt/);
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+// ---- agent-CLI version reporting + upgrade ----
+//
+// The end-to-end shape of the thing that made this feature necessary: a node
+// silently running claude 2.1.105 while the model it's pinned to rejects
+// everything that CLI builds. None of this was visible anywhere before.
+
+async function enrollNode(cloud, nodeId) {
+  await cloud.db.prepare('INSERT INTO nodes (id,token_hash,owner_user_id,created_at) VALUES (?,?,?,?)')
+    .bind(nodeId, 'h', 'user-test', Date.now()).run();
+}
+
+const helloWithClis = (nodeId, cliVersions) => ({
+  t: 'hello', nodeId, protocolVersion: PROTOCOL_VERSION, backends: ['claude', 'codex'],
+  features: [FEATURE_CLI_UPGRADE], tasks: [], cliVersions,
+});
+
+test('cli versions: hello reports them, GET /api/nodes shows them next to the published target', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'mac-cli');
+  await core.handleHello(cloud.ctx, 'mac-cli', helloWithClis('mac-cli', { claude: '2.1.105', codex: '0.144.6' }));
+
+  const r = await cloud.api('GET', '/api/nodes', {});
+  const node = r.body.nodes.find(n => n.id === 'mac-cli');
+  assert.deepEqual(node.cliVersions, { claude: '2.1.105', codex: '0.144.6' });
+  // No row in node_settings -> auto-upgrade is on. This is what gets every
+  // pre-existing node upgrading with no migration at all.
+  assert.equal(node.autoUpgradeCli, true);
+  // Nothing has been fetched from npm in this test, so the target is empty
+  // rather than wrong — the UI shows 已安装 instead of a bogus 可升级.
+  assert.deepEqual(r.body.cliLatest, {});
+});
+
+test('cli versions: hello_ok carries the policy, and never blanks a recorded failure', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'gpu-cli');
+  await cloud.db.prepare('INSERT INTO app_settings (key,value) VALUES (?,?)')
+    .bind('cli_latest_versions', JSON.stringify({ fetchedAt: Date.now(), versions: { claude: '2.1.273' } })).run();
+
+  const sent = [];
+  const realSend = cloud.ctx.sendToNode;
+  cloud.ctx.sendToNode = (nodeId, msg) => { sent.push(msg); return realSend(nodeId, msg); };
+  try {
+    await core.handleHello(cloud.ctx, 'gpu-cli', helloWithClis('gpu-cli', { claude: '2.1.105' }));
+    const helloOk = sent.find(m => m.t === 'hello_ok');
+    assert.deepEqual(helloOk.cliLatest, { claude: '2.1.273' });
+    assert.equal(helloOk.cliAutoUpgrade, true);
+
+    // An upgrade fails; the daemon then restarts and says hello again.
+    await core.handleCliVersions(cloud.ctx, 'gpu-cli', {
+      t: 'cli_versions',
+      versions: { claude: '2.1.105' },
+      upgrades: { claude: { state: 'failed', error: 'EACCES: permission denied', at: Date.now() } },
+    });
+    await core.handleHello(cloud.ctx, 'gpu-cli', helloWithClis('gpu-cli', { claude: '2.1.105' }));
+
+    const r = await cloud.api('GET', '/api/nodes', {});
+    const node = r.body.nodes.find(n => n.id === 'gpu-cli');
+    // The reason it failed is the only thing the owner can act on — a
+    // reconnect must not throw it away.
+    assert.equal(node.cliUpgrades.claude.state, 'failed');
+    assert.match(node.cliUpgrades.claude.error, /EACCES/);
+  } finally {
+    cloud.ctx.sendToNode = realSend;
+  }
+});
+
+test('cli versions: a node that reports nothing leaves its last known versions alone', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'rollback-cli');
+  await core.handleHello(cloud.ctx, 'rollback-cli', helloWithClis('rollback-cli', { claude: '2.1.105' }));
+  // Rolled back to an executor that predates this feature: no cliVersions at
+  // all. Better to show the last known truth than to blank the row.
+  await core.handleHello(cloud.ctx, 'rollback-cli', {
+    t: 'hello', nodeId: 'rollback-cli', protocolVersion: PROTOCOL_VERSION, backends: ['claude'], tasks: [],
+  });
+  const r = await cloud.api('GET', '/api/nodes', {});
+  assert.deepEqual(r.body.nodes.find(n => n.id === 'rollback-cli').cliVersions, { claude: '2.1.105' });
+});
+
+test('cli upgrade: the button reaches the node; an offline node says so instead of pretending', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'mac-btn');
+  await core.handleHello(cloud.ctx, 'mac-btn', helloWithClis('mac-btn', { claude: '2.1.105' }));
+
+  const sent = [];
+  const realSend = cloud.ctx.sendToNode;
+  cloud.ctx.sendToNode = (nodeId, msg) => { sent.push(msg); return realSend(nodeId, msg); };
+  try {
+    // No live socket in this test -> sendToNode returns false, which is
+    // exactly the offline case the route has to be honest about.
+    const offline = await cloud.api('POST', '/api/nodes/mac-btn/cli-upgrade', { backend: 'claude' });
+    assert.equal(offline.status, 409);
+    assert.match(offline.body.error, /离线/);
+
+    cloud.ctx.sendToNode = (nodeId, msg) => { sent.push(msg); return true; };
+    const r = await cloud.api('POST', '/api/nodes/mac-btn/cli-upgrade', { backend: 'claude' });
+    assert.equal(r.status, 200);
+    assert.deepEqual(sent.at(-1), { t: 'upgrade_cli', backend: 'claude' });
+  } finally {
+    cloud.ctx.sendToNode = realSend;
+  }
+});
+
+test('cli upgrade: refused for a node too old to understand it, and for one you do not own', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'old-cli');
+  // Old executor: no FEATURE_CLI_UPGRADE, so the button would do nothing.
+  await core.handleHello(cloud.ctx, 'old-cli', {
+    t: 'hello', nodeId: 'old-cli', protocolVersion: PROTOCOL_VERSION, backends: ['claude'], tasks: [],
+  });
+  const old = await cloud.api('POST', '/api/nodes/old-cli/cli-upgrade', {});
+  assert.equal(old.status, 409);
+  assert.match(old.body.error, /还不支持/);
+
+  await cloud.db.prepare('INSERT INTO nodes (id,token_hash,owner_user_id,created_at) VALUES (?,?,?,?)')
+    .bind('someone-elses', 'h', 'other-user', Date.now()).run();
+  const theirs = await cloud.api('POST', '/api/nodes/someone-elses/cli-upgrade', {});
+  assert.equal(theirs.status, 404, 'upgrading a machine you do not own is not your call');
+
+  const badBackend = await cloud.api('POST', '/api/nodes/old-cli/cli-upgrade', { backend: 'nope' });
+  assert.equal(badBackend.status, 400);
+});
+
+test('cli upgrade: turning auto-upgrade off is pushed live and re-asserted on reconnect', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'mac-auto');
+  await core.handleHello(cloud.ctx, 'mac-auto', helloWithClis('mac-auto', { claude: '2.1.105' }));
+
+  const sent = [];
+  const realSend = cloud.ctx.sendToNode;
+  cloud.ctx.sendToNode = (nodeId, msg) => { sent.push(msg); return true; };
+  try {
+    const off = await cloud.api('POST', '/api/nodes/mac-auto/auto-upgrade', { enabled: false });
+    assert.equal(off.status, 200);
+    const policy = sent.find(m => m.t === 'cli_policy');
+    assert.equal(policy.autoUpgrade, false);
+
+    const r = await cloud.api('GET', '/api/nodes', {});
+    assert.equal(r.body.nodes.find(n => n.id === 'mac-auto').autoUpgradeCli, false);
+
+    // Cloud is authoritative: a one-shot push can't self-heal, so the setting
+    // rides every hello the same way permission_mode does.
+    sent.length = 0;
+    await core.handleHello(cloud.ctx, 'mac-auto', helloWithClis('mac-auto', { claude: '2.1.105' }));
+    assert.equal(sent.find(m => m.t === 'hello_ok').cliAutoUpgrade, false);
+
+    await cloud.api('POST', '/api/nodes/mac-auto/auto-upgrade', { enabled: true });
+    const back = await cloud.api('GET', '/api/nodes', {});
+    assert.equal(back.body.nodes.find(n => n.id === 'mac-auto').autoUpgradeCli, true);
+  } finally {
+    cloud.ctx.sendToNode = realSend;
+  }
+});
+
+test('cli policy broadcast: a new release reaches nodes that never disconnect, honouring each opt-out', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'node-on');
+  await enrollNode(cloud, 'node-off');
+  await core.handleHello(cloud.ctx, 'node-on', helloWithClis('node-on', { claude: '2.1.105' }));
+  await core.handleHello(cloud.ctx, 'node-off', helloWithClis('node-off', { claude: '2.1.105' }));
+
+  const sent = [];
+  const realSend = cloud.ctx.sendToNode;
+  cloud.ctx.sendToNode = (nodeId, msg) => { sent.push([nodeId, msg]); return true; };
+  try {
+    await cloud.api('POST', '/api/nodes/node-off/auto-upgrade', { enabled: false });
+    sent.length = 0;
+    // What the DO alarm does when refreshCliVersions reports a change.
+    await core.pushCliPolicy(cloud.ctx, ['node-on', 'node-off'], { claude: '2.1.273' });
+    const byNode = Object.fromEntries(sent.filter(([, m]) => m.t === 'cli_policy'));
+    assert.deepEqual(byNode['node-on'], { t: 'cli_policy', latest: { claude: '2.1.273' }, autoUpgrade: true });
+    assert.equal(byNode['node-off'].autoUpgrade, false, 'a raised target must not override an opt-out');
+  } finally {
+    cloud.ctx.sendToNode = realSend;
+  }
+});
+
+test('cli versions: what a node reports is narrowed before it is stored', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'weird-cli');
+  await core.handleCliVersions(cloud.ctx, 'weird-cli', {
+    t: 'cli_versions',
+    versions: { claude: '2.1.105', codex: null, notABackend: '9.9.9' },
+    upgrades: {
+      claude: { state: 'failed', error: 'x'.repeat(5000), at: 1 },
+      codex: { state: 'not-a-state' },
+    },
+  });
+  const r = await cloud.api('GET', '/api/nodes', {});
+  const node = r.body.nodes.find(n => n.id === 'weird-cli');
+  // null means "installed, version unreadable" — a real state, kept.
+  assert.deepEqual(node.cliVersions, { claude: '2.1.105', codex: null });
+  assert.equal('notABackend' in node.cliVersions, false);
+  assert.ok(node.cliUpgrades.claude.error.length <= 500, 'error text is bounded before it reaches the DOM');
+  assert.equal(node.cliUpgrades.codex, undefined, 'an unknown state is dropped, not stored');
 });

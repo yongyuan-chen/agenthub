@@ -77,8 +77,8 @@ test('pending message: retry is hidden while the IDE owns the session', () => {
 });
 
 // ---- store: the pending/real handoff ----
-// Loaded through the same compile path (store.js is plain JS but imports
-// nothing else, so a direct import is enough).
+// Loaded through the same compile path (store.js is plain JS, and its only
+// import — elapsed.js, for RUNNING_STATUSES — resolves fine under node).
 const store = await import('../packages/web/src/store.js');
 
 test('pending store: the real message retires its own pending bubble', () => {

@@ -24,6 +24,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { truncateAtTurnBoundary } from './fork.mjs';
+
 const DEFAULT_SESSIONS_ROOT = () => path.join(os.homedir(), '.codex', 'sessions');
 const PREVIEW_LEN = 120;
 const MAX_SESSIONS = 30;
@@ -320,6 +322,54 @@ export function findExternalSessionFile(sessionId, sessionsRoot = DEFAULT_SESSIO
     if (!newest || mtime > newest.mtime) newest = { file, mtime };
   }
   return newest ? newest.file : null;
+}
+
+// Branching, the Codex counterpart of sessions.mjs's forkSession: write a
+// prefix of `sourceFile` out as a new rollout so `thread/resume` replays the
+// conversation as it stood at an earlier point.
+//
+// Two things Codex needs that claude doesn't: the session id lives in the
+// *filename* (see sessionIdOfRollout) as well as in the first line's
+// session_meta payload, and rollouts are filed under a YYYY/MM/DD bucket that
+// resume uses as part of its index. The fork is filed under today's bucket
+// under its own id, which is exactly what a session created today looks like.
+//
+// Deliberately conservative about session_meta: only `id` is rewritten and
+// every other field is passed through untouched. The payload's full shape is
+// version-dependent and undocumented (same caveat as the rest of this file),
+// so anything we don't understand is safer left alone than dropped.
+export function forkSession({
+  sourceFile, newSessionId, dropTrailingTurns = 0, sessionsRoot = DEFAULT_SESSIONS_ROOT(), now = new Date(),
+}) {
+  if (!sourceFile || !fs.existsSync(sourceFile)) throw new Error('找不到源会话的记录文件');
+
+  const lines = fs.readFileSync(sourceFile, 'utf8').split('\n').filter(Boolean);
+  const { kept, keptTurns, anchorText } = truncateAtTurnBoundary(
+    lines,
+    entry => rolloutLineToEvents(entry).find(event => event.role === 'user')?.content.text ?? null,
+    dropTrailingTurns,
+  );
+
+  let metaRewritten = false;
+  const rewritten = kept.map(line => {
+    if (metaRewritten) return line;
+    let entry;
+    try { entry = JSON.parse(line); } catch { return line; }
+    if (entry?.type !== 'session_meta') return line;
+    metaRewritten = true;
+    return JSON.stringify({ ...entry, payload: { ...entry.payload, id: newSessionId } });
+  });
+
+  // 2026-09-09T07-12-33 — the same shape resume writes, and the shape
+  // sessionIdOfRollout parses the trailing uuid back out of.
+  const stamp = now.toISOString().slice(0, 19).replace(/:/g, '-');
+  const [year, month, day] = stamp.slice(0, 10).split('-');
+  const destDir = path.join(sessionsRoot, year, month, day);
+  const destFile = path.join(destDir, `rollout-${stamp}-${newSessionId}.jsonl`);
+  if (fs.existsSync(destFile)) throw new Error(`会话 ${newSessionId} 已存在`);
+  fs.mkdirSync(destDir, { recursive: true });
+  fs.writeFileSync(destFile, rewritten.join('\n') + '\n');
+  return { file: destFile, sessionId: newSessionId, cwd: cwdOf(sourceFile), keptTurns, anchorText };
 }
 
 // Idempotent copy of an externally-created rollout into AgentHub's own

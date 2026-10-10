@@ -107,6 +107,24 @@ function Editor({ file, onChange, onSave }) {
 
 const joinPath = (dir, name) => `${String(dir).replace(/\/+$/, '')}/${name}`;
 
+// The tree is a working surface, not fixed chrome: file names are what you
+// navigate by, and no width chosen up front fits both a shallow repo root and
+// a nested component path — at 246px the latter was ellipsised down to the
+// part every sibling shares. Dragging the divider is remembered for the same
+// reason the collapse toggle is: it's a statement about how you're working,
+// not a momentary gesture.
+const TREE_WIDTH_KEY = 'agenthub_filetree_w';
+const TREE_WIDTH_DEFAULT = 246;
+const TREE_WIDTH_MIN = 140;
+// Whatever the tree takes, the editor keeps at least this much — a pane tiled
+// three-across is already narrow before anyone starts dragging.
+const EDITOR_MIN_WIDTH = 220;
+
+function storedTreeWidth() {
+  const stored = Number(localStorage.getItem(TREE_WIDTH_KEY));
+  return Number.isFinite(stored) && stored >= TREE_WIDTH_MIN ? stored : TREE_WIDTH_DEFAULT;
+}
+
 // One directory's children, rendered inline under it. Recursive rather than a
 // flattened list because the depth is what carries the structure — and because
 // collapsing a folder should take its whole subtree with it without any
@@ -175,6 +193,39 @@ export function FilePane({ nodeId, taskId, onClose, maximized, onToggleMaximize 
     else localStorage.removeItem('agenthub_filetree_off');
     return !v;
   });
+  const [treeWidth, setTreeWidth] = useState(storedTreeWidth);
+  const bodyRef = useRef(null);
+  const dragRef = useRef(null);
+  // The ceiling comes from the room actually available rather than a constant,
+  // so dragging can't push the editor out of a narrow pane. (.file-tree also
+  // carries a max-width for the other direction: the pane shrinking around an
+  // already-wide tree, which no drag handler ever hears about.)
+  const clampTreeWidth = (px) => {
+    const room = bodyRef.current?.clientWidth || 0;
+    const max = room ? Math.max(TREE_WIDTH_MIN, room - EDITOR_MIN_WIDTH) : px;
+    return Math.round(Math.min(Math.max(px, TREE_WIDTH_MIN), max));
+  };
+  const commitTreeWidth = (px) => {
+    const next = clampTreeWidth(px);
+    setTreeWidth(next);
+    localStorage.setItem(TREE_WIDTH_KEY, String(next));
+    return next;
+  };
+  const startResize = (e) => {
+    e.preventDefault(); // otherwise the drag selects text across the pane
+    dragRef.current = { x: e.clientX, width: treeWidth };
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  };
+  const onResize = (e) => {
+    if (!dragRef.current) return;
+    setTreeWidth(clampTreeWidth(dragRef.current.width + (e.clientX - dragRef.current.x)));
+  };
+  const endResize = (e) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    localStorage.setItem(TREE_WIDTH_KEY, String(treeWidth)); // only the settled width is worth keeping
+  };
   const [file, setFile] = useState(null);         // {path, content, mtime, binary, truncated, loadedAt}
   const [draft, setDraft] = useState('');
   const [dirty, setDirty] = useState(false);
@@ -313,7 +364,11 @@ export function FilePane({ nodeId, taskId, onClose, maximized, onToggleMaximize 
         <div className="review-bar"><span className="err">{saveError}</span></div>
       )}
 
-      <div className="file-body">
+      {/* The width travels as a custom property rather than an inline width on
+          the tree itself: on a phone the tree is a strip above the editor and
+          the stylesheet has to be able to say `width: auto`, which an inline
+          style would outrank. */}
+      <div className="file-body" ref={bodyRef} style={{ '--file-tree-w': `${treeWidth}px` }}>
         {treeOpen && <nav className="file-tree">
           {listError && <div className="err file-tree-error">{listError}</div>}
           {/* Climbing out of the root re-roots the tree rather than nesting
@@ -332,6 +387,24 @@ export function FilePane({ nodeId, taskId, onClose, maximized, onToggleMaximize 
             />
           )}
         </nav>}
+
+        {treeOpen && (
+          <div
+            className="file-tree-resizer" role="separator" aria-orientation="vertical"
+            aria-label="调整文件树宽度" title="拖动调整宽度,双击恢复默认" tabIndex={0}
+            onPointerDown={startResize} onPointerMove={onResize}
+            onPointerUp={endResize} onPointerCancel={endResize}
+            onDoubleClick={() => commitTreeWidth(TREE_WIDTH_DEFAULT)}
+            onKeyDown={e => {
+              // Reachable without a pointer, and the only way to nudge it by an
+              // exact amount.
+              if (e.key === 'ArrowLeft') commitTreeWidth(treeWidth - 16);
+              else if (e.key === 'ArrowRight') commitTreeWidth(treeWidth + 16);
+              else return;
+              e.preventDefault();
+            }}
+          />
+        )}
 
         <section className="file-view">
           {!file && <div className="empty">从左边选一个文件</div>}

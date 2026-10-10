@@ -4,6 +4,7 @@ import { loadConfig } from './config.mjs';
 import { LocalDb } from './db.mjs';
 import { SessionManager } from './manager.mjs';
 import { CloudLink } from './cloudlink.mjs';
+import { CliUpgrader } from './cli-upgrade.mjs';
 import { checkAndApply, sourceChangedSinceBoot } from './selfupdate.mjs';
 
 // Captured before anything else so a source file written during startup
@@ -13,8 +14,22 @@ const BOOTED_AT = Date.now();
 const config = loadConfig(process.argv[2]);
 const db = new LocalDb(config.workRoot);
 
-const link = new CloudLink(config, db, (cmd) => manager.handleCommand(cmd));
+// CLI-upgrade commands are intercepted before the manager sees them: they're
+// about this machine's installed binaries, not about any task, and the
+// manager would (correctly) log them as unknown.
+const link = new CloudLink(config, db, (cmd) => {
+  if (cmd.t === 'cli_policy') return upgrader.setPolicy({ latest: cmd.latest, autoUpgrade: cmd.autoUpgrade });
+  if (cmd.t === 'upgrade_cli') return upgrader.request(cmd.backend);
+  return manager.handleCommand(cmd);
+});
 const manager = new SessionManager(config, db, (taskId, seq, ev) => link.notifyEvent(taskId, seq, ev));
+// Same idle definition the code self-update uses — see hasActiveGeneration()
+// and selfupdate.mjs. Replacing a CLI binary mid-turn is worse than waiting.
+const upgrader = new CliUpgrader({
+  config,
+  isIdle: () => !manager.hasActiveGeneration(),
+  report: (payload) => link.sendCliVersions(payload),
+});
 
 console.log(`[executor] node=${config.nodeId} cloud=${config.cloudUrl} workRoot=${config.workRoot}`);
 manager.recover();
@@ -57,6 +72,11 @@ async function runSelfUpdateCheck() {
     console.log('[selfupdate] source checkout changed since boot, restarting into it');
     shutdown(0);
   }
+  // Agent-CLI upgrades ride the same timer but keep their own, much longer
+  // rate limit (see CliUpgrader.tick) — a CLI release is a daily event at
+  // most, and each check costs two spawns. Unlike the code update above this
+  // never restarts the daemon: the CLI is a child process respawned per turn.
+  try { upgrader.tick(); } catch (e) { console.error('[cli] upgrade check failed:', e.message); }
 }
 const updateTimer = setInterval(runSelfUpdateCheck, SELF_UPDATE_INTERVAL_MS);
 if (updateTimer.unref) updateTimer.unref();

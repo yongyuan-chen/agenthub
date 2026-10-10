@@ -1,12 +1,19 @@
 // Tiny global store: single version counter + module state, components
 // subscribe via useSyncExternalStore. Scale (1 user, hundreds of tasks) makes
 // full re-render on change perfectly fine.
+import { RUNNING_STATUSES } from './elapsed.js';
+
 let version = 0;
 const listeners = new Set();
 
 export const state = {
   tasks: new Map(),      // id -> task row (current personal/project scope only)
   nodes: new Map(),      // id -> node row (current personal/project scope only)
+  // Newest published version of each agent CLI, fleet-wide rather than
+  // per-node — {claude:'2.1.273', codex:'0.156.1'}. Deliberately not scoped:
+  // it's the same number in every project, and it's what every node's version
+  // is compared against to decide whether it's behind.
+  cliLatest: {},
   conversationSources: new Map(), // id -> read-only external Claude session metadata for this scope
   sourceClaims: {},       // scopeKey -> Map(source pane id -> claimed real task id), consumed by AppShell
   sourceEpochs: {},       // scopeKey -> mutation generation, rejects stale source-list responses
@@ -43,6 +50,11 @@ export const state = {
   // something waiting.
   taskSeen: new Map(),    // taskId -> seen_at (ms)
   unread: {},             // scopeKey -> count, from GET /api/unread
+  // "这个项目里有对话正在跑" for the tabs, same story as unread and from the
+  // same response: a project this client isn't subscribed to has no WS feed,
+  // so a poll is the only way its tab can know. Unlike unread this isn't
+  // per-viewer — a turn is in flight for everyone or for no one.
+  running: {},            // scopeKey -> count of running/starting tasks
 };
 
 // Must match shell.jsx's own PERSONAL/scopeKey constant and the backend's
@@ -92,6 +104,7 @@ export function resetUserState() {
   state.scopeCache = {};
   state.taskSeen = new Map();
   state.unread = {};
+  state.running = {};
   bump();
 }
 
@@ -149,6 +162,22 @@ export function unreadForScope(teamId) {
   return state.unread[scopeKeyOf(teamId)] || 0;
 }
 
+// How many conversations are mid-turn in a scope, for the tab's "运行中"
+// indicator. Same active-scope-is-live split as unreadForScope above, and it
+// matters more here: a run can start and finish well inside one poll interval,
+// so the scope you're actually looking at reads its own task list (WS-fed,
+// changes the instant a status does) instead of the polled snapshot.
+export function runningForScope(teamId) {
+  if (scopeKeyOf(teamId) === scopeKeyOf(state.activeTeamId)) {
+    let n = 0;
+    for (const task of state.tasks.values()) {
+      if (!task.archived_at && taskInScope(task) && RUNNING_STATUSES.has(task.status)) n++;
+    }
+    return n;
+  }
+  return state.running[scopeKeyOf(teamId)] || 0;
+}
+
 export function upsertNode(node) {
   if (!node?.id) return;
   state.nodes.set(node.id, node);
@@ -164,6 +193,24 @@ export function addMessage(taskId, msg) {
   // — still doesn't render the same text twice.
   const clientMessageId = msg.role === 'user' ? msg.content?.clientMessageId : null;
   if (clientMessageId) removePendingMessage(taskId, clientMessageId);
+}
+
+// A conversation now loads only its newest page, so msgs holds a *window* of
+// the log rather than all of it — and that window has to stay contiguous. A
+// pane reopened after being away can get a fresh tail that starts past where
+// the previous visit's messages ended (the gap arrived while this client was
+// disconnected); merging the two would leave an invisible hole in the middle
+// of the conversation, so the stale window is dropped instead and the user
+// scrolls back up through the real history.
+export function setMessageWindow(taskId, msgs) {
+  const known = state.msgs.get(taskId);
+  const oldest = msgs.length ? msgs[0].seq : null;
+  if (known && oldest !== null) {
+    let newest = 0;
+    for (const seq of known.keys()) if (seq > newest) newest = seq;
+    if (oldest > newest + 1) state.msgs.delete(taskId);
+  }
+  for (const m of msgs) addMessage(taskId, m);
 }
 
 export function upsertPendingMessage(taskId, pending) {
@@ -221,6 +268,7 @@ export function applyWsMessage(msg) {
       state.taskEpochs[scopeKeyOf(state.activeTeamId)] = (state.taskEpochs[scopeKeyOf(state.activeTeamId)] || 0) + 1;
       state.tasks = new Map(msg.tasks.map(t => [t.id, t]));
       state.nodes = new Map(msg.nodes.map(n => [n.id, n]));
+      if (msg.cliLatest) state.cliLatest = msg.cliLatest;
       state.loaded = true;
       // Authoritative full data for whichever scope this connection is
       // currently tagged for (reconnect() always closes+reopens with the

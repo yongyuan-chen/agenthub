@@ -72,6 +72,39 @@ CREATE TABLE IF NOT EXISTS node_features (
   updated_at INTEGER
 );
 
+-- Which version of each agent CLI a node actually has, and how its last
+-- upgrade went. node_capabilities above only answers installed-or-not, which
+-- turned out to be the wrong question: a CLI old enough still runs, still
+-- reports healthy, and still accepts work it will fail. Found live
+-- 2026-09-24 — a node on claude 2.1.105 answered every claude-opus-5-5 turn
+-- with "400 ... requires adaptive thinking", a request body AgentHub does not
+-- build and could not see. Side table for the same idempotent-redeploy reason
+-- as node_features itself.
+--   versions  {"claude":"2.1.105","codex":"0.144.6"} — a key present with a
+--             null value means "installed, but its --version output didn't
+--             parse", which is different from "not installed" (absent).
+--   upgrades  {"claude":{"state":"failed","error":"…","from":…,"to":…,"at":…}}
+--             state: pending|running|ok|failed. Kept cloud-side rather than
+--             only in the node's memory so a failure survives the reconnect
+--             and the owner can still read why it failed.
+CREATE TABLE IF NOT EXISTS node_cli_versions (
+  node_id    TEXT PRIMARY KEY,
+  versions   TEXT NOT NULL DEFAULT '{}',
+  upgrades   TEXT NOT NULL DEFAULT '{}',
+  updated_at INTEGER
+);
+
+-- Per-node owner preferences. Only one so far: whether this machine may
+-- upgrade its own agent CLIs when it's idle.
+-- No row means ENABLED, which is why there is no backfill anywhere for this
+-- table — every node that existed before it did is auto-upgrading, which is
+-- the agreed default. Opting a machine out writes the row.
+CREATE TABLE IF NOT EXISTS node_settings (
+  node_id          TEXT PRIMARY KEY,
+  auto_upgrade_cli INTEGER NOT NULL DEFAULT 1,
+  updated_at       INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,

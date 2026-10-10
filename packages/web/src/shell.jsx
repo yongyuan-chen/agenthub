@@ -537,7 +537,7 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
               {isFiles(id)
                 ? <FilePane {...parseFilesPane(id)} onClose={() => closePane(id)} maximized={id === maximizedPane} onToggleMaximize={() => setMaximizedPane(m => (m === id ? null : id))} />
                 : isDraft(id)
-                ? <DraftPane onCreated={(realId) => replacePane(id, realId)} onClose={() => closePane(id)} maximized={id === maximizedPane} onToggleMaximize={() => setMaximizedPane(m => (m === id ? null : id))} />
+                ? <DraftPane onCreated={(realId) => replacePane(id, realId)} onClose={() => closePane(id)} maximized={id === maximizedPane} onToggleMaximize={() => setMaximizedPane(m => (m === id ? null : id))} onOpenSettings={onOpenSettings} />
                 : isSource(id)
                   ? (state.conversationSources.has(id.slice(7))
                       ? <ConversationSourcePane source={state.conversationSources.get(id.slice(7))} onActivated={(realId) => replacePane(id, realId)} onClose={() => closePane(id)} maximized={id === maximizedPane} onToggleMaximize={() => setMaximizedPane(m => (m === id ? null : id))} />

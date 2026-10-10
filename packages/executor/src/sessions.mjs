@@ -12,6 +12,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
+import { truncateAtTurnBoundary } from './fork.mjs';
+
 const DEFAULT_PROJECTS_ROOT = () => path.join(os.homedir(), '.claude', 'projects');
 const PREVIEW_LEN = 120;
 const MAX_SESSIONS = 30;
@@ -221,7 +223,7 @@ export const MAX_IMPORT_EVENTS = 800; // hard ceiling regardless of turn count, 
 // produces for live output, so imported history renders with the exact same
 // (already-existing) chat UI, no new frontend code needed. Best-effort: skip
 // anything that doesn't cleanly map rather than guess.
-function transcriptLineToEvents(entry) {
+export function transcriptLineToEvents(entry) {
   if (entry?.isMeta || entry?.isSidechain) return []; // injected reminders / subagent side-threads, not the main thread
   switch (entry?.type) {
     case 'user': {
@@ -537,6 +539,48 @@ export function findExternalSessionFile(sessionId, projectsRoot = DEFAULT_PROJEC
   }
   if (newest) return newest.file;
   return null;
+}
+
+// Branching: copy a prefix of `sourceFile` out to a brand-new session id, so
+// `claude --resume <newSessionId>` replays the conversation as it stood at an
+// earlier point. The agent's real context is this file — nothing the cloud
+// stores in its messages table participates — so this is the entire feature.
+//
+// Destination is the *real* ~/.claude/projects, not AgentHub's isolated config
+// dir: a task created with a pre-set session id is treated as an adoption
+// (manager.mjs's startTask sets real_config_dir for it), and session.mjs then
+// deliberately unsets CLAUDE_CONFIG_DIR so the CLI looks only at the real
+// location. Writing anywhere else produces "No conversation found". It also
+// means the user can pick the branch up in their own terminal.
+//
+// The uuid/parentUuid chain needs no rewriting: cutting on a turn boundary
+// keeps a contiguous ancestor chain rooted at the same first entry.
+export function forkSession({
+  sourceFile, cwd, newSessionId, dropTrailingTurns = 0, projectsRoot = DEFAULT_PROJECTS_ROOT(),
+}) {
+  if (!sourceFile || !fs.existsSync(sourceFile)) throw new Error('找不到源会话的记录文件');
+  if (!cwd) throw new Error('分支需要知道源会话的工作目录');
+
+  const lines = fs.readFileSync(sourceFile, 'utf8').split('\n').filter(Boolean);
+  const { kept, keptTurns, anchorText } = truncateAtTurnBoundary(
+    lines,
+    entry => transcriptLineToEvents(entry).find(event => event.role === 'user')?.content.text ?? null,
+    dropTrailingTurns,
+  );
+
+  const rewritten = kept.map(line => {
+    let entry;
+    try { entry = JSON.parse(line); } catch { return line; } // preserved verbatim, same as everywhere else here
+    if (!entry || typeof entry !== 'object') return line;
+    return JSON.stringify({ ...entry, sessionId: newSessionId });
+  });
+
+  const destDir = path.join(projectsRoot, slugifyForResumeCwd(cwd));
+  const destFile = path.join(destDir, `${newSessionId}.jsonl`);
+  if (fs.existsSync(destFile)) throw new Error(`会话 ${newSessionId} 已存在`);
+  fs.mkdirSync(destDir, { recursive: true });
+  fs.writeFileSync(destFile, rewritten.join('\n') + '\n');
+  return { file: destFile, sessionId: newSessionId, cwd, keptTurns, anchorText };
 }
 
 export function importExternalSession(sessionId, workRoot, targetCwd, projectsRoot = DEFAULT_PROJECTS_ROOT()) {

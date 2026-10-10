@@ -17,7 +17,7 @@ function deriveTitle(text) {
 // A pane slot with no task yet: pick a project path (or take the account
 // default), type the first message, and sending it is what actually creates
 // the task — no upfront title/spec form to get through first.
-export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize }) {
+export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onOpenSettings }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
@@ -274,11 +274,28 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize }) {
             </div>
           )}
 
+          {/* Which agent CLI a card drives is a property of its model profile,
+              not a per-card switch — so with only Claude profiles around, the
+              picker above gives no clue that Codex exists at all. Reported as
+              "新建对话和历史对话都没看到 codex 标识" by someone who had the
+              feature deployed and two nodes with the CLI installed, but no
+              Codex profile. Disappears the moment one exists, at which point
+              the picker labels it "· Codex" and says so itself. */}
+          {!profiles.some(p => p.backend === 'codex') && (
+            <div className="muted">
+              想用 Codex 对话?先到「<button type="button" className="ghost link" onClick={() => onOpenSettings?.()}>设置 → 模型档案</button>」
+              新建一个后端选 Codex 的档案(中转站需支持 <code>/v1/responses</code>),再回这里选它。跑它的节点上也要装好 <code>codex</code> CLI。
+            </div>
+          )}
+
           {!showAdvanced
             ? <button type="button" className="ghost link" onClick={() => setShowAdvanced(true)}>高级选项…</button>
             : (
               <div className="row2 advanced-inline">
-                <label>基准分支<input value={baseBranch} onChange={e => setBaseBranch(e.target.value)} placeholder="留空则自动识别仓库默认分支" /></label>
+                {/* Only remote URLs still get a clone+worktree, so this is
+                    the only case a base branch can apply to — a local path is
+                    worked in directly, on whatever it is already checked out to. */}
+                <label>基准分支<input value={baseBranch} onChange={e => setBaseBranch(e.target.value)} placeholder="仅对远程仓库 URL 有效,本地路径直接原地工作" /></label>
                 <label>权限模式
                   <select value={permissionMode} onChange={e => setPermissionMode(e.target.value)}>
                     <option value="bypassPermissions">bypassPermissions(默认:全部放行)</option>

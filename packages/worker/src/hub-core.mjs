@@ -12,9 +12,10 @@
 //   listSessions(nodeId, path)    -> Promise<{sessions}|null> (same shape, lists existing claude sessions for a path)
 //   push(payload, ownerUserId)    -> void    (web push fan-out, fire and forget)
 //   now()                         -> epoch ms
-import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
+import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_CLI_UPGRADE, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
 import * as accounts from './accounts.mjs';
 import { hashPassword } from './auth.mjs';
+import { cachedCliVersions } from './cli-releases.mjs';
 
 const q = (db, sql, ...params) => db.prepare(sql).bind(...params);
 const SOURCE_CACHE_TTL_MS = 10 * 60_000;
@@ -295,15 +296,85 @@ async function attachNodeTeamIds(ctx, nodes) {
   for (const n of nodes) n.teamIds = byNode.get(n.id) ?? [];
 }
 
+function parseJsonObject(text, fallback = {}) {
+  try {
+    const parsed = JSON.parse(text ?? '');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback;
+  } catch { return fallback; }
+}
+
+// The node is authenticated, but what it reports still lands in D1 and then in
+// everyone's DOM, so both CLI payloads are narrowed to a known shape before
+// they're stored: known backends only, bounded strings, no extra keys.
+const CLI_UPGRADE_STATES = ['pending', 'running', 'ok', 'failed'];
+
+function sanitizeCliVersions(raw) {
+  const out = {};
+  for (const backend of BACKENDS) {
+    if (!(backend in (raw ?? {}))) continue;
+    const v = raw[backend];
+    // null is meaningful: installed, but its --version output didn't parse.
+    out[backend] = typeof v === 'string' ? v.slice(0, 64) : null;
+  }
+  return out;
+}
+
+function sanitizeCliUpgrades(raw) {
+  const out = {};
+  for (const backend of BACKENDS) {
+    const u = (raw ?? {})[backend];
+    if (!u || typeof u !== 'object') continue;
+    if (!CLI_UPGRADE_STATES.includes(u.state)) continue;
+    const entry = { state: u.state, at: Number(u.at) || null };
+    if (typeof u.from === 'string') entry.from = u.from.slice(0, 64);
+    if (typeof u.to === 'string') entry.to = u.to.slice(0, 64);
+    if (typeof u.error === 'string') entry.error = u.error.slice(0, 500);
+    out[backend] = entry;
+  }
+  return out;
+}
+
+// Installed CLI versions, last upgrade outcome, and whether this machine is
+// allowed to upgrade itself. Missing rows are the normal case, not an error:
+// node_cli_versions fills in on the node's next hello, and a missing
+// node_settings row means auto-upgrade is ON (see schema.sql — that default is
+// what lets every pre-existing node start upgrading with no backfill).
+async function attachNodeCliInfo(ctx, nodes) {
+  if (!nodes.length) return;
+  const ids = nodes.map(n => n.id);
+  const [verRows, setRows] = await Promise.all([
+    q(ctx.db, `SELECT node_id, versions, upgrades FROM node_cli_versions WHERE node_id IN (${inClause(ids)})`, ...ids).all(),
+    q(ctx.db, `SELECT node_id, auto_upgrade_cli FROM node_settings WHERE node_id IN (${inClause(ids)})`, ...ids).all(),
+  ]);
+  const byNode = new Map();
+  for (const r of (verRows.results ?? verRows)) byNode.set(r.node_id, r);
+  const autoOff = new Set();
+  for (const r of (setRows.results ?? setRows)) if (!r.auto_upgrade_cli) autoOff.add(r.node_id);
+  for (const n of nodes) {
+    const row = byNode.get(n.id);
+    n.cliVersions = parseJsonObject(row?.versions);
+    n.cliUpgrades = parseJsonObject(row?.upgrades);
+    n.autoUpgradeCli = !autoOff.has(n.id);
+  }
+}
+
+async function autoUpgradeEnabled(db, nodeId) {
+  const row = await q(db, 'SELECT auto_upgrade_cli FROM node_settings WHERE node_id = ?', nodeId).first();
+  return row ? !!row.auto_upgrade_cli : true;   // no row = on
+}
+
 // Same reasoning as broadcastTask's join above — store.js's upsertNode also
 // replaces (not merges) per update, so every 'node' broadcast needs
-// owner_username (and now teamIds) or it disappears/reverts from the client
-// after the first heartbeat.
+// owner_username (and now teamIds, and the CLI fields) or it
+// disappears/reverts from the client after the first heartbeat.
 async function nodePub(ctx, nodeId) {
   const node = await q(ctx.db,
     `SELECT nodes.id, nodes.name, nodes.owner_user_id, users.username AS owner_username, nodes.labels, nodes.status, nodes.last_heartbeat_at
      FROM nodes LEFT JOIN users ON users.id = nodes.owner_user_id WHERE nodes.id = ?`, nodeId).first();
-  if (node) node.teamIds = await nodeTeamIds(ctx, nodeId);
+  if (node) {
+    node.teamIds = await nodeTeamIds(ctx, nodeId);
+    await attachNodeCliInfo(ctx, [node]);
+  }
   return node;
 }
 
@@ -375,8 +446,11 @@ export async function absorbEvent(ctx, nodeId, { taskId, seq, ev }) {
     }
     // The turn just ended — hand the agent whatever the human queued while it
     // was busy. Keyed on the transition, not the new status alone, so a
-    // repeated 'running' heartbeat can't release anything mid-turn.
-    if (BUSY_STATUSES.has(prev) && !BUSY_STATUSES.has(ev.status)) {
+    // repeated 'running' heartbeat can't release anything mid-turn. Pausing
+    // for a human decision is not an ending either (see cannotTakeMessage),
+    // which is why this compares the pending request before and after, not
+    // just the status.
+    if (cannotTakeMessage(prev, task.pending_request) && !cannotTakeMessage(ev.status, pending)) {
       await releaseNextQueuedMessage(ctx, { ...task, status: ev.status });
     }
   } else if (ev.k === 'session' && fresh) {
@@ -479,6 +553,18 @@ export async function handleHello(ctx, nodeId, msg) {
     `INSERT INTO node_features (node_id, features, updated_at) VALUES (?, ?, ?)
      ON CONFLICT(node_id) DO UPDATE SET features = excluded.features, updated_at = excluded.updated_at`,
     nodeId, JSON.stringify(features), now).run();
+  // Which agent CLIs this machine actually has, and at what version. Only
+  // `versions` is written here: the node reboots with an empty upgrade history
+  // (it lives in the daemon's memory), and blanking the column on every hello
+  // would throw away the one thing the owner needs after a failed upgrade —
+  // the reason it failed. A node too old to report versions at all leaves the
+  // row untouched rather than clearing it.
+  if (msg.cliVersions && typeof msg.cliVersions === 'object') {
+    await q(ctx.db,
+      `INSERT INTO node_cli_versions (node_id, versions, upgrades, updated_at) VALUES (?, ?, '{}', ?)
+       ON CONFLICT(node_id) DO UPDATE SET versions = excluded.versions, updated_at = excluded.updated_at`,
+      nodeId, JSON.stringify(sanitizeCliVersions(msg.cliVersions)), now).run();
+  }
   await broadcastNode(ctx, nodeId, ownerId);
 
   // Reconciliation: the execution site is the truth — its reported state
@@ -546,7 +632,15 @@ export async function handleHello(ctx, nodeId, msg) {
 
   // The node always leaves with fresh relay credentials — no local config editing ever needed.
   const provider = ownerId ? await getProviderConfig(ctx.db, ownerId) : null;
-  ctx.sendToNode(nodeId, { t: 'hello_ok', tasks: replay, provider });
+  // CLI-upgrade policy rides along for the same reason permission_mode does
+  // above: cloud is authoritative, so re-assert it on every connect instead of
+  // hoping the one-shot push landed. Cache read only — a node handshake must
+  // never wait on registry.npmjs.org; alarm() keeps the cache warm.
+  const cliLatest = await cachedCliVersions(ctx.db);
+  ctx.sendToNode(nodeId, {
+    t: 'hello_ok', tasks: replay, provider,
+    cliLatest, cliAutoUpgrade: await autoUpgradeEnabled(ctx.db, nodeId),
+  });
 
   // Durable commands are persisted before first delivery and removed only
   // after the executor has written them to local SQLite. Reconnect replay is
@@ -568,6 +662,41 @@ export async function handleHello(ctx, nodeId, msg) {
   // clientMessageId, so redelivering one that actually did land is a no-op
   // rather than a duplicate turn.
   await flushOutboundMessages(ctx, nodeId);
+}
+
+// A node reporting its CLI state out of band — sent whenever an upgrade
+// changes state, so "升级中…" and a failure reason reach the open modal
+// immediately instead of waiting for the next reconnect. Unlike hello this
+// writes both columns: the node is the authority on its own upgrade attempt.
+export async function handleCliVersions(ctx, nodeId, msg) {
+  const node = await q(ctx.db, 'SELECT owner_user_id FROM nodes WHERE id = ?', nodeId).first();
+  if (!node) return;
+  await q(ctx.db,
+    `INSERT INTO node_cli_versions (node_id, versions, upgrades, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET versions = excluded.versions,
+       upgrades = excluded.upgrades, updated_at = excluded.updated_at`,
+    nodeId,
+    JSON.stringify(sanitizeCliVersions(msg.versions)),
+    JSON.stringify(sanitizeCliUpgrades(msg.upgrades)),
+    ctx.now()).run();
+  await broadcastNode(ctx, nodeId, node.owner_user_id);
+}
+
+// Push a (usually newly raised) upgrade target to nodes that are already
+// connected. hello_ok covers reconnects, but these sockets stay up for days
+// at a time — without this, a node would learn about a release only when its
+// daemon happened to restart for some other reason, which on a stable box is
+// "never". Each node gets its own autoUpgrade flag in the same message so the
+// two halves of the policy can't drift apart.
+export async function pushCliPolicy(ctx, nodeIds, latest) {
+  if (!nodeIds.length) return;
+  const rows = await q(ctx.db,
+    `SELECT node_id FROM node_settings WHERE auto_upgrade_cli = 0 AND node_id IN (${inClause(nodeIds)})`,
+    ...nodeIds).all();
+  const off = new Set((rows.results ?? rows).map(r => r.node_id));
+  for (const nodeId of nodeIds) {
+    ctx.sendToNode(nodeId, { t: 'cli_policy', latest, autoUpgrade: !off.has(nodeId) });
+  }
 }
 
 export async function handleHeartbeat(ctx, nodeId) {
@@ -668,7 +797,22 @@ function userMessagePayload(row) {
 // redirect, and there's nothing left to edit or take back. Holding it here
 // instead keeps it editable and cancellable until the turn actually ends.
 const BUSY_STATUSES = new Set(['running', 'starting']);
-const isTaskBusy = (task) => BUSY_STATUSES.has(task?.status);
+
+// Waiting on a permission decision is *not* the end of a turn, even though it
+// isn't "running" either: the CLI is still inside the tool call it asked
+// about, and a plain message can't reach it at all — a decision travels on a
+// different channel (control_request/can_use_tool), so the executor records
+// such a message and refuses to deliver it, telling the human to decide and
+// re-send (see manager.mjs). Treating it as "turn over" flushed the queue
+// straight into that refusal: found live, a message the human had queued
+// during the turn was released the moment the agent asked for permission, and
+// they were told to send it again by hand.
+// Keyed on the pending request itself, not on the status alone: a task left
+// in waiting_human with nothing actually pending (a CLI that died mid-prompt)
+// must not strand messages in the queue forever.
+const cannotTakeMessage = (status, pendingRequest) =>
+  BUSY_STATUSES.has(status) || (status === 'waiting_human' && !!pendingRequest);
+const isTaskBusy = (task) => cannotTakeMessage(task?.status, task?.pending_request);
 
 // Exactly one, deliberately: delivering it puts the task straight back into
 // 'running', so anything else still queued has to wait for *that* turn to end
@@ -836,6 +980,28 @@ export async function pushConfigToUser(ctx, userId) {
   for (const n of rows.results ?? rows) ctx.sendToNode(n.id, { t: 'config', provider });
 }
 
+// The pinned-task counterpart to pushConfigToUser. A card that picked a
+// profile reads its relay through its own provider_override, not through the
+// users.* mirror — so pushConfigToUser never reaches it, and hello_ok's
+// re-resolution (see handleHello) only runs when a node reconnects. Until
+// then the card keeps spawning its CLI against the profile's *old* base_url,
+// which reads to the user as "I changed the URL in Settings and nothing
+// happened" — found live: cards on one node kept hitting a relay that had
+// been switched away days earlier. Offline nodes still get it for free on
+// their next hello, exactly like pushConfigToUser.
+export async function pushProfileToPinnedTasks(ctx, userId, profileId) {
+  const profile = await q(ctx.db,
+    'SELECT base_url, api_key, model FROM model_profiles WHERE id = ? AND owner_user_id = ?', profileId, userId).first();
+  if (!profile) return;
+  const provider = { baseUrl: profile.base_url, apiKey: profile.api_key, model: profile.model };
+  const backend = await profileBackend(ctx.db, profileId);
+  const rows = await q(ctx.db,
+    'SELECT id, node_id FROM tasks WHERE model_profile_id = ? AND owner_user_id = ?', profileId, userId).all();
+  for (const t of rows.results ?? rows) {
+    ctx.sendToNode(t.node_id, { t: 'set_provider_override', taskId: t.id, provider, backend });
+  }
+}
+
 async function rowsForNodeChunks(ctx, sqlTemplate, nodeIds) {
   const rows = [];
   for (let offset = 0; offset < nodeIds.length; offset += 90) {
@@ -915,6 +1081,136 @@ async function invalidateConversationSource(ctx, nodeId, sessionId, sourceId, ta
     `SELECT 1 FROM tasks WHERE node_id = ? AND owner_user_id = ?
      AND id NOT IN (SELECT task_id FROM task_teams) AND repo_url IS NOT NULL LIMIT 1`, nodeId, node.owner_user_id).first();
   if (personalRoot) ctx.broadcast({ t: 'conversation_source_claimed', sourceId, taskId }, node.owner_user_id, null);
+}
+
+// Body of POST /api/tasks, lifted out so the branch route can reuse it — a
+// branch is an ordinary task that happens to be born with a session id, so
+// every check, insert and dispatch below applies to it unchanged.
+//
+// `adopting` is the one real difference. Adoption attaches a task to a session
+// that already exists in the user's home (only ever a claude one, see below);
+// branching *creates* the session first and then hands it here, so it can be
+// either backend and must not be refused for not being claude.
+async function createTask(ctx, body, userId, { adopting = true } = {}) {
+  const { title, spec, repoUrl, baseBranch, nodeId, permissionMode, modelProfileId, resumeSessionId } = body || {};
+  // The first message of a new conversation can carry attachments exactly
+  // like any later one (draftpane.jsx's composer is the same composer) —
+  // they ride along with spec rather than as a separate follow-up send, so
+  // the agent sees text and image in one turn.
+  const images = Array.isArray(body?.images) ? body.images : [];
+  // spec (the first message) is normally required, but images alone are a
+  // complete message too ("what's wrong with this screenshot?"), and
+  // resuming an existing external session already has content to pick up
+  // from — the task can be created and its history imported immediately,
+  // with the CLI left idle until the user actually sends something.
+  if (!title || (!spec && !images.length && !resumeSessionId) || !nodeId) return err(400, 'title, nodeId required (spec or images required unless resumeSessionId is set)');
+  const imageError = imageBatchError(images);
+  if (imageError) return err(400, imageError);
+  if (!(await assertTeamMember(ctx, ctx.teamId))) return err(403, 'not a member of that team');
+  // The node must be usable from the scope the task is being created in —
+  // a node shared with this project for a project task, or a node you
+  // personally own for a personal task (yours stays usable from personal
+  // scope even once you've also shared it with a project — see the node
+  // list route's comment; ownership isn't exclusive the way task sharing
+  // is). No more "any teammate's node is fair game because we're both on
+  // some team together," though — team scope still requires the explicit
+  // node_teams binding.
+  const node = ctx.teamId
+    ? await q(ctx.db, `SELECT id FROM nodes WHERE id = ? AND id IN (SELECT node_id FROM node_teams WHERE team_id = ?)`, nodeId, ctx.teamId).first()
+    : await q(ctx.db, `SELECT id FROM nodes WHERE id = ? AND owner_user_id = ?`, nodeId, userId).first();
+  if (!node) return err(400, `unknown node: ${nodeId}`);
+  if (resumeSessionId) {
+    const occupiedTask = await q(ctx.db, 'SELECT id FROM tasks WHERE node_id = ? AND session_id = ? AND COALESCE(repo_url,\'\') = ? LIMIT 1', nodeId, resumeSessionId, repoUrl || '').first();
+    const occupiedClaim = await q(ctx.db, 'SELECT task_id FROM conversation_claims_v2 WHERE node_id = ? AND session_id = ? AND source_cwd = ?', nodeId, resumeSessionId, repoUrl || '').first();
+    if (occupiedTask || occupiedClaim) return err(409, 'this Claude session is already connected to an AgentHub conversation');
+  }
+  let provider;
+  let backend = DEFAULT_BACKEND;
+  if (modelProfileId) {
+    const profile = await q(ctx.db,
+      'SELECT base_url, api_key, model FROM model_profiles WHERE id = ? AND owner_user_id = ?', modelProfileId, userId).first();
+    if (!profile) return err(404, `unknown model profile: ${modelProfileId}`);
+    provider = { baseUrl: profile.base_url, apiKey: profile.api_key, model: profile.model };
+    backend = await profileBackend(ctx.db, modelProfileId);
+  }
+  // Refuse up-front rather than dispatching work the node can't do — the
+  // spawn would go wrong in some backend-specific way and the resulting
+  // error would say nothing about the actual cause. Only on evidence the
+  // node itself supplied (cap.known): a node that has never connected to
+  // this cloud version stays dispatchable, and its task simply queues, which
+  // is what happened before backends existed.
+  const cap = await nodeCapabilities(ctx.db, nodeId);
+  if (cap.known && cap.protocolVersion < PROTOCOL_VERSION) {
+    return err(409, `节点 ${nodeId} 运行的是旧版 executor(协议 v${cap.protocolVersion},当前 v${PROTOCOL_VERSION}),请先升级该节点再派单`);
+  }
+  if (cap.known && !cap.backends.includes(backend)) {
+    return err(409, `节点 ${nodeId} 上没有安装 ${backend} CLI,无法运行这个模型档案`);
+  }
+  // A node that predates start_task.images would drop them and answer about
+  // a picture it never got — a wrong answer that looks like a working one.
+  // Refuse instead; nodes self-update within a couple of minutes, so this
+  // only ever shows up in the window right after a cloud deploy.
+  if (images.length && !(await nodeSupports(ctx.db, nodeId, FEATURE_TASK_IMAGES))) {
+    return err(409, `节点 ${nodeId} 的 executor 还不支持在新对话的第一条消息里带图片,请等它自动升级(约 2-3 分钟)后重试`);
+  }
+  // Session adoption only discovers claude histories today (see
+  // list_project_sessions), so a resumeSessionId is always a claude session
+  // id — and a session id belongs to exactly one agent CLI's on-disk store.
+  // The frontend filters the choices; reaching here means a stale page or a
+  // direct API call.
+  if (adopting && resumeSessionId && backend !== 'claude') {
+    return err(409, `无法用 ${backend} 档案接管一个 claude 会话:会话 ID 不通用`);
+  }
+  const id = ulid();
+  const now = ctx.now();
+  // No hardcoded 'main' fallback here — many repos default to 'master' or
+  // something else. Leaving base_branch unset when the caller didn't pick
+  // one lets the executor detect the clone's actual default branch.
+  const createStatements = [q(ctx.db,
+    `INSERT INTO tasks (id, title, spec, repo_url, base_branch, node_id, owner_user_id, team_id, status, permission_mode, session_id, model_profile_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
+    id, title, spec || '', repoUrl ?? null, baseBranch || null, nodeId, userId, ctx.teamId || null, permissionMode ?? 'bypassPermissions', resumeSessionId || null, modelProfileId || null, now, now,
+  )];
+  if (resumeSessionId) {
+    const sourceId = (await sha256Hex(`${nodeId}\0${resumeSessionId}\0${repoUrl || ''}`)).slice(0, 32);
+    createStatements.push(q(ctx.db,
+      'INSERT INTO conversation_claims_v2 (node_id,session_id,source_id,task_id,source_cwd,immutable,claimed_at) VALUES (?,?,?,?,?,0,?)',
+      nodeId, resumeSessionId, sourceId, id, repoUrl || '', now,
+    ));
+  }
+  if (ctx.teamId) createStatements.push(q(ctx.db, 'INSERT INTO task_teams (task_id, team_id) VALUES (?, ?)', id, ctx.teamId));
+  try { await ctx.db.batch(createStatements); }
+  catch { return err(409, 'this Claude session was connected concurrently; refresh and open the existing conversation'); }
+  // Creating a task while viewing a project starts it shared with that
+  // project (same UX as before) — more can be added/removed afterward via
+  // POST/DELETE /api/tasks/:id/teams/:teamId. tasks.team_id above is now
+  // unused legacy; task_teams is the actual source of truth.
+  await dispatch(ctx, nodeId, {
+    t: 'start_task',
+    task: {
+      id, title, spec: spec || '', repoUrl: repoUrl ?? null, baseBranch: baseBranch || null,
+      permissionMode: permissionMode ?? 'bypassPermissions', sessionId: resumeSessionId || null,
+      // Deliberately not persisted in tasks.spec: that column is the
+      // human-readable original ask shown in the 信息 tab, and the images
+      // are already durable either on the socket or in pending_cmds (see
+      // dispatch), then in messages.content once the node echoes the turn.
+      ...(images.length ? { images } : {}),
+      ...(provider ? { provider } : {}),
+      ...(backend !== DEFAULT_BACKEND ? { backend } : {}),
+    },
+  });
+  if (repoUrl) {
+    await q(ctx.db,
+      `INSERT INTO recent_repos (owner_user_id, repo_url, last_used_at) VALUES (?, ?, ?)
+       ON CONFLICT(owner_user_id, repo_url) DO UPDATE SET last_used_at = excluded.last_used_at`,
+      userId, repoUrl, now).run();
+  }
+  // Whatever model was picked for this task becomes the sticky default for
+  // the next new-task draft (draftpane.jsx reads this back via GET
+  // /api/model-profiles) — "changed once, defaults to that from now on."
+  await q(ctx.db, 'UPDATE users SET last_model_profile_id = ? WHERE id = ?', modelProfileId || null, userId).run();
+  const task = await broadcastTask(ctx, id);
+  return ok({ task });
 }
 
 // ---------- user-facing API (returns {status, body}) ----------
@@ -1094,125 +1390,7 @@ export async function api(ctx, method, pathname, body) {
   }
 
   if (method === 'POST' && route[0] === 'tasks' && route.length === 1) {
-    const { title, spec, repoUrl, baseBranch, nodeId, permissionMode, modelProfileId, resumeSessionId } = body || {};
-    // The first message of a new conversation can carry attachments exactly
-    // like any later one (draftpane.jsx's composer is the same composer) —
-    // they ride along with spec rather than as a separate follow-up send, so
-    // the agent sees text and image in one turn.
-    const images = Array.isArray(body?.images) ? body.images : [];
-    // spec (the first message) is normally required, but images alone are a
-    // complete message too ("what's wrong with this screenshot?"), and
-    // resuming an existing external session already has content to pick up
-    // from — the task can be created and its history imported immediately,
-    // with the CLI left idle until the user actually sends something.
-    if (!title || (!spec && !images.length && !resumeSessionId) || !nodeId) return err(400, 'title, nodeId required (spec or images required unless resumeSessionId is set)');
-    const imageError = imageBatchError(images);
-    if (imageError) return err(400, imageError);
-    if (!(await assertTeamMember(ctx, ctx.teamId))) return err(403, 'not a member of that team');
-    // The node must be usable from the scope the task is being created in —
-    // a node shared with this project for a project task, or a node you
-    // personally own for a personal task (yours stays usable from personal
-    // scope even once you've also shared it with a project — see the node
-    // list route's comment; ownership isn't exclusive the way task sharing
-    // is). No more "any teammate's node is fair game because we're both on
-    // some team together," though — team scope still requires the explicit
-    // node_teams binding.
-    const node = ctx.teamId
-      ? await q(ctx.db, `SELECT id FROM nodes WHERE id = ? AND id IN (SELECT node_id FROM node_teams WHERE team_id = ?)`, nodeId, ctx.teamId).first()
-      : await q(ctx.db, `SELECT id FROM nodes WHERE id = ? AND owner_user_id = ?`, nodeId, userId).first();
-    if (!node) return err(400, `unknown node: ${nodeId}`);
-    if (resumeSessionId) {
-      const occupiedTask = await q(ctx.db, 'SELECT id FROM tasks WHERE node_id = ? AND session_id = ? AND COALESCE(repo_url,\'\') = ? LIMIT 1', nodeId, resumeSessionId, repoUrl || '').first();
-      const occupiedClaim = await q(ctx.db, 'SELECT task_id FROM conversation_claims_v2 WHERE node_id = ? AND session_id = ? AND source_cwd = ?', nodeId, resumeSessionId, repoUrl || '').first();
-      if (occupiedTask || occupiedClaim) return err(409, 'this Claude session is already connected to an AgentHub conversation');
-    }
-    let provider;
-    let backend = DEFAULT_BACKEND;
-    if (modelProfileId) {
-      const profile = await q(ctx.db,
-        'SELECT base_url, api_key, model FROM model_profiles WHERE id = ? AND owner_user_id = ?', modelProfileId, userId).first();
-      if (!profile) return err(404, `unknown model profile: ${modelProfileId}`);
-      provider = { baseUrl: profile.base_url, apiKey: profile.api_key, model: profile.model };
-      backend = await profileBackend(ctx.db, modelProfileId);
-    }
-    // Refuse up-front rather than dispatching work the node can't do — the
-    // spawn would go wrong in some backend-specific way and the resulting
-    // error would say nothing about the actual cause. Only on evidence the
-    // node itself supplied (cap.known): a node that has never connected to
-    // this cloud version stays dispatchable, and its task simply queues, which
-    // is what happened before backends existed.
-    const cap = await nodeCapabilities(ctx.db, nodeId);
-    if (cap.known && cap.protocolVersion < PROTOCOL_VERSION) {
-      return err(409, `节点 ${nodeId} 运行的是旧版 executor(协议 v${cap.protocolVersion},当前 v${PROTOCOL_VERSION}),请先升级该节点再派单`);
-    }
-    if (cap.known && !cap.backends.includes(backend)) {
-      return err(409, `节点 ${nodeId} 上没有安装 ${backend} CLI,无法运行这个模型档案`);
-    }
-    // A node that predates start_task.images would drop them and answer about
-    // a picture it never got — a wrong answer that looks like a working one.
-    // Refuse instead; nodes self-update within a couple of minutes, so this
-    // only ever shows up in the window right after a cloud deploy.
-    if (images.length && !(await nodeSupports(ctx.db, nodeId, FEATURE_TASK_IMAGES))) {
-      return err(409, `节点 ${nodeId} 的 executor 还不支持在新对话的第一条消息里带图片,请等它自动升级(约 2-3 分钟)后重试`);
-    }
-    // Session adoption only discovers claude histories today (see
-    // list_project_sessions), so a resumeSessionId is always a claude session
-    // id — and a session id belongs to exactly one agent CLI's on-disk store.
-    // The frontend filters the choices; reaching here means a stale page or a
-    // direct API call.
-    if (resumeSessionId && backend !== 'claude') {
-      return err(409, `无法用 ${backend} 档案接管一个 claude 会话:会话 ID 不通用`);
-    }
-    const id = ulid();
-    const now = ctx.now();
-    // No hardcoded 'main' fallback here — many repos default to 'master' or
-    // something else. Leaving base_branch unset when the caller didn't pick
-    // one lets the executor detect the clone's actual default branch.
-    const createStatements = [q(ctx.db,
-      `INSERT INTO tasks (id, title, spec, repo_url, base_branch, node_id, owner_user_id, team_id, status, permission_mode, session_id, model_profile_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
-      id, title, spec || '', repoUrl ?? null, baseBranch || null, nodeId, userId, ctx.teamId || null, permissionMode ?? 'bypassPermissions', resumeSessionId || null, modelProfileId || null, now, now,
-    )];
-    if (resumeSessionId) {
-      const sourceId = (await sha256Hex(`${nodeId}\0${resumeSessionId}\0${repoUrl || ''}`)).slice(0, 32);
-      createStatements.push(q(ctx.db,
-        'INSERT INTO conversation_claims_v2 (node_id,session_id,source_id,task_id,source_cwd,immutable,claimed_at) VALUES (?,?,?,?,?,0,?)',
-        nodeId, resumeSessionId, sourceId, id, repoUrl || '', now,
-      ));
-    }
-    if (ctx.teamId) createStatements.push(q(ctx.db, 'INSERT INTO task_teams (task_id, team_id) VALUES (?, ?)', id, ctx.teamId));
-    try { await ctx.db.batch(createStatements); }
-    catch { return err(409, 'this Claude session was connected concurrently; refresh and open the existing conversation'); }
-    // Creating a task while viewing a project starts it shared with that
-    // project (same UX as before) — more can be added/removed afterward via
-    // POST/DELETE /api/tasks/:id/teams/:teamId. tasks.team_id above is now
-    // unused legacy; task_teams is the actual source of truth.
-    await dispatch(ctx, nodeId, {
-      t: 'start_task',
-      task: {
-        id, title, spec: spec || '', repoUrl: repoUrl ?? null, baseBranch: baseBranch || null,
-        permissionMode: permissionMode ?? 'bypassPermissions', sessionId: resumeSessionId || null,
-        // Deliberately not persisted in tasks.spec: that column is the
-        // human-readable original ask shown in the 信息 tab, and the images
-        // are already durable either on the socket or in pending_cmds (see
-        // dispatch), then in messages.content once the node echoes the turn.
-        ...(images.length ? { images } : {}),
-        ...(provider ? { provider } : {}),
-        ...(backend !== DEFAULT_BACKEND ? { backend } : {}),
-      },
-    });
-    if (repoUrl) {
-      await q(ctx.db,
-        `INSERT INTO recent_repos (owner_user_id, repo_url, last_used_at) VALUES (?, ?, ?)
-         ON CONFLICT(owner_user_id, repo_url) DO UPDATE SET last_used_at = excluded.last_used_at`,
-        userId, repoUrl, now).run();
-    }
-    // Whatever model was picked for this task becomes the sticky default for
-    // the next new-task draft (draftpane.jsx reads this back via GET
-    // /api/model-profiles) — "changed once, defaults to that from now on."
-    await q(ctx.db, 'UPDATE users SET last_model_profile_id = ? WHERE id = ?', modelProfileId || null, userId).run();
-    const task = await broadcastTask(ctx, id);
-    return ok({ task });
+    return createTask(ctx, body, userId);
   }
 
   // Deep-link support: a task URL (#/task/<id>) can reference a task that
@@ -1286,19 +1464,43 @@ export async function api(ctx, method, pathname, body) {
       return ok({ seenAt: now });
     }
 
+    // Two directions, because the two callers want opposite ends of the log.
+    // Forward (`after_seq`, the default) is the reconnect backfill: "everything
+    // I haven't seen yet". Backward (`before_seq`) is what opening a
+    // conversation uses — the newest page first, then older pages as you
+    // scroll up. Opening used to mean fetching the whole history (a long
+    // autonomous run is thousands of messages, three 1000-row round trips)
+    // before the first bubble could render.
     if (method === 'GET' && action === 'messages') {
-      const after = Number(body?.after_seq ?? 0);
       const limit = Math.min(Number(body?.limit ?? 300), 1000);
+      const decode = rows => (rows.results ?? rows).map(r => ({ ...r, content: JSON.parse(r.content) }));
+      // Both directions answer with `pending` — sends the cloud has accepted
+      // but no node has echoed back yet ride along on every page so a
+      // reload/second device shows in-flight text too, the whole point of
+      // persisting them. They are not messages yet (no seq), so they're a
+      // separate field the client renders after the real log rather than
+      // something that could collide with a real seq.
+      if (body?.before_seq !== undefined) {
+        // No/zero before_seq means "start at the newest". One extra row is
+        // read purely to answer hasMore, so the client knows whether scrolling
+        // up has anything left to reach without a probe request.
+        const before = Number(body.before_seq) || Number.MAX_SAFE_INTEGER;
+        const rows = decode(await q(ctx.db,
+          'SELECT seq, role, content, created_at FROM messages WHERE task_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?',
+          taskId, before, limit + 1).all());
+        const hasMore = rows.length > limit;
+        return ok({
+          messages: (hasMore ? rows.slice(0, limit) : rows).reverse(), // always oldest-first for the client
+          hasMore,
+          pending: await pendingMessagesFor(ctx, taskId),
+        });
+      }
+      const after = Number(body?.after_seq ?? 0);
       const rows = await q(ctx.db,
         'SELECT seq, role, content, created_at FROM messages WHERE task_id = ? AND seq > ? ORDER BY seq LIMIT ?',
         taskId, after, limit).all();
-      // Pending sends ride along on every page so a reload/second device
-      // shows in-flight text too — the whole point of persisting them. They
-      // are not messages yet (no seq), so they're a separate field the client
-      // renders after the real log rather than something that could collide
-      // with a real seq.
       return ok({
-        messages: (rows.results ?? rows).map(r => ({ ...r, content: JSON.parse(r.content) })),
+        messages: decode(rows),
         pending: await pendingMessagesFor(ctx, taskId),
       });
     }
@@ -1540,6 +1742,58 @@ export async function api(ctx, method, pathname, body) {
       await broadcastTask(ctx, taskId);
       return ok({});
     }
+    // Branch off an assistant reply into a fresh conversation that remembers
+    // everything up to it. The agent's memory is the CLI's own transcript file,
+    // not the messages table, so this has to physically fork that file on the
+    // node — copying rows here would produce a conversation that looks right
+    // and remembers nothing.
+    if (method === 'POST' && action === 'branch') {
+      const seq = Number(body?.seq);
+      if (!Number.isFinite(seq) || seq <= 0) return err(400, 'seq required');
+      if (!task.session_id) return err(409, '这个对话还没有会话记录,跑完第一个回合后才能分支');
+      if (!(await nodeSupports(ctx.db, task.node_id, FEATURE_SESSION_FORK))) {
+        return err(409, `节点 ${task.node_id} 的 executor 还不支持分支,请等它自动升级(约 2-3 分钟)后重试`);
+      }
+      // Count from the tail, not the head: _importHistory caps an adopted
+      // conversation at its last 50 turns, so a D1 message's seq says nothing
+      // about its position in the transcript — but "how many user turns came
+      // after this point" is the same number on both sides.
+      const after = await q(ctx.db,
+        "SELECT COUNT(*) AS n FROM messages WHERE task_id = ? AND role = 'user' AND seq > ?", taskId, seq).first();
+      const newSessionId = crypto.randomUUID();
+      const fork = await ctx.forkSession?.(task.node_id, taskId, task.session_id, after?.n ?? 0, newSessionId);
+      if (!fork) return err(504, '节点没有响应');
+      if (!fork.ok) return err(409, fork.error || '分支失败');
+      // Created only after the fork succeeded: a task whose session_id points
+      // at a transcript that doesn't exist is a conversation that can never be
+      // resumed and can only be deleted.
+      const created = await createTask(ctx, {
+        title: `${task.title} (分支)`,
+        spec: '',
+        repoUrl: fork.cwd,
+        nodeId: task.node_id,
+        permissionMode: task.permission_mode,
+        modelProfileId: task.model_profile_id,
+        resumeSessionId: newSessionId,
+      }, userId, { adopting: false });
+      if (created.status !== 200) return created;
+      // The branch works in the same directory as its parent, so uncommitted
+      // changes come along — and both conversations editing at once will
+      // collide. Reported rather than silently accepted; the frontend says so
+      // before it navigates.
+      const warnings = [`分支与原对话共用工作目录 ${fork.cwd},两边同时干活会改到同一批文件。`];
+      // The turn we actually cut at, echoed back from the transcript. If it
+      // doesn't match the user message the UI branched under, the two sides
+      // disagree about turn counts (a retry, an unsent queued message) and the
+      // branch point is off — better said out loud than discovered later.
+      const anchor = await q(ctx.db,
+        "SELECT content FROM messages WHERE task_id = ? AND role = 'user' AND seq <= ? ORDER BY seq DESC LIMIT 1", taskId, seq).first();
+      const expected = anchor && (JSON.parse(anchor.content)?.text ?? '');
+      if (expected && fork.anchorText && !fork.anchorText.includes(expected.trim().slice(0, 200))) {
+        warnings.push(`分支点可能有偏差:实际切在「${fork.anchorText.trim().slice(0, 60)}」这一轮之后。`);
+      }
+      return ok({ task: created.body.task, warnings });
+    }
     if (method === 'POST' && action === 'rename') {
       const title = String(body?.title || '').trim();
       if (!title) return err(400, 'title required');
@@ -1650,7 +1904,10 @@ export async function api(ctx, method, pathname, body) {
     if (!isMember) return err(403, 'not a member of that team');
     const nodes = rows.results ?? rows;
     await attachNodeTeamIds(ctx, nodes);
-    return ok({ nodes });
+    await attachNodeCliInfo(ctx, nodes);
+    // One target for the whole fleet, so it sits at the top level rather than
+    // being copied onto every node. Cache read — see cli-releases.mjs.
+    return ok({ nodes, cliLatest: await cachedCliVersions(ctx.db) });
   }
   if (method === 'POST' && route[0] === 'nodes' && route.length === 1) {
     const { id, tokenHash, labels, autoName } = body || {};
@@ -1738,6 +1995,46 @@ export async function api(ctx, method, pathname, body) {
     return ok({});
   }
 
+  // 「立即升级」— owner-only like rename: upgrading a CLI mutates someone's
+  // machine, so being able to *use* a shared node isn't enough.
+  if (method === 'POST' && route[0] === 'nodes' && route.length === 3 && route[2] === 'cli-upgrade') {
+    const nodeId = route[1];
+    const backend = body?.backend ?? null;
+    if (backend && !BACKENDS.includes(backend)) return err(400, 'unknown backend');
+    const node = await q(ctx.db, 'SELECT owner_user_id, status FROM nodes WHERE id = ?', nodeId).first();
+    if (!node || node.owner_user_id !== userId) return err(404, 'node not found');
+    if (!(await nodeSupports(ctx.db, nodeId, FEATURE_CLI_UPGRADE))) {
+      return err(409, '这个节点的 AgentHub 版本还不支持 CLI 升级,等它自更新后再试');
+    }
+    // Deliberately not queued as a durable command: "upgrade now" is about
+    // this moment. By the time an offline node comes back, auto-upgrade has
+    // almost certainly already done it, and replaying a button press from
+    // hours ago would run an installer nobody is watching.
+    if (!ctx.sendToNode(nodeId, { t: 'upgrade_cli', backend })) return err(409, '节点当前离线');
+    return ok({});
+  }
+
+  // Per-node auto-upgrade switch. Writing the row is what opts a machine
+  // *out* — absence means on (schema.sql), which is how every node that
+  // predates this feature ended up enabled without a backfill.
+  if (method === 'POST' && route[0] === 'nodes' && route.length === 3 && route[2] === 'auto-upgrade') {
+    const nodeId = route[1];
+    const enabled = body?.enabled !== false;
+    const node = await q(ctx.db, 'SELECT owner_user_id FROM nodes WHERE id = ?', nodeId).first();
+    if (!node || node.owner_user_id !== userId) return err(404, 'node not found');
+    await q(ctx.db,
+      `INSERT INTO node_settings (node_id, auto_upgrade_cli, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(node_id) DO UPDATE SET auto_upgrade_cli = excluded.auto_upgrade_cli,
+         updated_at = excluded.updated_at`,
+      nodeId, enabled ? 1 : 0, ctx.now()).run();
+    // Live push so turning it off stops an upgrade the node was about to
+    // start; if it's offline the next hello_ok carries the same value, which
+    // is why this isn't a durable command either.
+    ctx.sendToNode(nodeId, { t: 'cli_policy', latest: await cachedCliVersions(ctx.db), autoUpgrade: enabled });
+    await broadcastNode(ctx, nodeId, userId);
+    return ok({ enabled });
+  }
+
   if (method === 'GET' && route[0] === 'me' && route.length === 1) {
     const user = await accounts.getUser(ctx.db, userId);
     if (!user) return err(404, 'user not found');
@@ -1793,13 +2090,22 @@ export async function api(ctx, method, pathname, body) {
     return ok({ repos: repos.slice(0, 8), top: scoped[0] ?? null });
   }
 
-  // Unread counts per scope, for the red dots on the 个人 / project tabs.
-  // Scope-wide rather than per-task on purpose: the sidebar already has the
-  // current scope's tasks live over the WS and can mark its own rows, but a
-  // project you're *not* currently viewing sends this client nothing at all —
-  // this is the only way its tab learns it has something waiting.
+  // Per-scope badge counts for the 个人 / project tabs: "有新动静没看过"
+  // (unread) and "此刻有对话在跑" (running). Scope-wide rather than per-task on
+  // purpose: the sidebar already has the current scope's tasks live over the WS
+  // and can mark its own rows, but a project you're *not* currently viewing
+  // sends this client nothing at all — this is the only way its tab learns
+  // anything. Both counts ride one round trip because they're polled together
+  // on the same timer; splitting them would just double the requests.
+  // Unread is per-viewer (joins task_reads); running is not — a turn is in
+  // flight for everyone or for no one.
   if (method === 'GET' && route[0] === 'unread' && route.length === 1) {
-    const [personal, teams] = await Promise.all([
+    // Derived from BUSY_STATUSES rather than spelled out in the SQL: that set
+    // is what decides when run_started_at gets stamped, and a second hardcoded
+    // copy here would silently drift the day a status is added.
+    const busy = [...BUSY_STATUSES];
+    const busyIn = busy.map(() => '?').join(',');
+    const [personal, teams, personalRunning, teamsRunning] = await Promise.all([
       q(ctx.db,
         `SELECT COUNT(*) AS n FROM tasks t
          JOIN task_activity a ON a.task_id = t.id
@@ -1818,10 +2124,25 @@ export async function api(ctx, method, pathname, body) {
            AND a.attention_at IS NOT NULL AND a.attention_at > COALESCE(r.seen_at, 0)
          GROUP BY tt.team_id`,
         userId, userId).all(),
+      q(ctx.db,
+        `SELECT COUNT(*) AS n FROM tasks t
+         WHERE t.owner_user_id = ? AND t.archived_at IS NULL
+           AND t.id NOT IN (SELECT task_id FROM task_teams)
+           AND t.status IN (${busyIn})`,
+        userId, ...busy).first(),
+      q(ctx.db,
+        `SELECT tt.team_id AS team_id, COUNT(*) AS n FROM tasks t
+         JOIN task_teams tt ON tt.task_id = t.id
+         JOIN team_members tm ON tm.team_id = tt.team_id AND tm.user_id = ?
+         WHERE t.archived_at IS NULL AND t.status IN (${busyIn})
+         GROUP BY tt.team_id`,
+        userId, ...busy).all(),
     ]);
     const unread = { personal: personal?.n ?? 0 };
     for (const row of (teams.results ?? teams)) unread[row.team_id] = row.n;
-    return ok({ unread });
+    const running = { personal: personalRunning?.n ?? 0 };
+    for (const row of (teamsRunning.results ?? teamsRunning)) running[row.team_id] = row.n;
+    return ok({ unread, running });
   }
 
   // Which conversation panes are open, synced across devices — stored per
@@ -1970,6 +2291,10 @@ export async function api(ctx, method, pathname, body) {
     }
     await q(ctx.db, 'UPDATE model_profiles SET name = ?, base_url = ?, api_key = ?, model = ? WHERE id = ?',
       name, baseUrl, apiKey, model || null, route[1]).run();
+    // Independent of is_default: cards pinned to this profile hold their own
+    // copy of its credentials and would otherwise keep the old relay until
+    // their node next reconnects.
+    await pushProfileToPinnedTasks(ctx, userId, route[1]);
     if (profile.is_default) {
       // Same mirror + live push as set-default: the default profile's values
       // are what getProviderConfig/hello_ok actually read, so editing it
@@ -2390,7 +2715,11 @@ export async function snapshot(ctx) {
          WHERE nodes.owner_user_id = ?`, ctx.userId).all();
   const nodes = nodeRows.results ?? nodeRows;
   await attachNodeTeamIds(ctx, nodes);
-  return { t: 'snapshot', tasks, nodes };
+  // Same wholesale-replace hazard as the tasks above: the snapshot overwrites
+  // the client's node map, so CLI info omitted here would flash in from the
+  // REST load and then disappear when the socket connects.
+  await attachNodeCliInfo(ctx, nodes);
+  return { t: 'snapshot', tasks, nodes, cliLatest: await cachedCliVersions(ctx.db) };
 }
 
 const ok = (body) => ({ status: 200, body: { ok: true, ...body } });

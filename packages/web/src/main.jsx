@@ -71,6 +71,8 @@ function App() {
     api.nodes().then(r => {
       if (state.userGeneration !== userGeneration) return;
       const nodes = new Map(r.nodes.map(n => [n.id, n]));
+      // Fleet-wide, not scoped — same value in every project (see store.js).
+      if (r.cliLatest) state.cliLatest = r.cliLatest;
       state.scopeCache[scopeKey] = { ...(state.scopeCache[scopeKey] || {}), nodes };
       if (scopeKeyOf(state.activeTeamId) === scopeKey) { state.nodes = nodes; bump(); }
     }).catch(() => {});
@@ -111,16 +113,18 @@ function App() {
     });
   };
 
-  // Unread counts for every scope at once. Polled rather than pushed: the WS
-  // only carries the scope it's connected to, so a project you're not looking
-  // at has no other way to tell this tab that something finished there. The
-  // active scope's own dot doesn't wait for this — it's computed live from
-  // state.tasks (see store.js's unreadForScope).
-  const refreshUnread = () => {
+  // Tab badge counts (unread + running) for every scope at once. Polled rather
+  // than pushed: the WS only carries the scope it's connected to, so a project
+  // you're not looking at has no other way to tell this tab that something
+  // finished — or started — there. The active scope's own badges don't wait for
+  // this; they're computed live from state.tasks (see store.js's
+  // unreadForScope / runningForScope).
+  const refreshScopeBadges = () => {
     const userGeneration = state.userGeneration;
     api.unread().then(r => {
       if (state.userGeneration !== userGeneration) return;
       state.unread = r.unread || {};
+      state.running = r.running || {};
       bump();
     }).catch(() => {});
   };
@@ -134,6 +138,8 @@ function App() {
     return api.nodes().then(r => {
       if (state.userGeneration !== userGeneration) return;
       const nodes = new Map(r.nodes.map(n => [n.id, n]));
+      // Fleet-wide, not scoped — same value in every project (see store.js).
+      if (r.cliLatest) state.cliLatest = r.cliLatest;
       state.scopeCache[scopeKey] = { ...(state.scopeCache[scopeKey] || {}), nodes };
       if (scopeKeyOf(state.activeTeamId) === scopeKey) { state.nodes = nodes; bump(); }
     }).catch(() => {});
@@ -170,12 +176,17 @@ function App() {
     // sets right after auth with this wrong-shaped one on every reload.
     api.me().then(r => setUser(r.user)).catch(onAuthError);
     loadScopedData(onAuthError);
-    refreshUnread();
-    // 45s, plus a catch-up whenever the tab comes back to the front — the
+    refreshScopeBadges();
+    // 15s, plus a catch-up whenever the tab comes back to the front — the
     // common case for "a conversation finished while I was away" is returning
     // to a tab that's been backgrounded (where timers are throttled anyway).
-    const unreadTimer = setInterval(refreshUnread, 45_000);
-    const onVisible = () => { if (!document.hidden) refreshUnread(); };
+    // Unread alone was happy at 45s: it's sticky, so arriving late only ever
+    // meant a dot showing up a bit after the fact. "运行中" is transient — a
+    // whole turn can start and end inside one interval — and at 45s another
+    // project's tab would keep animating for a run that finished ages ago,
+    // which is worse than not showing it at all.
+    const badgeTimer = setInterval(refreshScopeBadges, 15_000);
+    const onVisible = () => { if (!document.hidden) refreshScopeBadges(); };
     document.addEventListener('visibilitychange', onVisible);
     api.myTeams().then(r => {
       state.teams = r.teams;
@@ -188,7 +199,7 @@ function App() {
     }).catch(() => {});
     return () => {
       ws.close();
-      clearInterval(unreadTimer);
+      clearInterval(badgeTimer);
       document.removeEventListener('visibilitychange', onVisible);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -225,9 +236,9 @@ function App() {
     bump();
     wsRef.current?.reconnect();
     loadScopedData(() => {});
-    // The scope being left keeps its dot from the last poll; refresh so it
-    // reflects what was just read there rather than what was true 45s ago.
-    refreshUnread();
+    // The scope being left falls back to its polled badges; refresh so they
+    // reflect what was just read/run there rather than the last snapshot.
+    refreshScopeBadges();
   };
 
   const togglePush = async () => {

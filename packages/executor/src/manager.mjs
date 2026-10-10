@@ -1,6 +1,6 @@
 // SessionManager: owns task lifecycle on this node. Local SQLite is the truth;
 // every externally visible change is emitted as an outbox event (via emit()).
-import { prepareWorkspace, collectDiff } from './worktree.mjs';
+import { prepareWorkspace, collectDiff, isManagedDir } from './worktree.mjs';
 import { MAX_IMPORT_EVENTS } from './sessions.mjs';
 import { backendFor, backendByName, DEFAULT_BACKEND } from './backends.mjs';
 import { TRANSIENT_ERROR_CODES, codexHomeFor } from './codex-session.mjs';
@@ -61,11 +61,24 @@ const TURN_CAP_CONTINUE_PROMPT = '（上一轮是被回合数上限截断的,不
 // 60s sweeper picks up that exact file instead: when a job comes due and the
 // task is idle, the prompt is injected as a normal user turn (same visible
 // semantics as the REPL enqueueing it). Entry shape (verified against what
-// CronCreate actually writes): {id, cron, prompt, createdAt, recurring?} —
-// `recurring: true` present for recurring jobs, absent for one-shots.
+// CronCreate actually writes): {id, cron, prompt, createdAt, recurring?,
+// createdBySessionId, createdByPid, createdByProcStart, createdInProject} —
+// `recurring: true` present for recurring jobs, absent for one-shots, and
+// createdBySessionId is what _ownsCronJob uses to tell whose job it is now
+// that a directory can hold more than one task's conversation.
 const CRON_RECURRING_EXPIRY_MS = 7 * 24 * 3600_000; // mirror the CLI's own 7-day rule
 const CRON_MAX_LOOKBACK_MS = 65 * 60_000; // a long-busy task still fires (once) for a missed minute
 const CRON_ONESHOT_CATCHUP_MS = 60 * 24 * 3600_000; // how far back a missed one-shot is still worth firing
+
+// Same folder? Compared the way the filesystem would: the board happily
+// collects case variants of one Windows path (c:\Users\... alongside
+// C:\Users\...) because that's whatever the user pasted, and those are one
+// directory sharing one .claude/scheduled_tasks.json.
+function sameDir(a, b) {
+  if (!a || !b) return false;
+  const norm = (p) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+  return norm(a) === norm(b);
+}
 
 // One 5-field cron component ("*", "23", "*/5", "8-18/2", "1,15,30").
 function cronFieldMatches(field, value, min, max) {
@@ -828,6 +841,14 @@ export class SessionManager {
 
   _publishDiff(taskId) {
     const t = this.db.getTask(taskId);
+    // Never in the user's own directory. collectDiff() starts with
+    // `git add -A`, which in a real working repo silently stages everything
+    // the user had lying around untracked — they'd discover it at their next
+    // commit. A scratch dir or a worktree is ours to stage freely; a path the
+    // user handed us (an in-place task, or any resumed session) is not, and
+    // the diff view is not worth mutating someone's index for. Also covers
+    // non-git directories, which never had a diff to show anyway.
+    if (!t?.dir || !isManagedDir(this.config, t.dir)) return;
     try {
       const { stat, patch } = collectDiff(t);
       if (stat || patch) this.emit(taskId, { k: 'msg', role: 'diff', content: { stat, patch } });
@@ -975,6 +996,14 @@ export class SessionManager {
       return;
     }
     let session = this.sessions.get(taskId);
+    // A model switch that landed mid-generation couldn't retire this process
+    // then (see setProviderOverride) — do it now, before the reuse below
+    // would run this turn against the relay the user just switched away from.
+    if (session?.alive && !session.busy && session.providerStale) {
+      session.kill();
+      this.sessions.delete(taskId);
+      session = null;
+    }
     if (!session || !session.alive) {
       // Pull in anything the user typed directly in VS Code/terminal since
       // AgentHub last looked, *before* resuming — otherwise this message
@@ -1059,7 +1088,14 @@ export class SessionManager {
       return;
     }
     const next = provider ? JSON.stringify(provider) : null;
-    if ((t.provider_override ?? null) === next && (t.backend ?? null) === nextBackend) return;
+    // Normalise the backend the same way the guard above does: start_task
+    // omits `backend` when it's the default, so a claude task is stored as
+    // NULL locally, while hello_ok's re-assertion always sends the resolved
+    // 'claude'. Comparing those raw made every such task register one phantom
+    // switch on its first reconnect — a "已切换模型" message in a conversation
+    // nobody touched, plus a needlessly killed idle session.
+    if ((t.provider_override ?? null) === next
+      && (t.backend ?? DEFAULT_BACKEND) === (nextBackend ?? DEFAULT_BACKEND)) return;
     this.db.patchTask(taskId, { providerOverride: next, backend: nextBackend });
     // real_config_dir tasks kill their session after every turn anyway; for
     // the isolated-copy model a warm idle session would otherwise keep the
@@ -1070,6 +1106,13 @@ export class SessionManager {
     if (session?.alive && !session.busy) {
       session.kill();
       this.sessions.delete(taskId);
+    } else if (session?.alive) {
+      // Mid-generation: killing now would destroy the turn the user is
+      // watching. But the relay is a spawn-time env var, so letting this
+      // process survive means the *next* turn silently reuses it and runs on
+      // the old config — the switch looks applied on the board and isn't.
+      // Mark it; userMessage retires it before the next turn instead.
+      session.providerStale = true;
     }
     this.emit(taskId, {
       k: 'msg', role: 'system',
@@ -1324,24 +1367,58 @@ export class SessionManager {
   // task's own backend is what keeps each one reading only its own store.
   _sweepScheduledTasks() {
     const now = Date.now();
-    for (const t of this.db.allTasks()) {
+    const all = this.db.allTasks();
+    for (const t of all) {
       if (!t.dir || t.lease !== 'daemon') continue;
       if (!['review', 'idle'].includes(t.status)) continue;
       if (backendFor(t).name === 'codex') this._sweepCodexAutomations(t, now);
-      else this._sweepClaudeCron(t, now);
+      else this._sweepClaudeCron(t, now, all);
     }
   }
 
-  _sweepClaudeCron(t, now) {
+  // Which card is a cron job actually for? The CLI stamps every job it writes
+  // with the session that created it (createdBySessionId — read off a real
+  // scheduled_tasks.json, not inferred), and a task's session_id is kept in
+  // step with whatever the CLI reports, so this is exact ownership rather
+  // than a guess. It matters because the dedup key below is per task: without
+  // it, one job in a shared folder fires once per card. Found live
+  // 2026-09-22 — a training-watchdog cron written in one conversation fired
+  // into six at once, every one of them sitting in the same project folder.
+  // Worktrees hid this for as long as they lasted: t.dir was private, so a
+  // task never had roommates to spill onto.
+  //
+  // Jobs with no stamp (hand-written, or predating it) fall back to "only if
+  // nobody else is reading this file": a private worktree fires exactly as it
+  // always did, a shared folder fires nothing rather than guessing which
+  // conversation the prompt was meant for.
+  _ownsCronJob(t, job, roommates) {
+    const owner = job.createdBySessionId;
+    if (!owner) return roommates.length === 0;
+    if (t.session_id && t.session_id === owner) return true;
+    // Stamped, but the owner is gone (its card was deleted, or its session
+    // was switched out from under it). Still not licence to spread it across
+    // the folder — only an unshared directory can safely inherit it.
+    if (roommates.some(o => o.session_id === owner)) return false;
+    return roommates.length === 0;
+  }
+
+  _sweepClaudeCron(t, now, all = this.db.allTasks()) {
     const file = path.join(t.dir, '.claude', 'scheduled_tasks.json');
     let data;
     try { data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return; } // absent/corrupt → nothing to do
     const jobs = Array.isArray(data?.tasks) ? data.tasks : [];
     if (!jobs.length) return;
+    // Everyone else reading this same file. Empty for a worktree; not empty
+    // once several cards are pointed at one real project path.
+    const roommates = all.filter(o => o.task_id !== t.task_id && sameDir(o.dir, t.dir));
     let fired = false, changed = false;
     const kept = [];
     for (const job of jobs) {
       if (!job?.cron || !job?.prompt) { kept.push(job); continue; }
+      // Ahead of the expiry check on purpose: a card that doesn't own this
+      // job has no business deleting it out of a shared file either, nor
+      // announcing the deletion into its own conversation.
+      if (!this._ownsCronJob(t, job, roommates)) { kept.push(job); continue; }
       const key = `${t.task_id}:${job.id}`;
       // Mirror the CLI's own 7-day cap on recurring jobs — also what stops
       // a forgotten hourly job on an abandoned task from burning relay

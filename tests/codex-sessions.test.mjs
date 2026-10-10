@@ -8,6 +8,7 @@ import {
   countTranscriptLines,
   cwdOf,
   findExternalSessionFile,
+  forkSession,
   importExternalSession,
   lastAssistantUsage,
   lastUsage,
@@ -108,4 +109,57 @@ test('reads latest valid usage and safely finds and imports a rollout', t => {
   assert.equal(fs.readFileSync(imported, 'utf8'), fs.readFileSync(file, 'utf8'));
   assert.equal(importExternalSession(id, isolatedHome, f.sessions), true, 'import is idempotent');
   assert.equal(importExternalSession('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', isolatedHome, f.sessions), false);
+});
+
+// ---- forkSession ----
+// A fork has to look exactly like a rollout Codex created itself: filed under
+// today's date bucket, id in both the filename and the session_meta payload,
+// and cut only where a user turn starts so no function_call is left without
+// its output.
+const call = (id, name) => ({ type: 'response_item', payload: { type: 'function_call', call_id: id, name, arguments: '{}' } });
+const callOutput = id => ({ type: 'response_item', payload: { type: 'function_call_output', call_id: id, output: 'ok' } });
+
+test('forkSession: cuts at a user turn, rewrites the id in file name and session_meta', t => {
+  const f = fixture();
+  t.after(f.cleanup);
+  const source = f.writeRollout('22222222-2222-4222-8222-222222222222', [
+    meta(f.cwd),
+    message('user', '第一问'), call('c1', 'shell'), callOutput('c1'), message('assistant', '第一答'),
+    message('user', '第二问'), message('assistant', '第二答'),
+    message('user', '第三问'), message('assistant', '第三答'),
+  ]);
+
+  const newId = '33333333-3333-4333-8333-333333333333';
+  const result = forkSession({
+    sourceFile: source, newSessionId: newId, dropTrailingTurns: 1,
+    sessionsRoot: f.sessions, now: new Date('2026-09-09T07:12:33Z'),
+  });
+
+  assert.equal(result.keptTurns, 2);
+  assert.equal(result.anchorText, '第二问');
+  assert.equal(result.cwd, f.cwd);
+  assert.equal(result.file, path.join(f.sessions, '2026', '09', '09', `rollout-2026-09-09T07-12-33-${newId}.jsonl`));
+  // Findable by its new id — the thing `codex resume` actually depends on.
+  assert.equal(findExternalSessionFile(newId, f.sessions), result.file);
+
+  const lines = fs.readFileSync(result.file, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.equal(lines[0].payload.id, newId);
+  assert.equal(lines[0].payload.cwd, f.cwd, 'everything else in session_meta is passed through');
+  const events = transcriptToEvents(result.file);
+  assert.deepEqual(events.filter(e => e.role === 'user').map(e => e.content.text), ['第一问', '第二问']);
+  assert.equal(events.filter(e => e.role === 'tool_use').length, 1);
+  assert.equal(events.filter(e => e.role === 'tool_result').length, 1);
+  assert.ok(!events.some(e => e.content?.text === '第三问'));
+});
+
+test('forkSession: refuses to produce an empty branch', t => {
+  const f = fixture();
+  t.after(f.cleanup);
+  const source = f.writeRollout('44444444-4444-4444-8444-444444444444', [
+    meta(f.cwd), message('user', '只有一问'), message('assistant', '一答'),
+  ]);
+  assert.throws(() => forkSession({
+    sourceFile: source, newSessionId: '55555555-5555-4555-8555-555555555555',
+    dropTrailingTurns: 1, sessionsRoot: f.sessions,
+  }), /回合/);
 });

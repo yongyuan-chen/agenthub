@@ -3,32 +3,23 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { externalSessionHistoryPage, listExternalSessions, listExternalSessionsForPaths } from './sessions.mjs';
+import { backendFor } from './backends.mjs';
+import { cliState, cliVersions } from './cli-upgrade.mjs';
 import { listDir, readFile, writeFile } from './files.mjs';
 import { PROTOCOL_VERSION, EXECUTOR_FEATURES } from '../../shared/protocol.mjs';
 
-// Which agent CLIs this machine can actually run. Probed once per process
-// (spawning a `--version` on every reconnect would be wasteful and, on a
-// flapping connection, noisy) — installing a CLI while the daemon is running
-// needs a daemon restart to be noticed, which matches how claudeBin/codexBin
-// are already treated everywhere else.
-let _backendsCache = null;
+// Which agent CLIs this machine can actually run. The probe itself (and its
+// process-level cache) lives in cli-upgrade.mjs, since the same single
+// `--version` spawn answers both questions this node has to report: whether
+// a CLI is installed at all, and which version of it.
 export function availableBackends(config) {
-  if (_backendsCache) return _backendsCache;
-  const found = [];
-  for (const [name, bin] of [['claude', config.claudeBin || 'claude'], ['codex', config.codexBin || 'codex']]) {
-    // shell:true on Windows for the same .cmd-shim reason session.mjs spawns
-    // that way; `bin` comes from this node's own config file, never the wire.
-    const r = spawnSync(bin, ['--version'], { stdio: 'ignore', timeout: 10_000, shell: process.platform === 'win32' });
-    if (!r.error && r.status === 0) found.push(name);
-  }
   // An empty list is meaningful: this daemon cannot safely spawn either CLI.
   // Advertising Claude as a fallback made an unconfigured node accept work
-  // only to fail later with ENOENT. Restarting the daemon after installing a
-  // CLI re-runs this process-level probe.
-  _backendsCache = found;
-  return _backendsCache;
+  // only to fail later with ENOENT.
+  return Object.entries(cliState(config))
+    .filter(([, info]) => info.installed)
+    .map(([name]) => name);
 }
 
 // Prefix-completes a path into matching subdirectories, e.g. '/ho' -> ['/home'].
@@ -231,11 +222,23 @@ export class CloudLink {
       t: 'hello', nodeId: this.config.nodeId, tasks,
       protocolVersion: PROTOCOL_VERSION,
       backends: availableBackends(this.config),
+      // Same probe as `backends`, finer answer: which version of each. This
+      // is the durable path for version reporting — the live 'cli_versions'
+      // message below is only the fast one, and is simply lost if the socket
+      // is down when an upgrade finishes.
+      cliVersions: cliVersions(this.config),
       // Fine-grained capabilities the coarse protocol version can't express —
       // see EXECUTOR_FEATURES. Absent = an older node, which the cloud then
       // treats conservatively rather than refusing outright.
       features: EXECUTOR_FEATURES,
     });
+  }
+
+  // CLI inventory changed (an upgrade started, finished, or failed). Best
+  // effort: _send drops it when offline, and the next hello carries the same
+  // information anyway.
+  sendCliVersions({ versions, upgrades }) {
+    this._send({ t: 'cli_versions', versions, upgrades });
   }
 
   _onCloudMessage(msg) {
@@ -279,6 +282,13 @@ export class CloudLink {
         // rename must be backward-compatible rather than silently dropping it.
         const provider = msg.provider ?? msg.anthropic;
         if (provider) this.onCommand({ t: 'config', provider });
+        // Cloud-owned CLI policy, re-asserted on every reconnect for the same
+        // reason as the settings above: a one-shot push has no way to
+        // self-heal if it was missed. Absent for a not-yet-redeployed Worker,
+        // and an absent target upgrades nothing.
+        if (msg.cliLatest || 'cliAutoUpgrade' in msg) {
+          this.onCommand({ t: 'cli_policy', latest: msg.cliLatest ?? null, autoUpgrade: msg.cliAutoUpgrade });
+        }
         break;
       }
       case 'ack':
@@ -330,6 +340,30 @@ export class CloudLink {
           includeTools: msg.includeTools !== false,
         });
         this._send({ t: 'read_project_session_result', requestId: msg.requestId, ...page });
+        break;
+      }
+      // Branching a conversation. Answered here rather than in manager.mjs
+      // because it touches no live process: it's a pure read of the source
+      // task's transcript plus a write of the truncated copy. The cloud
+      // creates the actual task only after this succeeds, so a failure here
+      // must be reported rather than swallowed — otherwise it would create a
+      // conversation pointing at a session file that doesn't exist.
+      case 'fork_session': {
+        const task = this.db.getTask(msg.taskId);
+        try {
+          if (!task) throw new Error('这个节点上找不到源会话');
+          if (task.session_id !== msg.sessionId) throw new Error('源会话的 ID 已经变了,请刷新后重试');
+          const fork = backendFor(task).forkSession(this.config, task, {
+            dropTrailingTurns: msg.dropTrailingTurns ?? 0,
+            newSessionId: msg.newSessionId,
+          });
+          this._send({
+            t: 'fork_session_result', requestId: msg.requestId, ok: true,
+            sessionId: fork.sessionId, cwd: fork.cwd, keptTurns: fork.keptTurns, anchorText: fork.anchorText,
+          });
+        } catch (e) {
+          this._send({ t: 'fork_session_result', requestId: msg.requestId, ok: false, error: e.message });
+        }
         break;
       }
       default:

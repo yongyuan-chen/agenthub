@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { externalSessionHistory, externalSessionHistoryPage, listExternalSessions, listExternalSessionsForPaths, importExternalSession, transcriptToEvents } from '../packages/executor/src/sessions.mjs';
+import { externalSessionHistory, externalSessionHistoryPage, listExternalSessions, listExternalSessionsForPaths, importExternalSession, transcriptToEvents, forkSession } from '../packages/executor/src/sessions.mjs';
 
 function makeProjectsRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'ah-claude-projects-'));
@@ -448,4 +448,59 @@ test('importExternalSession: with a targetCwd, lands in the folder matching *tha
 
   const genericImportedFolder = path.join(workRoot, 'claude-config', 'projects', 'imported', 'ext-session-2.jsonl');
   assert.ok(!fs.existsSync(genericImportedFolder), 'should not also land in the generic "imported" folder');
+});
+
+// ---- forkSession: branching a conversation ----
+// The whole feature rests on this producing a *resumable* file: same shape,
+// same project folder as a real session, cut only where a new user turn
+// starts. A cut anywhere else (between a tool_use and its tool_result) makes
+// a context the API rejects outright.
+const turn = (userText, { toolId = null } = {}) => [
+  { type: 'user', message: { content: userText } },
+  ...(toolId ? [
+    { type: 'assistant', message: { content: [{ type: 'tool_use', id: toolId, name: 'Read', input: {} }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: toolId, content: 'ok' }] } },
+  ] : []),
+  { type: 'assistant', message: { content: [{ type: 'text', text: `回答:${userText}` }] } },
+];
+
+test('forkSession: keeps whole turns, rewrites the session id and lands in the cwd\'s project folder', () => {
+  const root = makeProjectsRoot();
+  const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ah-fork-cwd-')));
+  const sourceFile = writeSession(path.join(root, 'whatever-slug'), 'src-session', [
+    { type: 'system', subtype: 'init', sessionId: 'src-session' },
+    ...turn('第一问', { toolId: 'tool-1' }),
+    ...turn('第二问'),
+    ...turn('第三问'),
+  ], Date.now());
+
+  const result = forkSession({ sourceFile, cwd, newSessionId: 'branch-1', dropTrailingTurns: 1, projectsRoot: root });
+
+  assert.equal(result.keptTurns, 2);
+  assert.equal(result.anchorText, '第二问');
+  assert.equal(result.file, path.join(root, cwd.replace(/[^a-zA-Z0-9]/g, '-'), 'branch-1.jsonl'));
+
+  const forked = fs.readFileSync(result.file, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.deepEqual(forked.map(e => e.sessionId), forked.map(() => 'branch-1'), 'every entry now points at the branch');
+  const events = transcriptToEvents(result.file);
+  assert.deepEqual(events.filter(e => e.role === 'user').map(e => e.content.text), ['第一问', '第二问']);
+  // The dropped turn is gone, and the kept turn's tool call still has its result.
+  assert.ok(!events.some(e => e.content?.text === '第三问'));
+  assert.equal(events.filter(e => e.role === 'tool_use').length, 1);
+  assert.equal(events.filter(e => e.role === 'tool_result').length, 1);
+});
+
+test('forkSession: dropTrailingTurns 0 copies everything; dropping every turn is refused', () => {
+  const root = makeProjectsRoot();
+  const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ah-fork-cwd-')));
+  const sourceFile = writeSession(path.join(root, 'slug'), 'src', [...turn('只有一问')], Date.now());
+
+  const whole = forkSession({ sourceFile, cwd, newSessionId: 'branch-whole', dropTrailingTurns: 0, projectsRoot: root });
+  assert.equal(whole.keptTurns, 1);
+  assert.equal(fs.readFileSync(whole.file, 'utf8').split('\n').filter(Boolean).length, 2);
+
+  // An empty branch would be a conversation the agent can't resume at all —
+  // better to fail loudly than to create one.
+  assert.throws(() => forkSession({ sourceFile, cwd, newSessionId: 'branch-empty', dropTrailingTurns: 1, projectsRoot: root }), /回合/);
+  assert.ok(!fs.existsSync(path.join(root, cwd.replace(/[^a-zA-Z0-9]/g, '-'), 'branch-empty.jsonl')));
 });

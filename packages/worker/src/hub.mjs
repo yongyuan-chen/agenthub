@@ -2,6 +2,7 @@
 // API), serializes all D1 writes, runs the heartbeat alarm. Logic lives in
 // hub-core.mjs; this class only binds infrastructure.
 import * as core from './hub-core.mjs';
+import { refreshCliVersions } from './cli-releases.mjs';
 import { pushAll } from './push.mjs';
 import { sha256Hex, ulid } from '../../shared/protocol.mjs';
 
@@ -85,6 +86,11 @@ export class Hub {
         fileSize: r.fileSize ?? null, fileMtime: r.fileMtime ?? null,
         hiddenDetailCount: r.hiddenDetailCount ?? 0, hasMore: !!r.hasMore, stale: !!r.stale,
       } : null)),
+      // Same generous timeout as readFile, and for the same reason: this
+      // reads a transcript that can run to tens of megabytes.
+      forkSession: (nodeId, taskId, sessionId, dropTrailingTurns, newSessionId) => this.askNode(nodeId, {
+        t: 'fork_session', taskId, sessionId, dropTrailingTurns, newSessionId,
+      }, 20_000),
     };
   }
 
@@ -214,6 +220,7 @@ export class Hub {
           try { ws.send(JSON.stringify({ t: 'hb_ack' })); } catch { /* socket's already dead, next hb cycle's watchdog will catch it */ }
         }
         else if (msg.t === 'ev') await core.absorbEvent(ctx, att.nodeId, msg);
+        else if (msg.t === 'cli_versions') await core.handleCliVersions(ctx, att.nodeId, msg);
       } catch (e) {
         console.error('hub message error:', e.stack || e.message);
       }
@@ -247,6 +254,21 @@ export class Hub {
     // reconnect to hang the retry off, so the timer is what makes delivery
     // eventually happen instead of eventually not.
     await core.flushOutboundMessages(this.ctx(), null, { minAgeMs: OUTBOUND_RETRY_MIN_AGE_MS });
+    // Where the fleet learns that a new agent-CLI release exists. This runs on
+    // the 30s alarm but refreshCliVersions rate-limits itself to once an hour,
+    // so the usual cost is one D1 read; only a real change pushes anything.
+    // Wrapped because a registry hiccup must not skip the alarm reschedule
+    // below — losing the alarm would stop heartbeat checks and redelivery too.
+    const nodeIds = [...new Set(this.state.getWebSockets('node')
+      .map(ws => (ws.deserializeAttachment() || {}).nodeId).filter(Boolean))];
+    if (nodeIds.length) {
+      try {
+        const { versions, changed } = await refreshCliVersions(this.env.DB);
+        if (changed) await core.pushCliPolicy(this.ctx(), nodeIds, versions);
+      } catch (e) {
+        console.error('cli release refresh failed:', e.stack || e.message);
+      }
+    }
     // Keep ticking while anything is still undelivered even if no node is
     // connected — otherwise a message queued for an offline node would sit
     // untouched (never retried, never timed out) until unrelated traffic

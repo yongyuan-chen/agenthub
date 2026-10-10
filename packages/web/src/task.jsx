@@ -1,7 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api.js';
 import {
-  state, taskMessages, addMessage, bump, taskPendingMessages, setPendingMessages, upsertPendingMessage,
+  state, taskMessages, addMessage, setMessageWindow, bump, taskPendingMessages, setPendingMessages, upsertPendingMessage,
   isTaskUnread, setTaskSeen,
 } from './store.js';
 import { renderMarkdown } from './md.js';
@@ -24,6 +24,23 @@ function newClientMessageId() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
   return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
+
+// How much of a conversation is on screen when you open it, and how much one
+// scroll-up adds. Opening used to fetch and render the entire log: a long
+// autonomous run is thousands of messages, so the pane spent seconds
+// downloading (and the browser laying out) history nobody asked to see just to
+// show the last exchange. Everything older is still there, one scroll away.
+const TAIL_PAGE = 60;
+const OLDER_PAGE = 60;
+// Distance from the top at which the next older page starts loading, so it is
+// usually already there by the time the user scrolls into it.
+const LOAD_OLDER_AT = 400;
+// How long a jump to the bottom keeps re-asserting itself while the rows below
+// are still growing into their real heights — see scrollToBottom. Long enough
+// to outlast content-visibility laying out a tall history plus its inline
+// images decoding, short enough that a reader who changes their mind is not
+// held for a noticeable time (and a deliberate scroll cancels it outright).
+const PIN_SETTLE_MS = 1200;
 
 // GET /api/tasks/:id/messages is capped at 1000 per request — a
 // long-running (especially autonomous/bypassPermissions) conversation can
@@ -496,10 +513,22 @@ function ModelChip({ task, isCreator }) {
   );
 }
 
-function DiffView({ messages }) {
+// The diff is read off the newest 'diff' message, which a turn emits after it
+// ends — so it normally sits in the loaded tail of the conversation. hasOlder
+// covers the case where it doesn't: say so instead of claiming there are no
+// changes at all.
+function DiffView({ messages, hasOlder = false, onLoadOlder = null }) {
   const diffMsg = [...messages].reverse().find(m => m.role === 'diff');
   const patch = diffMsg?.content?.patch;
   const files = useMemo(() => splitPatch(patch), [patch]);
+  if (!diffMsg && hasOlder) {
+    return (
+      <div className="empty">
+        已加载的这段对话里没有 diff — 更早的历史还没加载
+        {onLoadOlder && <> · <button type="button" className="ghost" onClick={onLoadOlder}>加载更早消息</button></>}
+      </div>
+    );
+  }
   if (!diffMsg) return <div className="empty">还没有变更(任务完成一轮后会生成 diff)</div>;
   const { stat } = diffMsg.content;
   return (
@@ -619,7 +648,7 @@ function PendingMessage({ pending, canRetry, onRetry, onImageClick }) {
 // durable (a row in outbound_messages) but has not been handed to the agent
 // yet, which is the entire point: until the turn ends it can still be
 // rewritten or taken back.
-function QueuedMessage({ pending, canEdit, onEdit, onCancel, onSendNow }) {
+function QueuedMessage({ pending, canEdit, waitingDecision, onEdit, onCancel, onSendNow }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(pending.text || '');
   const [menuOpen, setMenuOpen] = useState(false);
@@ -664,12 +693,42 @@ function QueuedMessage({ pending, canEdit, onEdit, onCancel, onSendNow }) {
           </span>
         )}
       </div>
-      <div className="muted queued-msg-note">当前回合结束后自动发送</div>
+      <div className="muted queued-msg-note">
+        {waitingDecision
+          ? '等你决定上面的权限请求、这一轮跑完后自动发送'
+          : '当前回合结束后自动发送'}
+      </div>
     </div>
   );
 }
 
-export function Message({ task, msg, resultByToolId, isCreator, onImageClick }) {
+// Hover-revealed toolbar under an assistant reply. Only ever one action so
+// far; it lives in its own component for the busy state, since forking a big
+// transcript on the node takes a visible moment.
+function MessageActions({ onBranch }) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="msg-actions">
+      <button
+        type="button" className="ghost" disabled={busy}
+        title="以这条回复为止的上下文开一个新对话,原对话保持不变"
+        onClick={async () => { setBusy(true); try { await onBranch(); } finally { setBusy(false); } }}
+      >{busy ? '分支中…' : '⑂ 分支到新对话'}</button>
+    </div>
+  );
+}
+
+async function branchFrom(taskId, seq) {
+  try {
+    const r = await api.branchTask(taskId, seq);
+    // Warnings are advisory, not failures (shared working directory, a branch
+    // point the node cut slightly differently) — say them once, then go.
+    if (r.warnings?.length) alert(r.warnings.join('\n\n'));
+    location.hash = '#/task/' + r.task.id;
+  } catch (e) { alert(e.message); }
+}
+
+export function Message({ task, msg, resultByToolId, isCreator, onImageClick, canBranch = false }) {
   switch (msg.role) {
     case 'user':
       return (
@@ -681,7 +740,14 @@ export function Message({ task, msg, resultByToolId, isCreator, onImageClick }) 
         </div>
       );
     case 'assistant':
-      return <div className="msg-row assistant"><div className="msg-col"><Md text={msg.content.text} /></div></div>;
+      return (
+        <div className="msg-row assistant">
+          <div className="msg-col">
+            <Md text={msg.content.text} />
+            {canBranch && msg.seq && <MessageActions onBranch={() => branchFrom(task.id, msg.seq)} />}
+          </div>
+        </div>
+      );
     case 'thinking':
       return <ThinkingRow msg={msg} />;
     case 'tool_use':
@@ -712,6 +778,9 @@ export function ConversationMessages({ messages, task = null, isCreator = false,
     return map;
   }, [messages]);
   const groups = useMemo(() => groupForToolChains(messages), [messages]);
+  // Branching needs a live task to fork from and creator rights to do it; the
+  // read-only history viewer reuses this component and has neither.
+  const canBranch = !!task && !staticHistory && isCreator;
   return (
     <>
       {groups.map(group => group.type === 'chain'
@@ -719,7 +788,7 @@ export function ConversationMessages({ messages, task = null, isCreator = false,
             key={messageKey(group.msgs[0])} resultByToolId={resultByToolId} defaultOpen={!staticHistory && !group.done}
             toolUses={group.msgs.filter(message => message.role === 'tool_use')}
           />
-        : <Message key={messageKey(group.msg)} task={task} msg={group.msg} resultByToolId={resultByToolId} isCreator={isCreator} onImageClick={onImageClick} />)}
+        : <Message key={messageKey(group.msg)} task={task} msg={group.msg} resultByToolId={resultByToolId} isCreator={isCreator} onImageClick={onImageClick} canBranch={canBranch} />)}
       {!messages.length && !hideEmpty && <div className="empty">暂无消息</div>}
     </>
   );
@@ -768,10 +837,22 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
   const [showSessionPicker, setShowSessionPicker] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
+  const [hasOlder, setHasOlder] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const listRef = useRef(null);
   const loadedRef = useRef(false);
   const firstPinRef = useRef(false);
   const suppressScrollUntilRef = useRef(0);
+  const loadingOlderRef = useRef(false);
+  // Pending frame of the settle loop that holds the list at the bottom.
+  const pinFrameRef = useRef(0);
+  // Bumped on every task switch so a page that lands after the pane moved on
+  // can't push another conversation's messages into this one.
+  const loadGenerationRef = useRef(0);
+  // Scroll position captured just before an older page is prepended.
+  const preserveRef = useRef(null);
+  // See onScroll: one auto-load per approach to the top of the list.
+  const autoLoadArmedRef = useRef(true);
   // Synchronous guard, separate from the `busy` state — setBusy(true) alone
   // doesn't take effect until the next render, so Enter-to-send's direct
   // send() call and the button's onSubmit-triggered send() can both pass the
@@ -804,14 +885,66 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
     return () => { cancelled = true; document.removeEventListener('visibilitychange', mark); };
   }, [taskId, attentionAt]);
 
+  // Opening loads the newest page only; loadOlder walks up from there.
   useEffect(() => {
     loadedRef.current = false;
+    loadGenerationRef.current++;
     let cancelled = false;
-    fetchAllMessagesSince(taskId, 0, () => cancelled)
+    api.messagesBefore(taskId, 0, TAIL_PAGE)
+      .then(r => {
+        if (cancelled) return;
+        setMessageWindow(taskId, r.messages);
+        setPendingMessages(taskId, r.pending);
+        setHasOlder(!!r.hasMore);
+      })
       .catch(() => {})
       .then(() => { if (!cancelled) { loadedRef.current = true; bump(); } });
     return () => { cancelled = true; };
   }, [taskId]);
+
+  // The row the reader is actually looking at — the first one reaching into the
+  // viewport — so the layout effect below can put it back where it was after a
+  // page is prepended above it. Deliberately an *element* rather than a
+  // scrollHeight delta: .chat-list rows use content-visibility, so off-screen
+  // rows report an estimated height and the total can even shrink as rows are
+  // added. Measuring one on-screen node, whose real height is known both
+  // before and after, is exact. The "加载更早消息" row is skipped because it
+  // stays above the new messages and would report no movement at all — which,
+  // when the reader is at the very top, left them still at the very top and
+  // cascaded into loading the entire history one scroll at a time.
+  const captureScrollAnchor = () => {
+    const el = listRef.current;
+    if (!el) return null;
+    const top = el.getBoundingClientRect().top;
+    const node = [...el.children]
+      .filter(child => !child.classList.contains('history-page-actions'))
+      .find(child => child.getBoundingClientRect().bottom > top + 1);
+    return node ? { node, offset: node.getBoundingClientRect().top - top } : null;
+  };
+
+  // Scrolling up (or the button at the top of the list) walks one page further
+  // back.
+  const loadOlder = async () => {
+    if (!hasOlder || loadingOlderRef.current) return;
+    const known = taskMessages(taskId);
+    if (!known.length) return;
+    const generation = loadGenerationRef.current;
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+    preserveRef.current = captureScrollAnchor();
+    try {
+      const r = await api.messagesBefore(taskId, known[0].seq, OLDER_PAGE);
+      if (generation !== loadGenerationRef.current) { preserveRef.current = null; return; }
+      for (const m of r.messages) addMessage(taskId, m);
+      setHasOlder(!!r.hasMore);
+      bump();
+    } catch {
+      preserveRef.current = null;
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlder(false);
+    }
+  };
 
   // WS reconnected: backfill anything missed while disconnected/locked.
   // Debounced — a real mobile connection can flap (weak signal, network
@@ -834,21 +967,78 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
     return () => { cancelled = true; clearTimeout(timer); };
   }, [wsConnected, taskId]);
 
-  // .chat-list has scroll-behavior:smooth and its rows use content-visibility
-  // (heights get (re)measured as they're laid out), so a single scrollTop
-  // assignment can take a few hundred ms — or longer, for a long imported
-  // history — to actually settle, firing several intermediate 'scroll'
-  // events along the way. onScroll reading those as "far from bottom" was
-  // flipping the new-message banner on for a jump the page itself triggered.
-  // Scroll events for a window after *our own* assignment (long enough to
-  // cover a long animated scroll, not just a short one) are not real user
-  // scrolling and must not be read as one.
-  const scrollToBottom = (behavior) => {
-    const el = listRef.current;
-    if (!el) return;
-    suppressScrollUntilRef.current = Date.now() + (behavior === 'smooth' ? 1500 : 300);
-    el.scrollTo({ top: el.scrollHeight, behavior });
+  const cancelPin = () => {
+    if (!pinFrameRef.current) return;
+    cancelAnimationFrame(pinFrameRef.current);
+    pinFrameRef.current = 0;
   };
+  useEffect(() => cancelPin, []);
+
+  // Going to the bottom can't be a single assignment. .chat-list rows use
+  // content-visibility, so an off-screen row reports contain-intrinsic-size's
+  // fallback height rather than its real one until the browser lays it out —
+  // and on a freshly mounted pane not one of them has a remembered size to
+  // fall back to instead. Switching projects swaps the whole pane set, so
+  // coming back to a conversation is always that fresh mount: scrollHeight
+  // right then is a large under-estimate, jumping to it strands the reader
+  // mid-history, the rows below grow to their real heights, and since
+  // scrollTop itself never moved, no scroll event ever fires to notice. So
+  // hold the bottom across the frames it takes for the heights to settle
+  // (which covers rows that grow late for other reasons too — inline images
+  // decoding, fonts), re-issuing the scroll only when the height actually
+  // changed: re-targeting a smooth scroll mid-flight is fine, but re-issuing
+  // it every frame would fight the animation it just started.
+  const scrollToBottom = (behavior) => {
+    if (!listRef.current) return;
+    cancelPin();
+    const until = Date.now() + PIN_SETTLE_MS;
+    let lastHeight = -1;
+    const step = () => {
+      pinFrameRef.current = 0;
+      const el = listRef.current;
+      if (!el) return;
+      if (el.scrollHeight !== lastHeight) {
+        lastHeight = el.scrollHeight;
+        // .chat-list has scroll-behavior:smooth and rows still being
+        // measured, so one assignment takes a few hundred ms — or longer, for
+        // a long imported history — to actually settle, firing several
+        // intermediate 'scroll' events along the way. onScroll reading those
+        // as "far from bottom" was flipping the new-message banner on for a
+        // jump the page itself triggered. Scroll events for a window after
+        // *our own* assignment (long enough to cover a long animated scroll,
+        // not just a short one) are not real user scrolling and must not be
+        // read as one.
+        suppressScrollUntilRef.current = Date.now() + (behavior === 'smooth' ? 1500 : 300);
+        el.scrollTo({ top: lastHeight, behavior });
+      }
+      if (Date.now() < until) pinFrameRef.current = requestAnimationFrame(step);
+    };
+    step(); // first pass synchronous — the jump itself must not wait a frame
+  };
+
+  // Puts the viewport back on the message the reader was looking at after an
+  // older page is prepended above it. Runs before the pin-to-bottom effect
+  // below (layout effects go first), which skips anyway: you can only be
+  // loading older messages while scrolled away from the bottom.
+  useLayoutEffect(() => {
+    const preserve = preserveRef.current;
+    const el = listRef.current;
+    if (!preserve || !el) return;
+    preserveRef.current = null;
+    if (!preserve.node.isConnected) return; // the anchor row is gone (task switched, window dropped)
+    const moved = (preserve.node.getBoundingClientRect().top - el.getBoundingClientRect().top) - preserve.offset;
+    if (!moved) return;
+    // A page prepended above changes the height, which is exactly what a
+    // still-running settle loop reads as "keep chasing the bottom" — and
+    // being at the bottom is not where someone loading older messages wants
+    // to be put.
+    cancelPin();
+    // 'instant' overrides .chat-list's scroll-behavior:smooth — the point is
+    // to stay where we already were, not to animate a jump there.
+    suppressScrollUntilRef.current = Date.now() + 300;
+    el.scrollTo({ top: el.scrollTop + moved, behavior: 'instant' });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages.length]);
 
   useEffect(() => {
     // Nothing loaded yet: skip entirely, so firstPinRef isn't consumed by
@@ -868,6 +1058,17 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
     if (!el) return;
     if (Date.now() < suppressScrollUntilRef.current) return;
     setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 60);
+    // Checked after the suppression window on purpose: the intermediate events
+    // of our own smooth jump to the bottom start out near the top, and reading
+    // those as "the user scrolled up" would fetch history nobody asked for.
+    //
+    // One page per approach to the top, re-armed by scrolling back away from
+    // it. A single scroll gesture is a long stream of events, and .chat-list
+    // scrolls smoothly, so "load whenever we're near the top" fires dozens of
+    // times over one animation — measured in a browser: one scroll-to-top
+    // pulled five pages, i.e. most of the history the paging exists to avoid.
+    if (el.scrollTop > LOAD_OLDER_AT) autoLoadArmedRef.current = true;
+    else if (autoLoadArmedRef.current) { autoLoadArmedRef.current = false; loadOlder(); }
   };
 
   if (!taskId || !task) return null;
@@ -1027,7 +1228,26 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
 
       {tab === 'chat' && (
         <>
-          <div className="chat-list" ref={listRef} onScroll={onScroll}>
+          {/* Reaching for the list during the settle window means the reader
+              wants to be somewhere other than the bottom — stop holding them
+              there. onScroll can't stand in for this: the settle loop's own
+              assignments produce scroll events too, and these two are the
+              gestures only a person can produce. */}
+          <div
+            className="chat-list" ref={listRef} onScroll={onScroll}
+            onWheel={cancelPin} onTouchMove={cancelPin}
+          >
+            {/* Scrolling up loads this by itself; the button is what that
+                looks like while it happens, and the way out if the automatic
+                trigger can't fire (a list too short to scroll, a failed
+                page the user wants to retry). */}
+            {hasOlder && (
+              <div className="history-page-actions">
+                <button type="button" className="ghost" onClick={loadOlder} disabled={loadingOlder}>
+                  {loadingOlder ? '正在加载更早消息…' : '加载更早消息'}
+                </button>
+              </div>
+            )}
             <ConversationMessages
               messages={messages} task={task} isCreator={isCreator} onImageClick={setLightboxSrc}
               hideEmpty={pendingMessages.length > 0}
@@ -1107,6 +1327,7 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
               {queuedMessages.map(pending => (
                 <QueuedMessage
                   key={pending.clientMessageId} pending={pending} canEdit={isCreator}
+                  waitingDecision={task.status === 'waiting_human'}
                   onEdit={editQueued} onCancel={cancelQueued} onSendNow={sendQueuedNow}
                 />
               ))}
@@ -1153,7 +1374,7 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
         </>
       )}
 
-      {tab === 'diff' && <div className="tab-scroll"><DiffView messages={messages} /></div>}
+      {tab === 'diff' && <div className="tab-scroll"><DiffView messages={messages} hasOlder={hasOlder} onLoadOlder={loadOlder} /></div>}
 
       {tab === 'info' && (
         <div className="tab-scroll info-view">
@@ -1162,7 +1383,12 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
             <dt>会话 ID</dt><dd><code>{task.session_id || '—'}</code></dd>
             <dt>节点</dt><dd>{task.node_id}</dd>
             <dt>仓库</dt><dd>{task.repo_url || '(无,scratch 目录)'}</dd>
-            <dt>分支</dt><dd>{task.branch_name || `task/${task.id}`} ← {task.base_branch || '(自动识别)'}</dd>
+            {/* No branch_name means no worktree was made: the agent works
+                directly in the directory above. Showing a `task/<id>` branch
+                there would be inventing one that does not exist. */}
+            <dt>分支</dt><dd>{task.branch_name
+              ? <>{task.branch_name} ← {task.base_branch || '(自动识别)'}</>
+              : '— 直接在该目录工作,不建分支'}</dd>
             <dt>权限模式</dt><dd>{task.permission_mode}{task.permission_mode === 'bypassPermissions' && ' ⚠️'}</dd>
             <dt>当前模型</dt><dd><ModelChip task={task} isCreator={isCreator} /></dd>
             {!!task.auto_decide_all && (

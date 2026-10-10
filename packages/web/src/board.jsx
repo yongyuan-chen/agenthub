@@ -8,6 +8,7 @@ import {
 import { state, bump, taskInScope } from './store.js';
 import { ModalBackdrop } from './modal.jsx';
 import { fmtAge } from './format.js';
+import { isOutdated } from '../../shared/protocol.mjs';
 
 // The install command plus the AI-assist fallback. Shared by the "add node"
 // modal and the first-run wizard so both stay in step — onboarding is exactly
@@ -120,6 +121,115 @@ function NodeRepairGuide({ node }) {
         <li>或只重启守护进程:<code>{repair.restart}</code></li>
         <li>执行后约 1 分钟内,这里的圆点应变绿;仍离线时查看日志:<code>{repair.logs}</code>,把最后几行发给管理员。</li>
       </ol>
+    </div>
+  );
+}
+
+const CLI_LABELS = { claude: 'Claude Code', codex: 'Codex' };
+
+// Is any CLI on this node behind the published release? Used both by the
+// version panel below and by the sidebar's ⬆ marker, so the two can't disagree
+// about which nodes need attention.
+export function nodeCliOutdated(node) {
+  const versions = node?.cliVersions || {};
+  return Object.keys(versions).some(b => isOutdated(versions[b], state.cliLatest?.[b]));
+}
+
+// Per-node agent-CLI versions, and the controls to move them forward.
+//
+// This exists because a stale CLI is invisible until it isn't: the daemon is
+// online, the node takes work, and then a task fails with a 400 from the model
+// API about a request body AgentHub never built (see cli-upgrade.mjs). Showing
+// 当前版本 → 最新版本 makes "this machine is two hundred releases behind" a
+// thing you can see instead of something you deduce from a broken task.
+function NodeCliPanel({ node, isMine }) {
+  const [busy, setBusy] = useState('');
+  const [err, setErr] = useState('');
+  const latest = state.cliLatest || {};
+  const versions = node.cliVersions || {};
+  const upgrades = node.cliUpgrades || {};
+  const autoOn = node.autoUpgradeCli !== false;
+
+  // A node running an AgentHub old enough to predate this feature reports
+  // nothing. It also has no handler for 'upgrade_cli', so there are no
+  // controls to offer — just say why it's blank. Its own self-update fixes it.
+  if (!Object.keys(versions).length) {
+    return <div className="node-cli-panel"><span className="muted">CLI 版本:等待节点上报(节点自更新到新版后自动出现)</span></div>;
+  }
+
+  const upgrade = async (backend) => {
+    setBusy(backend); setErr('');
+    try {
+      await api.upgradeNodeCli(node.id, backend);
+      // The real state arrives as a 'node' broadcast the moment the daemon
+      // starts (or queues) the installer — this is just so the click has an
+      // immediate effect even if the node is mid-turn and takes a while.
+      state.nodes.set(node.id, {
+        ...node, cliUpgrades: { ...upgrades, [backend]: { state: 'pending' } },
+      });
+      bump();
+    } catch (e) { setErr(e.message); }
+    setBusy('');
+  };
+
+  const toggleAuto = async (enabled) => {
+    setBusy('auto'); setErr('');
+    try {
+      await api.setNodeAutoUpgrade(node.id, enabled);
+      state.nodes.set(node.id, { ...node, autoUpgradeCli: enabled });
+      bump();
+    } catch (e) { setErr(e.message); }
+    setBusy('');
+  };
+
+  return (
+    <div className="node-cli-panel">
+      {Object.keys(versions).map((backend) => {
+        const cur = versions[backend];
+        const target = latest[backend];
+        const up = upgrades[backend];
+        const behind = isOutdated(cur, target);
+        const inFlight = up?.state === 'running' || up?.state === 'pending';
+        // A failure from before a successful upgrade is history, not a
+        // problem — only surface it while this CLI is actually still behind.
+        const failed = up?.state === 'failed' && (behind || !cur);
+        let chip = { cls: 'st-done', text: '最新' };
+        if (up?.state === 'running') chip = { cls: 'st-running', text: '升级中…' };
+        else if (up?.state === 'pending') chip = { cls: 'st-queued', text: '排队中(等节点空闲)' };
+        else if (failed) chip = { cls: 'st-failed', text: '升级失败' };
+        else if (behind) chip = { cls: 'st-waiting', text: '可升级' };
+        else if (!cur) chip = { cls: 'st-queued', text: '版本未知' };
+        else if (!target) chip = { cls: 'st-queued', text: '已安装' };
+        return (
+          <div className="node-cli-row" key={backend}>
+            <span className="node-cli-name">{CLI_LABELS[backend] || backend}</span>
+            <span className="node-cli-ver">
+              {cur || '版本未知'}
+              {behind && <> <span className="node-cli-arrow">→</span> <b>{target}</b></>}
+            </span>
+            <span className={`chip ${chip.cls}`}>{chip.text}</span>
+            {isMine && (behind || !cur) && !inFlight && (
+              <button
+                type="button" className="ghost repair-toggle" disabled={busy === backend}
+                onClick={() => upgrade(backend)}
+              >
+                {busy === backend ? '发送中…' : '立即升级'}
+              </button>
+            )}
+            {failed && up.error && <span className="node-cli-error" title={up.error}>{up.error}</span>}
+          </div>
+        );
+      })}
+      {isMine && (
+        <label className="row-inline node-cli-auto">
+          <input
+            type="checkbox" checked={autoOn} disabled={busy === 'auto'}
+            onChange={e => toggleAuto(e.target.checked)}
+          />
+          自动升级(节点空闲时自动升到最新版)
+        </label>
+      )}
+      {err && <div className="err">{err}</div>}
     </div>
   );
 }
@@ -291,6 +401,7 @@ export function NodeManageModal({ user, onClose }) {
                   ) : <span className="muted">非你所有,无法管理</span>}
                 </div>
                 {isMine && n.status !== 'online' && repairId === n.id && <NodeRepairGuide node={n} />}
+                <NodeCliPanel node={n} isMine={isMine} />
                 </React.Fragment>
               );
             })}

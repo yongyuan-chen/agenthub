@@ -33,6 +33,18 @@ function detectDefaultBranch(repoDir) {
   return null;
 }
 
+// Is this a directory AgentHub itself made (a scratch dir or a worktree under
+// workRoot), or a real project directory the user pointed a task at? Only the
+// former may be touched with mutating git commands — see manager.mjs's
+// _publishDiff, which collects no diff at all in a user directory rather than
+// running `git add -A` inside someone's actual working repo.
+export function isManagedDir(config, dir) {
+  if (!dir || !config?.workRoot) return false;
+  const root = path.resolve(config.workRoot);
+  const resolved = path.resolve(dir);
+  return resolved === root || resolved.startsWith(root + path.sep);
+}
+
 export async function prepareWorkspace(config, task) {
   if (!task.repoUrl) {
     const dir = path.join(config.workRoot, 'scratch', task.taskId);
@@ -40,29 +52,29 @@ export async function prepareWorkspace(config, task) {
     if (!fs.existsSync(path.join(dir, '.git'))) git(dir, 'init', '-q');
     return { dir, branchName: null };
   }
+  // A path that already exists on this machine *is* the workspace — used
+  // exactly as given, with no clone, no worktree, no branch, and no git
+  // command of any kind. The agent works in the user's real directory and
+  // the file browser (which resolves a taskId to this same dir) shows that
+  // real path, which is the whole point: the isolated-worktree flow left the
+  // board reporting a repo of C:\...\Desktop\quant\quant while every file it
+  // opened came from C:\...\agenthub\wt-<taskId>, an unrelated clone of the
+  // default branch that never saw the user's uncommitted work.
+  // Deliberately not conditional on the directory being a git repo: whether
+  // the project is version-controlled is the user's business, not a thing
+  // that should change where their agent runs.
+  let stat;
+  try { stat = fs.statSync(task.repoUrl); } catch { stat = null; }
+  if (stat?.isDirectory()) return { dir: task.repoUrl, branchName: null };
+  // Only a genuine remote (or a file:// URL) reaches here: nothing local to
+  // work in, so a clone is the only option and an isolated worktree per task
+  // costs nothing. A failure here is a real failure — bad URL, auth,
+  // network — and must surface rather than silently degrade.
   const repoKey = createHash('sha256').update(task.repoUrl).digest('hex').slice(0, 12);
   const repoDir = path.join(config.workRoot, 'repos', repoKey);
   if (!fs.existsSync(path.join(repoDir, '.git'))) {
     fs.mkdirSync(path.dirname(repoDir), { recursive: true });
-    try {
-      await execFileP('git', ['clone', task.repoUrl, repoDir], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-    } catch (e) {
-      // `git clone <local-path>` only ever works when that path is itself a
-      // git repo — but pointing at a plain project folder (no .git at all)
-      // to just work in directly is completely reasonable and was silently
-      // unsupported (found live: a Windows path to a non-git folder failed
-      // with "does not appear to be a git repository", surfaced to the user
-      // as an opaque "workspace: Command failed" task failure). Fall back to
-      // operating directly in it, same philosophy manager.mjs's
-      // session-resume path already uses for an arbitrary local directory —
-      // but only when the source really is a local dir; a genuine remote
-      // clone failure (bad URL, auth, network) must still surface as an
-      // error rather than silently degrading.
-      let stat;
-      try { stat = fs.statSync(task.repoUrl); } catch { stat = null; }
-      if (stat?.isDirectory()) return { dir: task.repoUrl, branchName: null };
-      throw e;
-    }
+    await execFileP('git', ['clone', task.repoUrl, repoDir], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   } else {
     try { await gitAsync(repoDir, 'fetch', '--all', '-q'); } catch { /* offline: use local state */ }
   }
