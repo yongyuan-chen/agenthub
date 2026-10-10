@@ -9,9 +9,11 @@ import { STATUS_META } from './board.jsx';
 import { fmtAge, fmtDuration } from './format.js';
 import { RUNNING_STATUSES, useElapsed } from './elapsed.js';
 import { SessionPicker } from './sessionpicker.jsx';
+import { SubagentPanel } from './subagents.jsx';
+import { SPAWN_TOOL_NAMES, isSubagentInternal } from './subagent-tree.js';
 import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
 
-function Md({ text }) {
+export function Md({ text }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
 }
@@ -75,6 +77,10 @@ async function fetchAllMessagesSince(taskId, after, isCancelled) {
 
 function toolSummary(name, input) {
   if (!input) return name;
+  // A subagent spawn: its description is the name it goes by in the 子代理 tab.
+  if (SPAWN_TOOL_NAMES.has(name) && input.description) {
+    return input.subagent_type ? `${input.subagent_type} · ${input.description}` : input.description;
+  }
   if (input.command) return String(input.command).slice(0, 120);
   if (input.file_path) return input.file_path;
   if (input.pattern) return input.pattern;
@@ -135,7 +141,7 @@ function toolBody(name, input, result) {
   return null;
 }
 
-function ToolUseRow({ msg, result }) {
+export function ToolUseRow({ msg, result }) {
   const [open, setOpen] = useState(false);
   const { name, input } = msg.content;
   const isErr = result?.content?.is_error;
@@ -480,7 +486,10 @@ function ModelChip({ task, isCreator }) {
   // there's nothing to be incompatible with.
   const backend = task.backend || (profile ? (profile.backend || 'claude') : 'claude');
   const locked = !!task.session_id;
-  const compatible = (b) => !locked || (b || 'claude') === backend;
+  // Multiagent conversations are claude-only regardless (no subagents in
+  // Codex) — the server 409s the switch, so it isn't offered either.
+  const multiAgent = task.agent_mode === 'multi';
+  const compatible = (b) => (!multiAgent || (b || 'claude') === 'claude') && (!locked || (b || 'claude') === backend);
 
   const pick = async (profileId) => {
     setBusy(true);
@@ -771,7 +780,15 @@ export function Message({ task, msg, resultByToolId, isCreator, onImageClick, ca
 
 const messageKey = message => message.historyKey ?? message.seq;
 
-export function ConversationMessages({ messages, task = null, isCreator = false, staticHistory = false, onImageClick = () => {}, hideEmpty = false }) {
+export function ConversationMessages({ messages: allMessages, task = null, isCreator = false, staticHistory = false, onImageClick = () => {}, hideEmpty = false }) {
+  // Subagent lifecycle is never chat content; in a multiagent conversation
+  // neither is what the subagents say and do — that's the 子代理 tab's, and
+  // left in it would break the orchestrator's own tool chains into pieces.
+  const multiAgent = task?.agent_mode === 'multi';
+  const messages = useMemo(
+    () => allMessages.filter(m => m.role !== 'agent_event' && !(multiAgent && isSubagentInternal(m))),
+    [allMessages, multiAgent],
+  );
   const resultByToolId = useMemo(() => {
     const map = new Map();
     for (const message of messages) if (message.role === 'tool_result') map.set(message.content.tool_use_id, message);
@@ -1206,7 +1223,7 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
             line of their own. */}
         <div className="pane-header-actions">
           <nav className="tabs">
-            {[['chat', '对话'], ['diff', '变更'], ['info', '信息']].map(([k, label]) => (
+            {[['chat', '对话'], ...(task.agent_mode === 'multi' ? [['agents', '子代理']] : []), ['diff', '变更'], ['info', '信息']].map(([k, label]) => (
               <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{label}</button>
             ))}
           </nav>
@@ -1372,6 +1389,10 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
             </div>
           )}
         </>
+      )}
+
+      {tab === 'agents' && (
+        <div className="tab-scroll"><SubagentPanel task={task} messages={messages} hasOlder={hasOlder} onLoadOlder={loadOlder} /></div>
       )}
 
       {tab === 'diff' && <div className="tab-scroll"><DiffView messages={messages} hasOlder={hasOlder} onLoadOlder={loadOlder} /></div>}

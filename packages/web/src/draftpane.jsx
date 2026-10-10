@@ -35,6 +35,9 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
   const [nodePickerOpen, setNodePickerOpen] = useState(false);
   const [profiles, setProfiles] = useState([]);
   const [modelProfileId, setModelProfileId] = useState(null); // null = 默认配置
+  // Conversations take their agent mode from the project they're created in.
+  const multiAgent = state.teams.find(t => t.id === state.activeTeamId)?.kind === 'multi';
+  const usableIn = (list) => (multiAgent ? list.filter(p => p.backend !== 'codex') : list);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [baseBranch, setBaseBranch] = useState(''); // empty = auto-detect the repo's actual default branch
@@ -69,13 +72,16 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
       // a different one makes THAT the new sticky default, see hub-core.mjs's
       // POST /api/tasks) — but only if it's still a real profile; one that's
       // since been deleted falls back to null (the flagged-default profile).
-      if (r.lastModelProfileId && profiles.some(p => p.id === r.lastModelProfileId)) {
+      // A multiagent project can only run Claude (see hub-core.mjs's
+      // multiAgentRefusal), so a sticky Codex default doesn't carry into one.
+      if (r.lastModelProfileId && usableIn(profiles).some(p => p.id === r.lastModelProfileId)) {
         setModelProfileId(r.lastModelProfileId);
       }
     }).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const usable = usableIn(profiles);
   const nodes = [...state.nodes.values()];
   const autoNode = nodes.find(n => n.status === 'online') || nodes[0];
   const selectedNode = (nodeId && nodes.find(n => n.id === nodeId)) || autoNode;
@@ -244,12 +250,12 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
           )}
 
           {/* ---- model profile picker: inline chips when few, dropdown when many ---- */}
-          {(1 + profiles.length) <= INLINE_THRESHOLD ? (
+          {(1 + usable.length) <= INLINE_THRESHOLD ? (
             <div className="inline-chip-group">
               <button type="button" className={`path-chip ${!modelProfileId ? 'selected' : ''}`} onClick={() => pickProfile(null)}>
                 🧠 默认配置
               </button>
-              {profiles.map(p => (
+              {usable.map(p => (
                 <button
                   type="button" key={p.id} className={`path-chip ${modelProfileId === p.id ? 'selected' : ''}`}
                   onClick={() => pickProfile(p.id)}
@@ -266,7 +272,7 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
               {modelPickerOpen && (
                 <div className="path-picker">
                   <button type="button" className="path-picker-item" onClick={() => pickProfile(null)}>默认配置</button>
-                  {profiles.map(p => (
+                  {usable.map(p => (
                     <button type="button" key={p.id} className="path-picker-item" onClick={() => pickProfile(p.id)}>{p.name}{p.backend === 'codex' ? ' · Codex' : ''}</button>
                   ))}
                 </div>
@@ -281,7 +287,10 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
               feature deployed and two nodes with the CLI installed, but no
               Codex profile. Disappears the moment one exists, at which point
               the picker labels it "· Codex" and says so itself. */}
-          {!profiles.some(p => p.backend === 'codex') && (
+          {multiAgent && (
+            <div className="muted">多 agent 编排项目:和你对话的 agent 会把需求拆开派给 subagent,只能使用 Claude Code 档案。</div>
+          )}
+          {!multiAgent && !profiles.some(p => p.backend === 'codex') && (
             <div className="muted">
               想用 Codex 对话?先到「<button type="button" className="ghost link" onClick={() => onOpenSettings?.()}>设置 → 模型档案</button>」
               新建一个后端选 Codex 的档案(中转站需支持 <code>/v1/responses</code>),再回这里选它。跑它的节点上也要装好 <code>codex</code> CLI。

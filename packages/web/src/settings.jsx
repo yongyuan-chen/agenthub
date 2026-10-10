@@ -236,6 +236,7 @@ export function ModelProfilesSection({ onChange }) {
 function TeamManagementSection() {
   const [teams, setTeams] = useState(null);
   const [newTeam, setNewTeam] = useState('');
+  const [newKind, setNewKind] = useState('single');
   const [memberInputs, setMemberInputs] = useState({}); // teamId -> username being typed
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
@@ -246,7 +247,7 @@ function TeamManagementSection() {
   const createTeam = async (e) => {
     e.preventDefault();
     setBusy(true); setNote('');
-    try { await api.adminCreateTeam(newTeam.trim()); setNewTeam(''); reload(); }
+    try { await api.adminCreateTeam(newTeam.trim(), newKind); setNewTeam(''); setNewKind('single'); reload(); }
     catch (e2) { setNote(e2.message); }
     setBusy(false);
   };
@@ -284,10 +285,15 @@ function TeamManagementSection() {
         <input value={newTeam} onChange={e => setNewTeam(e.target.value)} placeholder="新项目名称" />
         <button type="button" className="ghost" disabled={busy || !newTeam.trim()} onClick={createTeam}>创建项目</button>
       </div>
+      <div className="row-inline">
+        <label><input type="radio" name="admin-project-kind" checked={newKind === 'single'} onChange={() => setNewKind('single')} /> 单 agent</label>
+        <label><input type="radio" name="admin-project-kind" checked={newKind === 'multi'} onChange={() => setNewKind('multi')} /> 多 agent 编排</label>
+      </div>
       {(teams || []).map(t => (
         <div key={t.id} className="team-row">
           <div className="row-inline">
             <b>{t.name}</b>
+            {t.kind === 'multi' && <span className="kind-badge">多 agent</span>}
             <button type="button" className="ghost link" disabled={busy} onClick={() => deleteTeam(t.id)}>删除项目</button>
           </div>
           <ul className="team-member-list">

@@ -5819,3 +5819,127 @@ test('cli versions: what a node reports is narrowed before it is stored', async 
   assert.ok(node.cliUpgrades.claude.error.length <= 500, 'error text is bounded before it reaches the DOM');
   assert.equal(node.cliUpgrades.codex, undefined, 'an unknown state is dropped, not stored');
 });
+
+// ---- multiagent projects ----
+// A project's type decides how its conversations run: 'multi' hands the main
+// thread to an orchestrator (executor multiagent.mjs) and records which
+// subagent produced what, so the 子代理 tab can build its tree.
+
+async function seedMultiProject(cloud, nodeId) {
+  const created = await cloud.api('POST', '/api/teams', { name: '编排', kind: 'multi' });
+  assert.equal(created.status, 200);
+  assert.equal(created.body.team.kind, 'multi');
+  const teamId = created.body.team.id;
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind(nodeId, await sha256Hex('tok-' + nodeId), 'user-test', Date.now()).run();
+  await cloud.db.prepare('INSERT INTO node_teams (node_id, team_id) VALUES (?, ?)').bind(nodeId, teamId).run();
+  return { teamId, teamCtx: { ...cloud.ctx, teamId } };
+}
+
+test('multiagent: project type is stored and listed; old and unspecified projects are single', async () => {
+  const cloud = makeCloud();
+  await cloud.db.prepare('INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)').bind('team-old', '老项目', 1).run();
+  await cloud.db.prepare('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)').bind('team-old', 'user-test', 'owner', 1).run();
+  assert.equal((await cloud.api('POST', '/api/teams', { name: '多', kind: 'multi' })).body.team.kind, 'multi');
+  assert.equal((await cloud.api('POST', '/api/teams', { name: '默认' })).body.team.kind, 'single');
+  assert.equal((await cloud.api('POST', '/api/teams', { name: '乱填', kind: 'swarm' })).body.team.kind, 'single');
+  const kinds = Object.fromEntries((await cloud.api('GET', '/api/teams')).body.teams.map(t => [t.name, t.kind]));
+  assert.deepEqual(kinds, { 老项目: 'single', 多: 'multi', 默认: 'single', 乱填: 'single' });
+});
+
+test('multiagent: a conversation created in a multi project is dispatched as multi and keeps its subagent provenance', async () => {
+  const cloud = makeCloud();
+  const { teamCtx } = await seedMultiProject(cloud, 'mac-multi');
+  const spawned = [];
+  const exec = makeExecutor(cloud, 'mac-multi', async (session, opts) => {
+    await sleep(5);
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'agent-1', name: 'Agent', input: { description: '建文件', subagent_type: 'implementer', prompt: 'touch a' } }] } });
+    opts.onMessage({ type: 'system', subtype: 'task_started', tool_use_id: 'agent-1', description: '建文件', subagent_type: 'implementer', is_backgrounded: false, prompt: 'touch a' });
+    // A subagent's own usage must not land on the conversation's context gauge.
+    opts.onMessage({ type: 'assistant', parent_tool_use_id: 'agent-1', message: { usage: { input_tokens: 99999 }, content: [{ type: 'tool_use', id: 'bash-1', name: 'Bash', input: { command: 'touch a' } }] } });
+    opts.onMessage({ type: 'user', parent_tool_use_id: 'agent-1', message: { content: [{ type: 'tool_result', tool_use_id: 'bash-1', content: '', is_error: false }] } });
+    opts.onMessage({ type: 'system', subtype: 'task_notification', tool_use_id: 'agent-1', status: 'completed', summary: '建好了', usage: { total_tokens: 10, tool_uses: 1, duration_ms: 20 } });
+    opts.onMessage({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'agent-1', content: [{ type: 'text', text: '建好了' }] }] } });
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'text', text: '完成' }] } });
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  const origFactory = exec.manager.sessionFactory;
+  exec.manager.sessionFactory = (opts) => { spawned.push(opts.agentMode); return origFactory(opts); };
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+
+  const res = await core.api(teamCtx, 'POST', '/api/tasks', { title: 't', spec: '建个文件', nodeId: 'mac-multi' });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.task.agent_mode, 'multi');
+  const taskId = res.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 3000, 'review');
+  assert.equal(exec.db.getTask(taskId).agent_mode, 'multi');
+  assert.deepEqual(spawned, ['multi']);
+
+  const rows = (await cloud.db.prepare('SELECT role, content FROM messages WHERE task_id = ? ORDER BY seq').bind(taskId).all()).results
+    .map(r => ({ role: r.role, content: JSON.parse(r.content) }));
+  const bash = rows.find(r => r.role === 'tool_use' && r.content.name === 'Bash');
+  assert.equal(bash.content.parentToolUseId, 'agent-1');
+  assert.equal(rows.find(r => r.role === 'tool_result' && r.content.tool_use_id === 'bash-1').content.parentToolUseId, 'agent-1');
+  assert.equal(rows.find(r => r.role === 'tool_use' && r.content.name === 'Agent').content.parentToolUseId, undefined);
+  const events = rows.filter(r => r.role === 'agent_event').map(r => r.content);
+  assert.deepEqual(events.map(e => e.phase), ['started', 'finished']);
+  assert.equal(events[1].status, 'completed');
+  assert.equal(events[1].summary, '建好了');
+  assert.notEqual((await core.getTask(cloud.ctx, taskId)).context_tokens, 99999);
+
+  const listed = await core.api(teamCtx, 'GET', '/api/tasks', {});
+  assert.equal(listed.body.tasks.find(t => t.id === taskId).agent_mode, 'multi');
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('multiagent: personal and single-project conversations are unchanged', async () => {
+  const cloud = makeCloud();
+  const spawned = [];
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-single', await sha256Hex('tok-mac-single'), 'user-test', Date.now()).run();
+  const exec = makeExecutor(cloud, 'mac-single', async (session, opts) => {
+    await sleep(5);
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0, duration_ms: 1, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  const origFactory = exec.manager.sessionFactory;
+  exec.manager.sessionFactory = (opts) => { spawned.push(opts.agentMode); return origFactory(opts); };
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-single' });
+  assert.equal(res.body.task.agent_mode, 'single');
+  await until(async () => (await core.getTask(cloud.ctx, res.body.task.id))?.status === 'review', 3000, 'review');
+  assert.deepEqual(spawned, [null]);
+  assert.equal(exec.db.getTask(res.body.task.id).agent_mode, null);
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('multiagent: refused with Codex, on a node too old to understand it, and switching a multi conversation to Codex', async () => {
+  const cloud = makeCloud();
+  const { teamCtx } = await seedMultiProject(cloud, 'mac-ma-old');
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO node_capabilities (node_id, protocol_version, backends, updated_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-ma-old', PROTOCOL_VERSION, JSON.stringify(['claude', 'codex']), now).run();
+  await cloud.db.prepare('INSERT INTO node_features (node_id, features, updated_at) VALUES (?, ?, ?)')
+    .bind('mac-ma-old', JSON.stringify(['message-ack']), now).run();
+  const codex = await cloud.api('POST', '/api/model-profiles', { name: 'Codex', baseUrl: 'https://cx/v1', apiKey: 'sk-cx', backend: 'codex' });
+  const codexId = codex.body.profile.id;
+
+  const withCodex = await core.api(teamCtx, 'POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-ma-old', modelProfileId: codexId });
+  assert.equal(withCodex.status, 409);
+  assert.match(withCodex.body.error, /Claude/);
+  const oldNode = await core.api(teamCtx, 'POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-ma-old' });
+  assert.equal(oldNode.status, 409);
+  assert.match(oldNode.body.error, /multiagent/);
+
+  await cloud.db.prepare('UPDATE node_features SET features = ? WHERE node_id = ?')
+    .bind(JSON.stringify(['message-ack', 'multi-agent']), 'mac-ma-old').run();
+  const ok = await core.api(teamCtx, 'POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-ma-old' });
+  assert.equal(ok.status, 200);
+  const sw = await core.api(teamCtx, 'POST', `/api/tasks/${ok.body.task.id}/switch-model`, { modelProfileId: codexId });
+  assert.equal(sw.status, 409);
+});

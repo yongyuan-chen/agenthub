@@ -356,6 +356,27 @@ CREATE TABLE IF NOT EXISTS task_teams (
 CREATE INDEX IF NOT EXISTS idx_task_teams_team ON task_teams(team_id);
 CREATE INDEX IF NOT EXISTS idx_task_teams_task ON task_teams(task_id);
 
+-- Project type. No row = 'single' (one agent does the work), which is every
+-- project that predates this table, so no backfill. 'multi' = conversations
+-- created in the project run their main thread as an orchestrator that hands
+-- all work to subagents. Side table for the same idempotent-redeploy reason
+-- as model_profile_backends.
+CREATE TABLE IF NOT EXISTS team_kinds (
+  team_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL
+);
+
+-- A conversation's agent mode, fixed when it is created from the project it
+-- was created in — not derived from its current task_teams rows, which can
+-- change afterwards (and a conversation can be in several projects at once).
+-- The node keeps its own copy (local_tasks.agent_mode); this one is what the
+-- UI reads and what re-dispatches (adopt/claim) send back down. No row =
+-- 'single'.
+CREATE TABLE IF NOT EXISTS task_agent_modes (
+  task_id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL
+);
+
 -- Same story as task_teams, for nodes — a node can be registered/shared into
 -- several projects at once instead of at most one.
 CREATE TABLE IF NOT EXISTS node_teams (

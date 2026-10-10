@@ -92,7 +92,8 @@ function TeamSwitcher({ onSwitchTeam, onManageMembers, onCreateProject }) {
         <button
           key={t.id} type="button" className={state.activeTeamId === t.id ? 'active' : ''}
           onClick={() => onSwitchTeam(t.id)}
-        >{t.name}{dot(t.id)}{running(t.id)}</button>
+          title={t.kind === 'multi' ? '多 agent 编排项目' : undefined}
+        >{t.name}{t.kind === 'multi' && <span className="kind-badge">多</span>}{dot(t.id)}{running(t.id)}</button>
       ))}
       {activeTeam?.role === 'owner' && (
         <button type="button" className="ghost" title="管理项目成员" onClick={() => onManageMembers(activeTeam)}>⚙</button>

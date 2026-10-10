@@ -149,6 +149,36 @@ function decodeInput(raw) {
   return { text: raw, images: [] };
 }
 
+// Spread into a message's content: {} for the main thread, {parentToolUseId}
+// for anything a subagent produced.
+function parentOf(msg) {
+  return msg.parent_tool_use_id ? { parentToolUseId: msg.parent_tool_use_id } : {};
+}
+
+// The CLI's subagent lifecycle system messages (verified against claude
+// 2.1.296), mapped to the phase recorded on an 'agent_event' message.
+const SUBAGENT_LIFECYCLE = { task_started: 'started', task_progress: 'progress', task_notification: 'finished' };
+
+// Only the fields the 子代理 tab shows, bounded: these arrive many times per
+// subagent and land in D1 like any other message.
+function agentEventContent(msg) {
+  const clip = (v, n) => (typeof v === 'string' ? v.slice(0, n) : undefined);
+  const usage = msg.usage && typeof msg.usage === 'object'
+    ? { totalTokens: msg.usage.total_tokens, toolUses: msg.usage.tool_uses, durationMs: msg.usage.duration_ms }
+    : undefined;
+  return {
+    toolUseId: msg.tool_use_id,
+    phase: SUBAGENT_LIFECYCLE[msg.subtype],
+    status: clip(msg.status, 40),
+    description: clip(msg.description, 300),
+    subagentType: clip(msg.subagent_type, 80),
+    background: msg.is_backgrounded === true || undefined,
+    lastToolName: clip(msg.last_tool_name, 80),
+    summary: clip(msg.summary, 4000),
+    usage,
+  };
+}
+
 export class SessionManager {
   /**
    * @param {object} config
@@ -336,6 +366,7 @@ export class SessionManager {
       // into v2 executor code before that Worker is deployed, so carry either
       // spelling into the unified provider_override column.
       providerOverride: task.provider ?? task.anthropic ?? null, backend: task.backend ?? null,
+      agentMode: task.agentMode === 'multi' ? 'multi' : null,
       // Adopted from an existing external session -> resume it directly
       // against the real ~/.claude location going forward, not an isolated
       // copy — see the real_config_dir column comment in db.mjs.
@@ -475,6 +506,7 @@ export class SessionManager {
       realConfigDir: !!t.real_config_dir,
       permissionMode: t.permission_mode || 'acceptEdits',
       allowRootBypass: !!t.allow_root_bypass,
+      agentMode: t.agent_mode || null,
       onMessage: (msg) => this._onSdkMessage(taskId, msg),
       onPermission: (req) => this._onPermission(taskId, req),
       onWithdrawPermission: (requestId) => this._withdrawPermission(taskId, requestId),
@@ -525,6 +557,13 @@ export class SessionManager {
             this.db.patchTask(taskId, { sessionId: msg.session_id });
             this.emit(taskId, { k: 'session', sessionId: msg.session_id });
           }
+        } else if (SUBAGENT_LIFECYCLE[msg.subtype] && msg.tool_use_id) {
+          // A subagent's lifecycle, keyed by the Agent tool_use that spawned
+          // it — the only place its live status, progress and final summary
+          // appear (a backgrounded subagent's tool_result arrives as soon as
+          // it is launched, long before it is done). Stored as its own role
+          // so the chat can skip it and the 子代理 tab can build on it.
+          this.emit(taskId, { k: 'msg', role: 'agent_event', content: agentEventContent(msg) });
         } else if (msg.subtype === 'compacted') {
           // History was just summarized away, so the stored context estimate
           // is now far too high. Left stale it would re-trigger auto-compact
@@ -534,15 +573,24 @@ export class SessionManager {
         }
         break;
       case 'assistant': {
+        // Set on everything a subagent says or does: the id of the Agent
+        // tool_use that spawned it. Carried into content so the cloud can
+        // tell subagent internals from the main thread (messages.content is
+        // free JSON — no schema change).
+        const parent = parentOf(msg);
         for (const block of msg.message?.content ?? []) {
           if (block.type === 'text') {
-            this.emit(taskId, { k: 'msg', role: 'assistant', content: { text: block.text } });
+            this.emit(taskId, { k: 'msg', role: 'assistant', content: { text: block.text, ...parent } });
           } else if (block.type === 'tool_use') {
-            this.emit(taskId, { k: 'msg', role: 'tool_use', content: { id: block.id, name: block.name, input: block.input } });
+            this.emit(taskId, { k: 'msg', role: 'tool_use', content: { id: block.id, name: block.name, input: block.input, ...parent } });
           } else if (block.type === 'thinking' && block.thinking) {
-            this.emit(taskId, { k: 'msg', role: 'thinking', content: { text: block.thinking } });
+            this.emit(taskId, { k: 'msg', role: 'thinking', content: { text: block.thinking, ...parent } });
           }
         }
+        // A subagent's usage is the size of *its* context, not the
+        // conversation's — recording it would make the context chip jump
+        // around and could trigger auto-compact of the main thread.
+        if (parent.parentToolUseId) break;
         // Best-effort live signal — works when talking directly to the
         // Anthropic API, but some ANTHROPIC_BASE_URL relays report all-zero
         // usage on every streamed message (verified directly). The 'result'
@@ -565,12 +613,13 @@ export class SessionManager {
       }
       case 'user': {
         const content = msg.message?.content;
+        const parent = parentOf(msg);
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block.type === 'tool_result') {
               this.emit(taskId, {
                 k: 'msg', role: 'tool_result',
-                content: { tool_use_id: block.tool_use_id, is_error: block.is_error ?? false, content: block.content },
+                content: { tool_use_id: block.tool_use_id, is_error: block.is_error ?? false, content: block.content, ...parent },
               });
             }
           }

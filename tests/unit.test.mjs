@@ -8,6 +8,7 @@ import { ulid, userCanTransition, sha256Hex } from '../packages/shared/protocol.
 import { sendWebPush } from '../packages/worker/src/push.mjs';
 import { listDirs } from '../packages/executor/src/cloudlink.mjs';
 import { buildClaudeArgs } from '../packages/executor/src/session.mjs';
+import { multiAgentDefinitions, writeAgentsFile, ORCHESTRATOR_AGENT } from '../packages/executor/src/multiagent.mjs';
 import { fmtDuration } from '../packages/web/src/format.js';
 import { elapsedOf, RUNNING_STATUSES } from '../packages/web/src/elapsed.js';
 
@@ -30,6 +31,20 @@ test('Claude CLI arguments never impose AgentHub turn or cost limits', () => {
     assert.ok(!args.includes('--max-budget-usd'));
     assert.ok(!args.includes('100'));
   }
+});
+
+test('multiagent: the main thread runs as an orchestrator that cannot change anything itself', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-agents-'));
+  const file = writeAgentsFile(root);
+  const args = buildClaudeArgs({ permissionMode: 'bypassPermissions', agentsFile: file });
+  assert.deepEqual(args.slice(-4), ['--agents', file, '--agent', ORCHESTRATOR_AGENT]);
+  const defs = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(defs, multiAgentDefinitions());
+  const tools = defs[ORCHESTRATOR_AGENT].tools;
+  for (const banned of ['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash']) assert.ok(!tools.includes(banned), banned);
+  assert.ok(tools.includes('Agent') && tools.includes('Task'));
+  // The worker that does the changes is unrestricted (no tools list = all).
+  assert.equal(defs.implementer.tools, undefined);
 });
 
 test('listDirs: prefix-completes into matching subdirectories', () => {

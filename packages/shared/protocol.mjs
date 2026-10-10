@@ -49,6 +49,12 @@ export const PROTOCOL_VERSION = 2;
 export const BACKENDS = ['claude', 'codex'];
 export const DEFAULT_BACKEND = 'claude';
 
+// Project types (team_kinds.kind). 'single' is the default and what every
+// project predating the field is; 'multi' runs conversations as an
+// orchestrator plus subagents, and is claude-only — Codex has no subagents.
+export const PROJECT_KINDS = ['single', 'multi'];
+export const DEFAULT_PROJECT_KIND = 'single';
+
 // ---- Executor -> Cloud messages ----
 // {t:'hello', nodeId, protocolVersion, backends:['claude','codex'], features:['message-ack'],
 //             cliVersions:{claude:'2.1.105', codex:'0.144.6'},
@@ -81,13 +87,19 @@ export const DEFAULT_BACKEND = 'claude';
 //    cliAutoUpgrade -> whether this node may upgrade its CLIs on its own. Cloud-owned and
 //      re-asserted on every hello, like permission_mode and the provider override.
 // {t:'ack', taskId, seq}
-// {t:'start_task', task:{id,title,spec,images?,repoUrl,baseBranch,permissionMode,sessionId,sourceCwd?,provider?,backend?}}
+// {t:'start_task', task:{id,title,spec,images?,repoUrl,baseBranch,permissionMode,sessionId,sourceCwd?,provider?,backend?,agentMode?}}
 //    task.provider (optional) -> {baseUrl,apiKey,model} pins this task to a specific model
 //    profile chosen at creation time, overriding the node's shared config for its lifetime.
 //    task.backend (optional) -> which agent CLI drives it; absent = 'claude'. Comes from the
 //    same profile, so choosing a model is also choosing a backend.
 //    task.images (optional) -> [{mediaType, data}] attached to the *first* message (spec), same
 //    shape as user_message.images. Only sent to a node advertising FEATURE_TASK_IMAGES.
+//    task.agentMode (optional) -> 'multi' for a conversation in a multiagent project: the main
+//    thread runs as an orchestrator that delegates to subagents. Absent = single-agent. Only
+//    sent to a node advertising FEATURE_MULTI_AGENT. While it runs, subagent output carries
+//    content.parentToolUseId, and subagent lifecycle arrives as role 'agent_event'
+//    {toolUseId, phase: started|progress|finished, status?, description?, subagentType?,
+//     background?, lastToolName?, summary?, usage?}.
 // {t:'user_message', taskId, text, images?, clientMessageId?}
 //                                                          images: [{mediaType, data}], data is base64.
 //                                                          clientMessageId: the browser's own id for this exact send, echoed
@@ -188,13 +200,19 @@ export function isValidClientMessageId(value) {
 // handler, so the cloud hides the upgrade controls for it rather than
 // offering a button that silently does nothing — the same reasoning as
 // FILE_IO, minus the hung spinner (there's no request/response here).
+// MULTI_AGENT: this node understands start_task.agentMode. An older one would
+// silently run a multiagent conversation as a plain single agent — a
+// conversation that looks like it works but ignores what the project is for —
+// so the cloud refuses to create one there instead.
 export const FEATURE_MESSAGE_ACK = 'message-ack';
 export const FEATURE_TASK_IMAGES = 'task-images';
 export const FEATURE_FILE_IO = 'file-io';
 export const FEATURE_SESSION_FORK = 'session-fork';
 export const FEATURE_CLI_UPGRADE = 'cli-upgrade';
+export const FEATURE_MULTI_AGENT = 'multi-agent';
 export const EXECUTOR_FEATURES = [
   FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_CLI_UPGRADE,
+  FEATURE_MULTI_AGENT,
 ];
 
 // Caps for the file browser, shared so the executor and the cloud agree.

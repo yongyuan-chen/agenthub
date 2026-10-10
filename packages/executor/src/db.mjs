@@ -111,6 +111,11 @@ export class LocalDb {
     // Renamed from anthropic_override: a model profile now pins the backend as
     // well as the relay, so "anthropic" stopped being true.
     try { this.db.exec('ALTER TABLE local_tasks ADD COLUMN provider_override TEXT'); } catch { /* already exists */ }
+    // 'multi' = the conversation belongs to a multiagent project: the main
+    // thread runs as an orchestrator that delegates to subagents (see
+    // multiagent.mjs). NULL means single-agent, which is every task
+    // predating this column, so no backfill is needed.
+    try { this.db.exec('ALTER TABLE local_tasks ADD COLUMN agent_mode TEXT'); } catch { /* already exists */ }
     // Data migration, not a compatibility shim: without this, every task
     // already running on an upgraded daemon loses the relay it was pinned to
     // and silently falls back to the node-wide default. Runs once — after the
@@ -139,13 +144,13 @@ export class LocalDb {
   upsertTask(t) {
     const now = Date.now();
     this.db.prepare(`
-      INSERT INTO local_tasks (task_id, title, spec, status, session_id, dir, repo_url, base_branch, branch_name, permission_mode, lease, cost_usd, provider_override, backend, real_config_dir, source_cwd, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO local_tasks (task_id, title, spec, status, session_id, dir, repo_url, base_branch, branch_name, permission_mode, lease, cost_usd, provider_override, backend, agent_mode, real_config_dir, source_cwd, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET title=excluded.title, spec=excluded.spec, updated_at=excluded.updated_at
     `).run(t.taskId, t.title ?? '', t.spec ?? '', t.status ?? 'queued', t.sessionId ?? null,
       t.dir ?? null, t.repoUrl ?? null, t.baseBranch ?? null, t.branchName ?? null,
       t.permissionMode ?? 'default', t.lease ?? 'daemon', t.costUsd ?? 0,
-      t.providerOverride ? JSON.stringify(t.providerOverride) : null, t.backend ?? null,
+      t.providerOverride ? JSON.stringify(t.providerOverride) : null, t.backend ?? null, t.agentMode ?? null,
       t.realConfigDir ? 1 : 0, t.sourceCwd ?? null, now, now);
   }
 
@@ -157,6 +162,7 @@ export class LocalDb {
       permissionMode: 'permission_mode', allowRootBypass: 'allow_root_bypass', autoDecideAll: 'auto_decide_all',
       spec: 'spec', sourceCwd: 'source_cwd', retryAttempt: 'retry_attempt', retryFirstFailedAt: 'retry_first_failed_at',
       retryLastInput: 'retry_last_input', providerOverride: 'provider_override', backend: 'backend',
+      agentMode: 'agent_mode',
     };
     const sets = [];
     const vals = [];

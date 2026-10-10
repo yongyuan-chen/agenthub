@@ -12,7 +12,7 @@
 //   listSessions(nodeId, path)    -> Promise<{sessions}|null> (same shape, lists existing claude sessions for a path)
 //   push(payload, ownerUserId)    -> void    (web push fan-out, fire and forget)
 //   now()                         -> epoch ms
-import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_CLI_UPGRADE, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
+import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_CLI_UPGRADE, FEATURE_MULTI_AGENT, PROJECT_KINDS, DEFAULT_PROJECT_KIND, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
 import * as accounts from './accounts.mjs';
 import { hashPassword } from './auth.mjs';
 import { cachedCliVersions } from './cli-releases.mjs';
@@ -168,6 +168,64 @@ async function profileBackends(db, userId) {
   return new Map((rows.results ?? rows).map(r => [r.profile_id, r.backend]));
 }
 
+// A project's type — see team_kinds in schema.sql. Personal scope (no
+// teamId) is always single-agent.
+async function teamKind(db, teamId) {
+  if (!teamId) return DEFAULT_PROJECT_KIND;
+  const row = await q(db, 'SELECT kind FROM team_kinds WHERE team_id = ?', teamId).first();
+  return PROJECT_KINDS.includes(row?.kind) ? row.kind : DEFAULT_PROJECT_KIND;
+}
+
+// Batch-attaches `kind` to a list of team rows, same shape as attachTeamIds.
+async function attachTeamKinds(db, teams) {
+  if (!teams.length) return;
+  const ids = teams.map(t => t.id);
+  const rows = await q(db, `SELECT team_id, kind FROM team_kinds WHERE team_id IN (${inClause(ids)})`, ...ids).all();
+  const byTeam = new Map((rows.results ?? rows).map(r => [r.team_id, r.kind]));
+  for (const t of teams) t.kind = PROJECT_KINDS.includes(byTeam.get(t.id)) ? byTeam.get(t.id) : DEFAULT_PROJECT_KIND;
+}
+
+// Validated project type from a create request; anything unknown is 'single'
+// rather than an error, so an older client that never sends it still works.
+const requestedKind = (raw) => (PROJECT_KINDS.includes(raw) ? raw : DEFAULT_PROJECT_KIND);
+
+async function insertTeamKind(db, teamId, kind) {
+  if (kind === DEFAULT_PROJECT_KIND) return;   // no row = single, see schema.sql
+  await q(db, 'INSERT INTO team_kinds (team_id, kind) VALUES (?, ?) ON CONFLICT(team_id) DO UPDATE SET kind = excluded.kind', teamId, kind).run();
+}
+
+async function taskAgentMode(db, taskId) {
+  const row = await q(db, 'SELECT mode FROM task_agent_modes WHERE task_id = ?', taskId).first();
+  return row?.mode === 'multi' ? 'multi' : 'single';
+}
+
+// Batch-attaches `agent_mode` ('single'|'multi') to each task in a list. Every
+// task payload the frontend receives needs it: the store replaces task
+// objects wholesale (see broadcastTask's comment), so one path missing it
+// would make the 子代理 tab flicker away.
+async function attachAgentModes(db, tasks) {
+  if (!tasks.length) return;
+  const ids = tasks.map(t => t.id);
+  const rows = await q(db, `SELECT task_id FROM task_agent_modes WHERE task_id IN (${inClause(ids)}) AND mode = 'multi'`, ...ids).all();
+  const multi = new Set((rows.results ?? rows).map(r => r.task_id));
+  for (const t of tasks) t.agent_mode = multi.has(t.id) ? 'multi' : 'single';
+}
+
+// start_task.task fields for a conversation in a multiagent project — {} for
+// a single-agent one, so older nodes and payloads are byte-for-byte unchanged.
+const agentModeField = (mode) => (mode === 'multi' ? { agentMode: 'multi' } : {});
+
+// Why a conversation of this mode can't be created on/with this node+backend,
+// or null. Shared by every path that creates a conversation inside a project.
+async function multiAgentRefusal(db, nodeId, mode, backend) {
+  if (mode !== 'multi') return null;
+  if (backend !== 'claude') return 'multiagent 项目只支持 Claude Code:Codex 没有 subagent,请换一个 Claude 模型档案';
+  if (!(await nodeSupports(db, nodeId, FEATURE_MULTI_AGENT))) {
+    return `节点 ${nodeId} 的 executor 还不支持 multiagent 项目,请等它自动升级(约 2-3 分钟)后重试`;
+  }
+  return null;
+}
+
 async function taskTeamIds(ctx, taskId) {
   const rows = await q(ctx.db, 'SELECT team_id FROM task_teams WHERE task_id = ?', taskId).all();
   return (rows.results ?? rows).map(r => r.team_id);
@@ -270,6 +328,7 @@ async function broadcastTask(ctx, taskId) {
     const teamIds = await taskTeamIds(ctx, taskId);
     task.teamIds = teamIds;
     task.backend = await taskBackend(ctx.db, task);
+    await attachAgentModes(ctx.db, [task]);
     // No seen_at here on purpose: this payload goes to every member of every
     // project the task is in, and read state is per-user. The client keeps
     // its own seen map (store.js) and compares it against attention_at.
@@ -1161,6 +1220,11 @@ async function createTask(ctx, body, userId, { adopting = true } = {}) {
   if (adopting && resumeSessionId && backend !== 'claude') {
     return err(409, `无法用 ${backend} 档案接管一个 claude 会话:会话 ID 不通用`);
   }
+  // Fixed here, from the project the conversation is created in — see
+  // task_agent_modes in schema.sql.
+  const agentMode = (await teamKind(ctx.db, ctx.teamId)) === 'multi' ? 'multi' : 'single';
+  const modeRefusal = await multiAgentRefusal(ctx.db, nodeId, agentMode, backend);
+  if (modeRefusal) return err(409, modeRefusal);
   const id = ulid();
   const now = ctx.now();
   // No hardcoded 'main' fallback here — many repos default to 'master' or
@@ -1179,6 +1243,7 @@ async function createTask(ctx, body, userId, { adopting = true } = {}) {
     ));
   }
   if (ctx.teamId) createStatements.push(q(ctx.db, 'INSERT INTO task_teams (task_id, team_id) VALUES (?, ?)', id, ctx.teamId));
+  if (agentMode === 'multi') createStatements.push(q(ctx.db, 'INSERT INTO task_agent_modes (task_id, mode) VALUES (?, ?)', id, agentMode));
   try { await ctx.db.batch(createStatements); }
   catch { return err(409, 'this Claude session was connected concurrently; refresh and open the existing conversation'); }
   // Creating a task while viewing a project starts it shared with that
@@ -1197,6 +1262,7 @@ async function createTask(ctx, body, userId, { adopting = true } = {}) {
       ...(images.length ? { images } : {}),
       ...(provider ? { provider } : {}),
       ...(backend !== DEFAULT_BACKEND ? { backend } : {}),
+      ...agentModeField(agentMode),
     },
   });
   if (repoUrl) {
@@ -1239,6 +1305,7 @@ export async function api(ctx, method, pathname, body) {
     const seen = await seenAtFor(ctx, userId, tasks.map(t => t.id));
     await Promise.all([
       attachTeamIds(ctx, tasks), attachTaskBackends(ctx.db, tasks), attachActivity(ctx, tasks, seen),
+      attachAgentModes(ctx.db, tasks),
     ]);
     return ok({ tasks });
   }
@@ -1353,7 +1420,7 @@ export async function api(ctx, method, pathname, body) {
       if (!existing) return err(409, 'conversation was already activated in another scope');
       if (existing.status === 'queued') {
         const commandKey = `start:${existing.id}`;
-        const payload = { t: 'start_task', task: { id: existing.id, title: existing.title, spec: existing.spec, repoUrl: existing.repo_url, baseBranch: null, permissionMode: existing.permission_mode, sessionId: existing.session_id, sourceCwd: source.cwd } };
+        const payload = { t: 'start_task', task: { id: existing.id, title: existing.title, spec: existing.spec, repoUrl: existing.repo_url, baseBranch: null, permissionMode: existing.permission_mode, sessionId: existing.session_id, sourceCwd: source.cwd, ...agentModeField(await taskAgentMode(ctx.db, existing.id)) } };
         await q(ctx.db, 'INSERT OR IGNORE INTO durable_cmds (command_key,node_id,payload,created_at) VALUES (?,?,?,?)', commandKey, existing.node_id, JSON.stringify(payload), ctx.now()).run();
         ctx.sendToNode(existing.node_id, { ...payload, commandKey });
       }
@@ -1362,17 +1429,25 @@ export async function api(ctx, method, pathname, body) {
       return ok({ task: existing, reused: true, messageForwarded: true });
     }
 
+    // Continuing an external session inside a multiagent project hands it to
+    // the orchestrator from here on, same as any conversation created there.
+    // Claimed sessions are always claude ones (see createTask), so only the
+    // node needs checking.
+    const agentMode = (await teamKind(ctx.db, ctx.teamId)) === 'multi' ? 'multi' : 'single';
+    const modeRefusal = await multiAgentRefusal(ctx.db, source.nodeId, agentMode, 'claude');
+    if (modeRefusal) return err(409, modeRefusal);
     const taskId = `S${sourceId.slice(0, 25)}`;
     const now = ctx.now();
     const titleLine = (source.preview || text).split('\n')[0].trim();
     const title = titleLine.length > 40 ? titleLine.slice(0, 40) + '…' : (titleLine || '历史对话');
     const commandKey = `start:${taskId}`;
-    const payload = { t: 'start_task', task: { id: taskId, title, spec: text, repoUrl: source.cwd, baseBranch: null, permissionMode: 'bypassPermissions', sessionId: source.sessionId, sourceCwd: source.cwd } };
+    const payload = { t: 'start_task', task: { id: taskId, title, spec: text, repoUrl: source.cwd, baseBranch: null, permissionMode: 'bypassPermissions', sessionId: source.sessionId, sourceCwd: source.cwd, ...agentModeField(agentMode) } };
     const statements = [
       q(ctx.db, 'INSERT INTO conversation_claims_v2 (node_id,session_id,source_id,task_id,source_cwd,immutable,claimed_at) VALUES (?,?,?,?,?,1,?)', source.nodeId, source.sessionId, sourceId, taskId, source.cwd, now),
       q(ctx.db, `INSERT INTO tasks (id,title,spec,repo_url,node_id,owner_user_id,team_id,status,permission_mode,session_id,created_at,updated_at)
         VALUES (?,?,?,?,?,?,?,'queued','bypassPermissions',?,?,?)`, taskId, title, text, source.cwd, source.nodeId, userId, ctx.teamId || null, source.sessionId, now, now),
       ...(ctx.teamId ? [q(ctx.db, 'INSERT INTO task_teams (task_id,team_id) VALUES (?,?)', taskId, ctx.teamId)] : []),
+      ...(agentMode === 'multi' ? [q(ctx.db, 'INSERT INTO task_agent_modes (task_id,mode) VALUES (?,?)', taskId, agentMode)] : []),
       q(ctx.db, 'INSERT INTO durable_cmds (command_key,node_id,payload,created_at) VALUES (?,?,?,?)', commandKey, source.nodeId, JSON.stringify(payload), now),
     ];
     try { await ctx.db.batch(statements); }
@@ -1416,6 +1491,7 @@ export async function api(ctx, method, pathname, body) {
     }
     task.teamIds = teamIds;
     task.backend = await taskBackend(ctx.db, task);
+    await attachAgentModes(ctx.db, [task]);
     await attachActivity(ctx, [task], await seenAtFor(ctx, userId, [taskId]));
     return ok({ task });
   }
@@ -1823,6 +1899,9 @@ export async function api(ctx, method, pathname, body) {
       // has never heard of. Refuse instead: this is a new conversation, not a
       // model change. (A task with no session yet hasn't spawned anything, so
       // it can still move freely.)
+      if (backend !== 'claude' && (await taskAgentMode(ctx.db, taskId)) === 'multi') {
+        return err(409, 'multiagent 对话只能用 Claude 模型档案:Codex 没有 subagent');
+      }
       const currentBackend = await taskBackend(ctx.db, task);
       if (task.session_id && backend !== currentBackend) {
         return err(409, `这个对话已经在 ${currentBackend} 上有会话记录,不能改用 ${backend} 档案(会话 ID 不通用)。请新建一张卡。`);
@@ -2561,6 +2640,7 @@ export async function api(ctx, method, pathname, body) {
       if (method === 'GET' && route.length === 2) {
         const teams = await q(ctx.db, 'SELECT id, name, created_at FROM teams ORDER BY created_at').all();
         const rows = teams.results ?? teams;
+        await attachTeamKinds(ctx.db, rows);
         for (const t of rows) {
           const members = await q(ctx.db,
             `SELECT team_members.user_id, users.username, team_members.role FROM team_members
@@ -2572,8 +2652,10 @@ export async function api(ctx, method, pathname, body) {
       if (method === 'POST' && route.length === 2) {
         const name = String(body?.name || '').trim();
         if (!name) return err(400, 'name required');
+        const kind = requestedKind(body?.kind);
         const id = ulid(ctx.now());
         await q(ctx.db, 'INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)', id, name, ctx.now()).run();
+        await insertTeamKind(ctx.db, id, kind);
         // The admin who creates a team is who it's "theirs" from the UI's
         // perspective — not auto-joining them was the actual bug behind "I
         // made a team but my own switcher doesn't show it." They can still
@@ -2581,7 +2663,7 @@ export async function api(ctx, method, pathname, body) {
         // meant to be admin-managed-but-not-admin-member.
         await q(ctx.db, 'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)',
           id, userId, 'owner', ctx.now()).run();
-        return ok({ team: { id, name } });
+        return ok({ team: { id, name, kind } });
       }
       const teamId = route[2];
       if (method === 'DELETE' && route.length === 3) {
@@ -2595,6 +2677,7 @@ export async function api(ctx, method, pathname, body) {
         await q(ctx.db, 'DELETE FROM task_teams WHERE team_id = ?', teamId).run();
         await q(ctx.db, 'DELETE FROM node_teams WHERE team_id = ?', teamId).run();
         await q(ctx.db, 'DELETE FROM team_members WHERE team_id = ?', teamId).run();
+        await q(ctx.db, 'DELETE FROM team_kinds WHERE team_id = ?', teamId).run();
         await q(ctx.db, 'DELETE FROM teams WHERE id = ?', teamId).run();
         return ok({});
       }
@@ -2617,7 +2700,9 @@ export async function api(ctx, method, pathname, body) {
       `SELECT teams.id, teams.name, team_members.role FROM team_members
        JOIN teams ON teams.id = team_members.team_id WHERE team_members.user_id = ? ORDER BY teams.name`,
       userId).all();
-    return ok({ teams: rows.results ?? rows });
+    const teams = rows.results ?? rows;
+    await attachTeamKinds(ctx.db, teams);
+    return ok({ teams });
   }
 
   // Self-service project creation — any user can spin up their own project,
@@ -2627,11 +2712,13 @@ export async function api(ctx, method, pathname, body) {
   if (method === 'POST' && route[0] === 'teams' && route.length === 1) {
     const name = String(body?.name || '').trim();
     if (!name) return err(400, 'name required');
+    const kind = requestedKind(body?.kind);
     const id = ulid(ctx.now());
     await q(ctx.db, 'INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)', id, name, ctx.now()).run();
+    await insertTeamKind(ctx.db, id, kind);
     await q(ctx.db, 'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)',
       id, userId, 'owner', ctx.now()).run();
-    return ok({ team: { id, name, role: 'owner' } });
+    return ok({ team: { id, name, role: 'owner', kind } });
   }
 
   // Self-service membership — a project owner can pull people in/kick them
@@ -2698,6 +2785,7 @@ export async function snapshot(ctx) {
          ORDER BY tasks.created_at DESC LIMIT 500`, ctx.userId).all();
   const tasks = taskRows.results ?? taskRows;
   await attachTeamIds(ctx, tasks);
+  await attachAgentModes(ctx.db, tasks);
   // Same enrichment the REST list does — the snapshot *replaces* the client's
   // task map wholesale on every (re)connect, so anything missing here silently
   // erases it: found live, the run timer and unread dots showed up from the

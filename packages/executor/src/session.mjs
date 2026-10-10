@@ -6,8 +6,12 @@ import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { ORCHESTRATOR_AGENT, writeAgentsFile } from './multiagent.mjs';
 
-export function buildClaudeArgs({ permissionMode = 'default', resumeSessionId = null } = {}) {
+// agentsFile: set only for multiagent conversations — the path written by
+// multiagent.mjs's writeAgentsFile, and the main thread runs as its
+// orchestrator role.
+export function buildClaudeArgs({ permissionMode = 'default', resumeSessionId = null, agentsFile = null } = {}) {
   const args = [
     '-p',
     '--input-format', 'stream-json',
@@ -17,6 +21,12 @@ export function buildClaudeArgs({ permissionMode = 'default', resumeSessionId = 
     '--permission-prompt-tool', 'stdio',
   ];
   if (resumeSessionId) args.push('--resume', resumeSessionId);
+  if (agentsFile) {
+    // Spawned through a shell on Windows (see start()), which splits on
+    // spaces — and workRoot is usually under a user profile that can have one.
+    const file = process.platform === 'win32' && /\s/.test(agentsFile) ? `"${agentsFile}"` : agentsFile;
+    args.push('--agents', file, '--agent', ORCHESTRATOR_AGENT);
+  }
   return args;
 }
 
@@ -28,6 +38,7 @@ export class ClaudeSession {
    * @param {string=} opts.resumeSessionId
    * @param {boolean=} opts.realConfigDir  resume against the real ~/.claude instead of the isolated copy
    * @param {string} opts.permissionMode  default|acceptEdits|bypassPermissions
+   * @param {string=} opts.agentMode    'multi' = run the main thread as the multiagent orchestrator
    * @param {(msg: object) => void} opts.onMessage        raw SDK message (assistant/user/system/result...)
    * @param {(req: {requestId,toolName,input,suggestions}) => Promise<{behavior:'allow'|'deny', message?:string, updatedInput?:object}>} opts.onPermission
    * @param {(err: Error) => void} opts.onExit            called once when process ends (null err = clean)
@@ -53,8 +64,9 @@ export class ClaudeSession {
   }
 
   start() {
-    const { config, cwd, resumeSessionId, permissionMode, realConfigDir, allowRootBypass } = this.opts;
-    const args = buildClaudeArgs({ permissionMode, resumeSessionId });
+    const { config, cwd, resumeSessionId, permissionMode, realConfigDir, allowRootBypass, agentMode } = this.opts;
+    const agentsFile = agentMode === 'multi' ? writeAgentsFile(config.workRoot) : null;
+    const args = buildClaudeArgs({ permissionMode, resumeSessionId, agentsFile });
 
     const env = { ...process.env };
     // Never inherit host login/session state; force the relay.
@@ -89,7 +101,8 @@ export class ClaudeSession {
     // can't exec those directly without a shell (a well-known Node.js/
     // Windows gotcha, same reason cross-spawn-style libraries exist). Safe
     // to blanket-enable here: every element of `args` is a fixed literal or
-    // a value we generate ourselves (session id, permission-mode enum) —
+    // a value we generate ourselves (session id, permission-mode enum, the
+    // multiagent agents-file path, quoted in buildClaudeArgs) —
     // actual conversation text never goes through `args`, only stdin (see
     // send()) — so there's no untrusted content for cmd.exe's
     // shell parsing to mis-handle.

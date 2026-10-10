@@ -422,6 +422,7 @@ export function NodeManageModal({ user, onClose }) {
 // sidebar straight to it so it doesn't just silently appear in the tab strip.
 export function CreateProjectModal({ onClose, onCreated }) {
   const [name, setName] = useState('');
+  const [kind, setKind] = useState('single');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -431,7 +432,7 @@ export function CreateProjectModal({ onClose, onCreated }) {
     if (!trimmed || busy) return;
     setBusy(true); setErr('');
     try {
-      const r = await api.createTeam(trimmed);
+      const r = await api.createTeam(trimmed, kind);
       state.teams = [...state.teams, r.team];
       bump();
       onCreated(r.team.id);
@@ -448,6 +449,16 @@ export function CreateProjectModal({ onClose, onCreated }) {
           项目名称
           <input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="例如:量化训练" />
         </label>
+        <div className="field-label">项目类型</div>
+        <div className="row-inline">
+          <label><input type="radio" name="project-kind" checked={kind === 'single'} onChange={() => setKind('single')} /> 单 agent</label>
+          <label><input type="radio" name="project-kind" checked={kind === 'multi'} onChange={() => setKind('multi')} /> 多 agent 编排</label>
+        </div>
+        <p className="muted">
+          {kind === 'multi'
+            ? '和你对话的 agent 只负责拆分和派发:每个需求都交给 subagent 去做,互不相关的需求并行处理。会话里多一个「子代理」标签页,能看到 subagent 树和每个 subagent 的状态。只支持 Claude Code,创建后不能更改。'
+            : '和你对话的 agent 自己完成工作,和以前一样。创建后不能更改。'}
+        </p>
         {err && <div className="err">{err}</div>}
         <div className="modal-actions">
           <button type="button" className="ghost" onClick={onClose}>取消</button>

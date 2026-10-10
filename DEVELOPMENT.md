@@ -309,6 +309,15 @@ agent 的记忆在 CLI 自己写的会话文件里,不在 D1 的 `messages` 表�
 
 新对话**复用父对话的工作目录**(带 `session_id` 创建的任务不建 worktree,直接在给定目录里跑 —— `--resume` 要求 cwd 与会话创建时一致),所以父子同时干活会改到同一批文件,创建后会在前端提示一次。
 
+### 8.2 multiagent 项目
+
+项目有两种类型(`team_kinds`,无行 = `single`,所以老项目全是单 agent):**single** 和以前一样;**multi** 里和用户对话的主 agent 只做编排 —— 把一条消息拆成独立需求、无依赖的并行派给 subagent、最后汇总。类型在建项目时选,之后不改;会话的模式在**创建时**按所在项目定下(`task_agent_modes` / 节点侧 `local_tasks.agent_mode`),之后会话被移进移出项目都不变。
+
+- **约束是硬的**:节点把 `multiagent.mjs` 里的角色定义写进 `<workRoot>/multiagent-agents.json`,以 `--agents <文件> --agent agenthub-orchestrator` 启动 CLI。编排者的 `tools` 只有 Read/Grep/Glob/Agent(Task)/AskUserQuestion,改不了文件也跑不了命令;`implementer` 不限工具,`explorer`/`reviewer` 只读。用文件而不是内联 JSON,是因为 Windows 上 CLI 经 shell 启动。
+- **只支持 Claude**:Codex 没有 subagent。用 Codex 档案建会话、把 multi 会话切到 Codex 档案、或者节点 executor 不支持 `FEATURE_MULTI_AGENT`,云端都直接 409。
+- **subagent 归属**:CLI 给 subagent 产生的每条消息带 `parent_tool_use_id`,节点把它记成 `content.parentToolUseId`;subagent 的生命周期(`task_started`/`task_progress`/`task_notification`)记成 `agent_event` 消息。subagent 的 usage 不计入会话的上下文用量。
+- **前端**:multi 会话多一个「子代理」标签页(`subagents.jsx`,树由 `subagent-tree.js` 从消息列表推出);对话页隐藏 subagent 内部消息。后台 subagent 的 tool_result 只是"已启动"回执,以 `finished` 事件为准。
+
 ---
 
 ## 9. 前端设计(Pages)
