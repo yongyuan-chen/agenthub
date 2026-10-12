@@ -69,3 +69,51 @@ test('subagent tree: only subagent output counts as internal', () => {
   assert.equal(isSubagentInternal({ role: 'assistant', content: { text: 'x' } }), false);
   assert.deepEqual(buildSubagentTree([msg('tool_use', { id: 'r', name: 'Read', input: {} })]).roots, []);
 });
+
+test('subagent tree: work handed back with SendMessage joins the same node as a new run', () => {
+  const messages = [
+    spawn('calc', 'calc.py'),
+    msg('agent_event', { toolUseId: 'calc', agentId: 'ag1', phase: 'started' }),
+    msg('tool_use', { id: 'w1', name: 'Write', input: { file_path: 'calc.py' }, parentToolUseId: 'calc' }),
+    msg('tool_result', { tool_use_id: 'calc', is_error: false, content: [{ type: 'text', text: 'The report follows:\n  wrote add\nagentId: ag1\n<usage>x</usage>' }] }),
+    spawn('readme', 'README'),
+    msg('tool_result', { tool_use_id: 'readme', is_error: false, content: 'done\nagentId: ag2' }),
+    // Second request, related to calc.py: continued, not respawned.
+    msg('tool_use', { id: 'sm1', name: 'SendMessage', input: { to: 'ag1', summary: 'add mul', message: 'add mul(a,b)' } }),
+    msg('agent_event', { toolUseId: 'sm1', agentId: 'ag1', phase: 'started' }),
+    msg('tool_result', { tool_use_id: 'sm1', is_error: false, content: '{"success":true,"message":"Resuming agent ag1"}' }),
+    // Its steps still point at the spawning Agent call.
+    msg('tool_use', { id: 'b2', name: 'Bash', input: { command: 'cat >> calc.py' }, parentToolUseId: 'calc' }),
+  ];
+  const live = buildSubagentTree(messages, { status: 'review' });
+  assert.equal(live.byId.size, 2, 'one node per subagent, not per handout');
+  const calc = live.byId.get('calc');
+  assert.equal(calc.agentId, 'ag1');
+  assert.deepEqual(calc.runs.map(r => r.kind), ['spawn', 'continue']);
+  assert.equal(calc.runs[0].status, 'done');
+  assert.equal(calc.runs[0].report, 'wrote add');
+  // The receipt is not an outcome: the continued run is still going.
+  assert.equal(calc.runs[1].status, 'running');
+  assert.equal(calc.status, 'running');
+  assert.equal(calc.runs[1].prompt, 'add mul(a,b)');
+  assert.deepEqual(calc.runs[0].toolUses.map(m => m.content.id), ['w1']);
+  assert.deepEqual(calc.runs[1].toolUses.map(m => m.content.id), ['b2']);
+
+  const finished = buildSubagentTree([...messages,
+    msg('agent_event', { toolUseId: 'sm1', agentId: 'ag1', phase: 'finished', status: 'completed', summary: 'added mul' }),
+  ], { status: 'review' }).byId.get('calc');
+  assert.equal(finished.status, 'done');
+  assert.equal(finished.report, 'added mul');
+});
+
+test('subagent tree: history without agentId on events still resolves continuations from the report line', () => {
+  const messages = [
+    spawn('a', 'A'),
+    msg('tool_result', { tool_use_id: 'a', is_error: false, content: 'ok\nagentId: old-1' }),
+    msg('tool_use', { id: 's', name: 'SendMessage', input: { to: 'old-1', message: 'more' } }),
+  ];
+  assert.equal(buildSubagentTree(messages, { status: 'failed' }).byId.get('a').runs.length, 2);
+  // An address that matches nobody is left alone rather than invented.
+  const stray = [spawn('b', 'B'), msg('tool_use', { id: 's2', name: 'SendMessage', input: { to: 'nobody', message: 'x' } })];
+  assert.equal(buildSubagentTree(stray).byId.get('b').runs.length, 1);
+});

@@ -10,7 +10,7 @@ import { fmtAge, fmtDuration } from './format.js';
 import { RUNNING_STATUSES, useElapsed } from './elapsed.js';
 import { SessionPicker } from './sessionpicker.jsx';
 import { SubagentPanel } from './subagents.jsx';
-import { SPAWN_TOOL_NAMES, isSubagentInternal } from './subagent-tree.js';
+import { SPAWN_TOOL_NAMES, CONTINUE_TOOL_NAME, isSubagentInternal } from './subagent-tree.js';
 import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
 
 export function Md({ text }) {
@@ -81,6 +81,8 @@ function toolSummary(name, input) {
   if (SPAWN_TOOL_NAMES.has(name) && input.description) {
     return input.subagent_type ? `${input.subagent_type} · ${input.description}` : input.description;
   }
+  // Work handed back to an existing subagent.
+  if (name === CONTINUE_TOOL_NAME && input.to) return `→ ${input.to} · ${input.summary || String(input.message || '').slice(0, 100)}`;
   if (input.command) return String(input.command).slice(0, 120);
   if (input.file_path) return input.file_path;
   if (input.pattern) return input.pattern;

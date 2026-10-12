@@ -808,6 +808,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 .sa-facts dd { margin: 0; word-break: break-word; }
 .sa-prompt { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 10px; white-space: pre-wrap; word-break: break-word; font-size: 12.5px; max-height: 260px; overflow-y: auto; }
 .sa-report { border-left: 3px solid var(--border-strong); padding-left: 12px; }
+.sa-run { border-top: 1px solid var(--border); padding: 8px 0; }
+.sa-run > summary { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; color: var(--ink); list-style: none; }
+.sa-run > summary::-webkit-details-marker { display: none; }
+.sa-run > summary .muted { font-size: 12px; }
 @media (max-width: 720px) {
   .sa-panel { grid-template-columns: 1fr; }
   .sa-tree { position: static; max-height: 40vh; }

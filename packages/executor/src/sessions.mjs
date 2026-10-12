@@ -13,6 +13,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 
 import { truncateAtTurnBoundary } from './fork.mjs';
+import { stripRoster } from './multiagent.mjs';
 
 const DEFAULT_PROJECTS_ROOT = () => path.join(os.homedir(), '.claude', 'projects');
 const PREVIEW_LEN = 120;
@@ -228,7 +229,7 @@ export function transcriptLineToEvents(entry) {
   switch (entry?.type) {
     case 'user': {
       const content = entry.message?.content;
-      if (typeof content === 'string') return [{ role: 'user', content: { text: content } }];
+      if (typeof content === 'string') return [{ role: 'user', content: { text: stripRoster(content) } }];
       if (Array.isArray(content)) {
         const events = [];
         let textParts = [];
@@ -239,7 +240,7 @@ export function transcriptLineToEvents(entry) {
           textParts = []; images = [];
         };
         for (const block of content) {
-          if (block?.type === 'text' && block.text) textParts.push(block.text);
+          if (block?.type === 'text' && block.text) textParts.push(stripRoster(block.text));
           else if (block?.type === 'image' && block.source?.type === 'base64' && block.source.data) {
             images.push({ mediaType: block.source.media_type || 'image/png', data: block.source.data });
           } else if (block?.type === 'tool_result') {

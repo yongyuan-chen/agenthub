@@ -5,6 +5,7 @@ import { MAX_IMPORT_EVENTS } from './sessions.mjs';
 import { backendFor, backendByName, DEFAULT_BACKEND } from './backends.mjs';
 import { TRANSIENT_ERROR_CODES, codexHomeFor } from './codex-session.mjs';
 import { readAutomations, firstRruleMatchIn } from './codex-automations.mjs';
+import { withRoster, CONTINUE_TOOL_NAME, SPAWN_TOOL_NAMES } from './multiagent.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -159,6 +160,10 @@ function parentOf(msg) {
 // 2.1.296), mapped to the phase recorded on an 'agent_event' message.
 const SUBAGENT_LIFECYCLE = { task_started: 'started', task_progress: 'progress', task_notification: 'finished' };
 
+// How long a process with a backgrounded subagent still out survives without
+// any output at all before the idle sweep reaps it anyway.
+const SUBAGENT_IDLE_CAP_MS = 6 * 3600_000;
+
 // Only the fields the 子代理 tab shows, bounded: these arrive many times per
 // subagent and land in D1 like any other message.
 function agentEventContent(msg) {
@@ -168,6 +173,10 @@ function agentEventContent(msg) {
     : undefined;
   return {
     toolUseId: msg.tool_use_id,
+    // The subagent's own identity (the agentId SendMessage targets). One
+    // subagent continued several times reports under several toolUseIds —
+    // one per Agent/SendMessage call — but always this same id.
+    agentId: clip(msg.task_id, 80),
     phase: SUBAGENT_LIFECYCLE[msg.subtype],
     status: clip(msg.status, 40),
     description: clip(msg.description, 300),
@@ -475,6 +484,42 @@ export class SessionManager {
     }
   }
 
+  // What the CLI is actually sent for a user message: in a multiagent
+  // conversation, the roster of its subagents ahead of the text, so the
+  // router can always see who to hand work to (see multiagent.mjs). The
+  // 'user' event — what the board shows — keeps the text as typed.
+  _routed(t, text) {
+    return t?.agent_mode === 'multi' ? withRoster(text, this.db.subagents(t.task_id)) : text;
+  }
+
+  // The router just created a subagent or handed one more work. Its
+  // identity (agentId) only arrives with the matching task_started event, so
+  // remember what the call said until then.
+  _noteDispatch(taskId, block) {
+    const input = block.input || {};
+    let note = null;
+    if (SPAWN_TOOL_NAMES.includes(block.name)) {
+      note = { fresh: true, subagentType: input.subagent_type || null, description: input.description || null, lastTask: input.description || null };
+    } else if (block.name === CONTINUE_TOOL_NAME) {
+      note = { fresh: false, lastTask: input.summary || String(input.message || '').slice(0, 200) || null };
+    }
+    if (!note) return;
+    this._pendingDispatches ??= new Map();
+    this._pendingDispatches.set(block.id, { taskId, ...note });
+  }
+
+  _noteSubagentEvent(taskId, msg) {
+    if (!msg.task_id) return;
+    if (msg.subtype === 'task_started') {
+      const note = this._pendingDispatches?.get(msg.tool_use_id);
+      if (!note || note.taskId !== taskId) return;   // not the main thread's (a subagent's own spawn)
+      this._pendingDispatches.delete(msg.tool_use_id);
+      this.db.noteSubagentRun(taskId, msg.task_id, note);
+    } else if (msg.subtype === 'task_notification') {
+      this.db.setSubagentStatus(taskId, msg.task_id, msg.status === 'completed' ? 'idle' : 'failed');
+    }
+  }
+
   _spawn(taskId, firstMessage, { fresh = false, silent = false } = {}) {
     const t = this.db.getTask(taskId);
     // A task pinned to a specific model profile at creation time keeps using
@@ -526,7 +571,7 @@ export class SessionManager {
       // copy would look like the human said it twice. The "正在重试…" /
       // "检测到...自动重试" system messages already say what's happening.
       if (!silent) this.emit(taskId, { k: 'msg', role: 'user', content: { text: sendText, ...(sendImages.length ? { images: sendImages } : {}) } });
-      session.send(sendText, sendImages);
+      session.send(this._routed(t, sendText), sendImages);
       this.setStatus(taskId, 'running');
       // Once sent, spec has done its one job — clearing it here (not just
       // wherever it's read) is what makes retryTask() safe regardless of
@@ -553,6 +598,16 @@ export class SessionManager {
     switch (msg.type) {
       case 'system':
         if (msg.subtype === 'init') {
+          // A turn nobody sent: a backgrounded subagent (every continued one
+          // is) finished after the turn that dispatched it settled, and the
+          // CLI starts a turn of its own to hand its report to the main
+          // thread. Show it as running like any other turn; its 'result'
+          // settles it back through the normal path below.
+          const live = this.sessions.get(taskId);
+          if (t.status === 'review' && live && !live.busy) {
+            live.busy = true;
+            this.setStatus(taskId, 'running');
+          }
           if (msg.session_id && msg.session_id !== t.session_id) {
             this.db.patchTask(taskId, { sessionId: msg.session_id });
             this.emit(taskId, { k: 'session', sessionId: msg.session_id });
@@ -564,6 +619,16 @@ export class SessionManager {
           // it is launched, long before it is done). Stored as its own role
           // so the chat can skip it and the 子代理 tab can build on it.
           this.emit(taskId, { k: 'msg', role: 'agent_event', content: agentEventContent(msg) });
+          // Which subagent runs are still out, so this process isn't reaped
+          // (or, for real_config_dir, closed at turn end) with one of them
+          // halfway through its work — see _sweepIdle.
+          this._noteSubagentEvent(taskId, msg);
+          const live = this.sessions.get(taskId);
+          if (live) {
+            live.runningSubagents ??= new Set();
+            if (msg.subtype === 'task_notification') live.runningSubagents.delete(msg.tool_use_id);
+            else live.runningSubagents.add(msg.tool_use_id);
+          }
         } else if (msg.subtype === 'compacted') {
           // History was just summarized away, so the stored context estimate
           // is now far too high. Left stale it would re-trigger auto-compact
@@ -583,6 +648,7 @@ export class SessionManager {
             this.emit(taskId, { k: 'msg', role: 'assistant', content: { text: block.text, ...parent } });
           } else if (block.type === 'tool_use') {
             this.emit(taskId, { k: 'msg', role: 'tool_use', content: { id: block.id, name: block.name, input: block.input, ...parent } });
+            if (!parent.parentToolUseId && t.agent_mode === 'multi') this._noteDispatch(taskId, block);
           } else if (block.type === 'thinking' && block.thinking) {
             this.emit(taskId, { k: 'msg', role: 'thinking', content: { text: block.thinking, ...parent } });
           }
@@ -630,6 +696,9 @@ export class SessionManager {
         // total_cost_usd is cumulative per CLI process; add only the delta.
         // A negative delta means a fresh process (counter reset) — take it whole.
         const session = this.sessions.get(taskId);
+        // A dispatch's task_started follows its tool_use immediately, so any
+        // still unmatched when the turn ends never will be.
+        for (const [id, note] of this._pendingDispatches ?? []) if (note.taskId === taskId) this._pendingDispatches.delete(id);
         // Whatever turn just finished (including a compact one we kicked off
         // ourselves) is done — clear the in-flight guard so a future result
         // can trigger auto-compact again if it's still needed.
@@ -717,7 +786,7 @@ export class SessionManager {
             session.pendingResendAfterCompact = null;
             const { text: rText, images: rImages } = decodeInput(raw);
             this.emit(taskId, { k: 'msg', role: 'system', content: { text: '压缩完成,自动重发被中断的输入继续任务…' } });
-            session.send(rText, rImages);
+            session.send(this._routed(t, rText), rImages);
             this.setStatus(taskId, 'running');
             continuing = true; // keep the session alive (real_config_dir would otherwise kill it below)
           } else if (this._maybeAutoCompact(taskId, session)) {
@@ -756,7 +825,7 @@ export class SessionManager {
         // stop the user from having a live VS Code window open at the same
         // literal instant, which is an inherent `claude --resume` limitation
         // with or without AgentHub.)
-        if (t.real_config_dir && !continuing && session) {
+        if (t.real_config_dir && !continuing && session && !session.runningSubagents?.size) {
           session.kill();
           this.sessions.delete(taskId);
         }
@@ -1078,7 +1147,7 @@ export class SessionManager {
     this._compactRecoveries.delete(taskId);
     this._turnCapContinuations.delete(taskId);
     record();
-    session.send(text, images);
+    session.send(this._routed(this.db.getTask(taskId), text), images);
     this.setStatus(taskId, 'running');
     // Same bookkeeping as _spawn's firstMessage send — if *this* turn fails
     // transiently, retry/auto-retry needs to know what to resend (images
@@ -1391,7 +1460,11 @@ export class SessionManager {
     for (const [taskId, session] of this.sessions) {
       const t = this.db.getTask(taskId);
       const idleFor = Date.now() - session.lastActivity;
-      if (t && t.status === 'review' && !session.busy && idleFor > this.config.idleSessionTimeoutMs) {
+      // A backgrounded subagent keeps the process wanted past the usual idle
+      // timeout — up to a cap, so one that hangs silently can't pin a CLI
+      // process forever (any output it produces resets idleFor anyway).
+      const awaitingSubagents = session.runningSubagents?.size > 0 && idleFor < SUBAGENT_IDLE_CAP_MS;
+      if (t && t.status === 'review' && !session.busy && !awaitingSubagents && idleFor > this.config.idleSessionTimeoutMs) {
         session.kill();
         this.sessions.delete(taskId);
       }

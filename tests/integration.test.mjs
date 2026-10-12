@@ -5943,3 +5943,99 @@ test('multiagent: refused with Codex, on a node too old to understand it, and sw
   const sw = await core.api(teamCtx, 'POST', `/api/tasks/${ok.body.task.id}/switch-model`, { modelProfileId: codexId });
   assert.equal(sw.status, 409);
 });
+
+test('multiagent: a continued subagent keeps its process alive past the idle timeout, and its report turn shows as running', async () => {
+  const cloud = makeCloud();
+  const { teamCtx } = await seedMultiProject(cloud, 'mac-route');
+  let sessionOpts;
+  const exec = makeExecutor(cloud, 'mac-route', async (session, opts) => {
+    sessionOpts = opts;
+    await sleep(5);
+    // The router hands the request back to an existing subagent: SendMessage
+    // returns a receipt at once, and the turn settles while it works.
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'sm1', name: 'SendMessage', input: { to: 'ag1', message: 'add mul' } }] } });
+    opts.onMessage({ type: 'system', subtype: 'task_started', tool_use_id: 'sm1', task_id: 'ag1' });
+    opts.onMessage({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'sm1', content: 'Resuming agent ag1' }] } });
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
+    session.busy = false;
+  }, { idleSessionTimeoutMs: 1 });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  const res = await core.api(teamCtx, 'POST', '/api/tasks', { title: 't', spec: '加 mul', nodeId: 'mac-route' });
+  const taskId = res.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 3000, 'dispatch turn settled');
+  const session = exec.manager.sessions.get(taskId);
+
+  await sleep(5);
+  exec.manager._sweepIdle();
+  assert.equal(exec.manager.sessions.get(taskId), session, 'not reaped while its subagent is still working');
+  assert.equal(session.alive, true);
+
+  const statuses = [];
+  const origSetStatus = exec.manager.setStatus.bind(exec.manager);
+  exec.manager.setStatus = (id, status, extra) => { if (id === taskId) statuses.push(status); return origSetStatus(id, status, extra); };
+  // The subagent finishes; the CLI starts a turn on its own to report it.
+  sessionOpts.onMessage({ type: 'system', subtype: 'task_notification', tool_use_id: 'sm1', task_id: 'ag1', status: 'completed', summary: 'added mul' });
+  sessionOpts.onMessage({ type: 'system', subtype: 'init', session_id: session.sessionId });
+  sessionOpts.onMessage({ type: 'assistant', message: { content: [{ type: 'text', text: 'mul 加好了' }] } });
+  sessionOpts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.02, duration_ms: 10, num_turns: 1, is_error: false });
+  session.busy = false;
+  assert.deepEqual(statuses, ['running', 'review']);
+  await until(async () => (await cloud.db.prepare("SELECT COUNT(*) AS n FROM messages WHERE task_id = ? AND role = 'agent_event'").bind(taskId).first()).n === 2, 3000, 'events stored');
+  const events = (await cloud.db.prepare("SELECT content FROM messages WHERE task_id = ? AND role = 'agent_event' ORDER BY seq").bind(taskId).all()).results
+    .map(r => JSON.parse(r.content));
+  assert.deepEqual(events.map(e => e.agentId), ['ag1', 'ag1'], 'both runs carry the subagent identity');
+
+  await sleep(5);
+  exec.manager._sweepIdle();
+  assert.equal(exec.manager.sessions.get(taskId), undefined, 'reaped normally once nothing is out');
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('multiagent: each user message reaches the router with the roster of its subagents; the board shows it as typed', async () => {
+  const cloud = makeCloud();
+  const { teamCtx } = await seedMultiProject(cloud, 'mac-roster');
+  const sent = [];
+  let turn = 0;
+  const exec = makeExecutor(cloud, 'mac-roster', async (session, opts, text) => {
+    sent.push(text);
+    turn++;
+    await sleep(5);
+    if (turn === 1) {
+      opts.onMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'sp1', name: 'Agent', input: { description: 'calc.py', subagent_type: 'implementer', prompt: 'write add' } }] } });
+      opts.onMessage({ type: 'system', subtype: 'task_started', tool_use_id: 'sp1', task_id: 'ag1' });
+      // A subagent's own spawn is not the router's to address.
+      opts.onMessage({ type: 'assistant', parent_tool_use_id: 'sp1', message: { content: [{ type: 'tool_use', id: 'nested', name: 'Agent', input: { description: 'helper' } }] } });
+      opts.onMessage({ type: 'system', subtype: 'task_started', tool_use_id: 'nested', task_id: 'ag-nested' });
+      opts.onMessage({ type: 'system', subtype: 'task_notification', tool_use_id: 'sp1', task_id: 'ag1', status: 'completed' });
+      opts.onMessage({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'sp1', content: 'done\nagentId: ag1' }] } });
+    } else {
+      opts.onMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'sm1', name: 'SendMessage', input: { to: 'ag1', summary: 'add mul', message: 'add mul too' } }] } });
+      opts.onMessage({ type: 'system', subtype: 'task_started', tool_use_id: 'sm1', task_id: 'ag1' });
+    }
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  const res = await core.api(teamCtx, 'POST', '/api/tasks', { title: 't', spec: '写 add', nodeId: 'mac-roster' });
+  const taskId = res.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 3000, 'turn 1');
+  assert.equal(sent[0], '写 add', 'nothing to list before the first subagent exists');
+
+  await core.api(teamCtx, 'POST', `/api/tasks/${taskId}/message`, { text: '再加 mul' });
+  await until(() => sent.length === 2, 3000, 'turn 2 sent');
+  assert.match(sent[1], /^<agenthub-subagents>/);
+  assert.match(sent[1], /- ag1 \(implementer\) "calc.py" — last handed: calc.py; handed work 1×; idle/);
+  assert.ok(!sent[1].includes('ag-nested'));
+  assert.ok(sent[1].endsWith('\n\n再加 mul'));
+  await until(() => exec.db.subagents(taskId)[0]?.runs === 2, 3000, 'turn 2 handed ag1 more work');
+  const userTexts = (await cloud.db.prepare("SELECT content FROM messages WHERE task_id = ? AND role = 'user' ORDER BY seq").bind(taskId).all()).results
+    .map(r => JSON.parse(r.content).text);
+  assert.deepEqual(userTexts, ['写 add', '再加 mul']);
+  const [row] = exec.db.subagents(taskId);
+  assert.deepEqual([row.agent_id, row.runs, row.status, row.last_task], ['ag1', 2, 'running', 'add mul']);
+  exec.manager.shutdown();
+  exec.link.stop();
+});

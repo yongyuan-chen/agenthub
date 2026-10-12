@@ -8,7 +8,8 @@ import { ulid, userCanTransition, sha256Hex } from '../packages/shared/protocol.
 import { sendWebPush } from '../packages/worker/src/push.mjs';
 import { listDirs } from '../packages/executor/src/cloudlink.mjs';
 import { buildClaudeArgs } from '../packages/executor/src/session.mjs';
-import { multiAgentDefinitions, writeAgentsFile, ORCHESTRATOR_AGENT } from '../packages/executor/src/multiagent.mjs';
+import { multiAgentDefinitions, writeAgentsFile, ORCHESTRATOR_AGENT, withRoster, stripRoster } from '../packages/executor/src/multiagent.mjs';
+import { transcriptLineToEvents } from '../packages/executor/src/sessions.mjs';
 import { fmtDuration } from '../packages/web/src/format.js';
 import { elapsedOf, RUNNING_STATUSES } from '../packages/web/src/elapsed.js';
 
@@ -43,8 +44,25 @@ test('multiagent: the main thread runs as an orchestrator that cannot change any
   const tools = defs[ORCHESTRATOR_AGENT].tools;
   for (const banned of ['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash']) assert.ok(!tools.includes(banned), banned);
   assert.ok(tools.includes('Agent') && tools.includes('Task'));
+  // Routing work back to a subagent that already knows the area.
+  assert.ok(tools.includes('SendMessage'));
   // The worker that does the changes is unrestricted (no tools list = all).
   assert.equal(defs.implementer.tools, undefined);
+});
+
+test('multiagent roster: shown to the router ahead of the message, never to the human', () => {
+  assert.equal(withRoster('加个 mul', []), '加个 mul', 'no subagents yet: sent exactly as typed');
+  const sent = withRoster('加个 mul', [
+    { agent_id: 'ag1', subagent_type: 'implementer', description: 'calc.py', last_task: 'add\n函数', runs: 2, status: 'idle' },
+  ]);
+  assert.match(sent, /^<agenthub-subagents>\n/);
+  assert.match(sent, /- ag1 \(implementer\) "calc.py" — last handed: add 函数; handed work 2×; idle/);
+  assert.ok(sent.endsWith('\n\n加个 mul'));
+  assert.equal(stripRoster(sent), '加个 mul');
+  assert.equal(stripRoster('plain <agenthub-subagents>'), 'plain <agenthub-subagents>');
+  // Reading the CLI transcript back as history shows the typed text only.
+  assert.deepEqual(transcriptLineToEvents({ type: 'user', message: { content: sent } }), [{ role: 'user', content: { text: '加个 mul' } }]);
+  assert.deepEqual(transcriptLineToEvents({ type: 'user', message: { content: [{ type: 'text', text: sent }] } }), [{ role: 'user', content: { text: '加个 mul' } }]);
 });
 
 test('listDirs: prefix-completes into matching subdirectories', () => {

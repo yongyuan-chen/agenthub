@@ -49,6 +49,25 @@ export class LocalDb {
         created_at        INTEGER,
         PRIMARY KEY (task_id, client_message_id)
       );
+
+      -- A multiagent conversation's subagents, as the router should see them:
+      -- injected ahead of each user message (see multiagent.mjs's withRoster)
+      -- so routing never depends on the router remembering agentIds that
+      -- context compaction may have summarized away. Only subagents the main
+      -- thread itself created — those are the ones it can address.
+      --   status     running | idle | failed
+      --   last_task  what it was most recently handed (description/summary)
+      CREATE TABLE IF NOT EXISTS local_subagents (
+        task_id        TEXT NOT NULL,
+        agent_id       TEXT NOT NULL,
+        subagent_type  TEXT,
+        description    TEXT,
+        last_task      TEXT,
+        status         TEXT NOT NULL DEFAULT 'running',
+        runs           INTEGER NOT NULL DEFAULT 1,
+        updated_at     INTEGER,
+        PRIMARY KEY (task_id, agent_id)
+      );
     `);
     // CREATE TABLE IF NOT EXISTS can't retroactively add a column to an
     // already-existing local_tasks on an already-installed node.
@@ -224,6 +243,31 @@ export class LocalDb {
     return this.db.prepare(
       'SELECT task_id, seq, payload FROM outbox WHERE task_id = ? AND seq > ? ORDER BY seq LIMIT ?'
     ).all(taskId, afterSeq, limit);
+  }
+
+  // A subagent was created (or handed more work): its row, newest activity
+  // first in the roster. `fresh` = a new subagent, otherwise a continuation.
+  noteSubagentRun(taskId, agentId, { subagentType = null, description = null, lastTask = null, fresh = false } = {}) {
+    this.db.prepare(`
+      INSERT INTO local_subagents (task_id, agent_id, subagent_type, description, last_task, status, runs, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'running', 1, ?)
+      ON CONFLICT(task_id, agent_id) DO UPDATE SET
+        subagent_type = COALESCE(excluded.subagent_type, subagent_type),
+        description   = COALESCE(excluded.description, description),
+        last_task     = COALESCE(excluded.last_task, last_task),
+        status        = 'running',
+        runs          = runs + ?,
+        updated_at    = excluded.updated_at
+    `).run(taskId, agentId, subagentType, description, lastTask, Date.now(), fresh ? 0 : 1);
+  }
+
+  setSubagentStatus(taskId, agentId, status) {
+    this.db.prepare('UPDATE local_subagents SET status = ?, updated_at = ? WHERE task_id = ? AND agent_id = ?')
+      .run(status, Date.now(), taskId, agentId);
+  }
+
+  subagents(taskId, limit = 20) {
+    return this.db.prepare('SELECT * FROM local_subagents WHERE task_id = ? ORDER BY updated_at DESC LIMIT ?').all(taskId, limit);
   }
 
   ack(taskId, seq) {
