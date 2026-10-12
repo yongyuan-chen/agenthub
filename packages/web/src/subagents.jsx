@@ -1,7 +1,8 @@
 // The 子代理 tab of a multiagent conversation: which subagent the orchestrator
 // (or another subagent) launched, as a tree, and the selected one's state.
 // Built from the same message list the chat renders — see subagent-tree.js.
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { api } from './api.js';
 import { buildSubagentTree, countByStatus } from './subagent-tree.js';
 import { Md, ToolUseRow } from './task.jsx';
 import { fmtDuration } from './format.js';
@@ -96,7 +97,32 @@ function SubagentDetail({ node, resultByToolId, now }) {
   );
 }
 
-export function SubagentPanel({ task, messages, hasOlder = false, onLoadOlder = null }) {
+// The chat's loaded window plus the conversation's full subagent history,
+// fetched once when the tab opens: the window alone is the newest 60 rows,
+// which in a multiagent conversation usually covers only the latest
+// subagent. Live messages keep arriving through the window; seq dedupes the
+// overlap.
+function useSubagentMessages(taskId, windowMessages) {
+  const [history, setHistory] = useState({ taskId: null, messages: [], hasMore: false, loading: true });
+  useEffect(() => {
+    let cancelled = false;
+    setHistory({ taskId, messages: [], hasMore: false, loading: true });
+    api.subagentMessages(taskId)
+      .then(r => { if (!cancelled) setHistory({ taskId, messages: r.messages || [], hasMore: !!r.hasMore, loading: false }); })
+      .catch(() => { if (!cancelled) setHistory({ taskId, messages: [], hasMore: false, loading: false }); });
+    return () => { cancelled = true; };
+  }, [taskId]);
+  const merged = useMemo(() => {
+    if (history.taskId !== taskId || !history.messages.length) return windowMessages;
+    const bySeq = new Map(history.messages.map(m => [m.seq, m]));
+    for (const m of windowMessages) bySeq.set(m.seq, m);
+    return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+  }, [history, taskId, windowMessages]);
+  return { messages: merged, truncated: history.hasMore, loading: history.loading };
+}
+
+export function SubagentPanel({ task, messages: windowMessages }) {
+  const { messages, truncated, loading } = useSubagentMessages(task.id, windowMessages);
   const { roots, byId } = useMemo(() => buildSubagentTree(messages, task), [messages, task?.status]);
   const resultByToolId = useMemo(() => {
     const map = new Map();
@@ -110,16 +136,8 @@ export function SubagentPanel({ task, messages, hasOlder = false, onLoadOlder = 
   // is the one being worked on.
   const selected = byId.get(selectedId) ?? roots[roots.length - 1] ?? null;
 
-  const olderButton = hasOlder && onLoadOlder && (
-    <button type="button" className="ghost" onClick={onLoadOlder}>加载更早消息</button>
-  );
   if (!roots.length) {
-    return (
-      <div className="empty">
-        {hasOlder ? '已加载的这段对话里还没有 subagent — 更早的历史还没加载' : '还没有 subagent。发一条需求,主 agent 会把它派给 subagent 处理。'}
-        {olderButton && <> · {olderButton}</>}
-      </div>
-    );
+    return <div className="empty">{loading ? '正在加载子代理…' : '还没有 subagent。发一条需求,主 agent 会把它派给 subagent 处理。'}</div>;
   }
   return (
     <div className="sa-panel">
@@ -133,7 +151,7 @@ export function SubagentPanel({ task, messages, hasOlder = false, onLoadOlder = 
         {roots.map(node => (
           <TreeRow key={node.id} node={node} depth={1} selectedId={selected?.id} onSelect={setSelectedId} />
         ))}
-        {olderButton && <div className="history-page-actions">{olderButton}</div>}
+        {truncated && <div className="muted sa-truncated">对话太长,最早的一部分子代理记录没有显示。</div>}
       </div>
       {selected && <SubagentDetail node={selected} resultByToolId={resultByToolId} now={now} />}
     </div>

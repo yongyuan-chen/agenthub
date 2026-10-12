@@ -111,6 +111,7 @@ export const api = {
   // with hasMore so the client knows whether anything older is left.
   messagesBefore: (id, beforeSeq = 0, limit = 60) =>
     req('GET', `/api/tasks/${id}/messages?before_seq=${beforeSeq}&limit=${limit}`),
+  subagentMessages: (id) => req('GET', `/api/tasks/${id}/subagent-messages`),
   // clientMessageId makes the send durable and idempotent end-to-end: the
   // cloud stores it before answering, keeps redelivering until the node
   // echoes that same id back, and collapses a retry of the same id onto the

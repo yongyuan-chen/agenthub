@@ -1394,7 +1394,7 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
       )}
 
       {tab === 'agents' && (
-        <div className="tab-scroll"><SubagentPanel task={task} messages={messages} hasOlder={hasOlder} onLoadOlder={loadOlder} /></div>
+        <div className="tab-scroll"><SubagentPanel task={task} messages={messages} /></div>
       )}
 
       {tab === 'diff' && <div className="tab-scroll"><DiffView messages={messages} hasOlder={hasOlder} onLoadOlder={loadOlder} /></div>}

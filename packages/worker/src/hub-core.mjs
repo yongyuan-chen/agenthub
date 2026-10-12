@@ -211,6 +211,11 @@ async function attachAgentModes(db, tasks) {
   for (const t of tasks) t.agent_mode = multi.has(t.id) ? 'multi' : 'single';
 }
 
+// Upper bound on one subagent-messages answer. A busy multiagent
+// conversation is mostly subagent steps, and each step's tool output can be
+// sizable; beyond this the oldest are left out (the response says so).
+const SUBAGENT_MESSAGES_LIMIT = 3000;
+
 // start_task.task fields for a conversation in a multiagent project — {} for
 // a single-agent one, so older nodes and payloads are byte-for-byte unchanged.
 const agentModeField = (mode) => (mode === 'multi' ? { agentMode: 'multi' } : {});
@@ -1547,6 +1552,34 @@ export async function api(ctx, method, pathname, body) {
     // scroll up. Opening used to mean fetching the whole history (a long
     // autonomous run is thousands of messages, three 1000-row round trips)
     // before the first bubble could render.
+    // Everything the 子代理 tab needs, regardless of how much of the chat is
+    // loaded: the spawn/continue calls and their results, lifecycle events,
+    // and every subagent's own steps. The chat pages from the newest end
+    // (60 rows), and in a multiagent conversation those rows are mostly
+    // subagent internals — after a reload the tree only ever saw the latest
+    // subagent. Filtered by JSON fields in SQL so a long conversation's
+    // main-thread chatter never crosses the wire for this.
+    if (method === 'GET' && action === 'subagent-messages') {
+      const limit = Math.min(Number(body?.limit ?? SUBAGENT_MESSAGES_LIMIT), SUBAGENT_MESSAGES_LIMIT);
+      const spawnNames = `('Agent','Task','SendMessage')`;
+      const rows = await q(ctx.db,
+        `SELECT seq, role, content, created_at FROM messages WHERE task_id = ? AND (
+           role = 'agent_event'
+           OR json_extract(content, '$.parentToolUseId') IS NOT NULL
+           OR (role = 'tool_use' AND json_extract(content, '$.name') IN ${spawnNames})
+           OR (role = 'tool_result' AND json_extract(content, '$.tool_use_id') IN (
+             SELECT json_extract(content, '$.id') FROM messages
+             WHERE task_id = ? AND role = 'tool_use' AND json_extract(content, '$.name') IN ${spawnNames}))
+         ) ORDER BY seq DESC LIMIT ?`,
+        taskId, taskId, limit + 1).all();
+      const list = rows.results ?? rows;
+      const hasMore = list.length > limit;
+      return ok({
+        // Newest kept when capped: the subagents still at work matter most.
+        messages: (hasMore ? list.slice(0, limit) : list).reverse().map(r => ({ ...r, content: JSON.parse(r.content) })),
+        hasMore,
+      });
+    }
     if (method === 'GET' && action === 'messages') {
       const limit = Math.min(Number(body?.limit ?? 300), 1000);
       const decode = rows => (rows.results ?? rows).map(r => ({ ...r, content: JSON.parse(r.content) }));

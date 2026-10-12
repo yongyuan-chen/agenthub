@@ -6039,3 +6039,46 @@ test('multiagent: each user message reaches the router with the roster of its su
   exec.manager.shutdown();
   exec.link.stop();
 });
+
+test('multiagent: the subagent history comes back whole, even when the chat window would only reach the latest subagent', async () => {
+  const cloud = makeCloud();
+  const { teamCtx } = await seedMultiProject(cloud, 'mac-history');
+  const exec = makeExecutor(cloud, 'mac-history', async (session, opts) => {
+    await sleep(5);
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'text', text: '先派 A' }, { type: 'tool_use', id: 'spA', name: 'Agent', input: { description: 'A', prompt: 'a' } }] } });
+    opts.onMessage({ type: 'system', subtype: 'task_started', tool_use_id: 'spA', task_id: 'agA' });
+    opts.onMessage({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'spA', content: 'A done\nagentId: agA' }] } });
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'spB', name: 'Agent', input: { description: 'B', prompt: 'b' } }] } });
+    // B is busy enough to push A far out of the newest page.
+    for (let i = 0; i < 80; i++) {
+      opts.onMessage({ type: 'assistant', parent_tool_use_id: 'spB', message: { content: [{ type: 'tool_use', id: `b${i}`, name: 'Bash', input: { command: `step ${i}` } }] } });
+    }
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'smA', name: 'SendMessage', input: { to: 'agA', message: 'more' } }] } });
+    opts.onMessage({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'smA', content: 'Resuming agent agA' }] } });
+    opts.onMessage({ type: 'assistant', message: { content: [{ type: 'text', text: '都派出去了' }] } });
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0.01, duration_ms: 10, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  const res = await core.api(teamCtx, 'POST', '/api/tasks', { title: 't', spec: '开工', nodeId: 'mac-history' });
+  const taskId = res.body.task.id;
+  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'review', 5000, 'review');
+
+  const page = await core.api(teamCtx, 'GET', `/api/tasks/${taskId}/messages`, { before_seq: 0, limit: 60 });
+  assert.ok(!page.body.messages.some(m => m.content.id === 'spA'), 'precondition: A is outside the newest page');
+
+  const r = await core.api(teamCtx, 'GET', `/api/tasks/${taskId}/subagent-messages`, {});
+  assert.equal(r.status, 200);
+  assert.equal(r.body.hasMore, false);
+  const ids = r.body.messages.map(m => m.content.id ?? m.content.tool_use_id ?? m.content.toolUseId);
+  for (const id of ['spA', 'spB', 'smA', 'b0', 'b79']) assert.ok(ids.includes(id), id);
+  assert.equal(r.body.messages.filter(m => m.role === 'tool_result' && m.content.tool_use_id === 'spA').length, 1, "A's report");
+  assert.ok(r.body.messages.some(m => m.role === 'agent_event'));
+  // Main-thread chatter and the human's own message aren't part of it.
+  assert.ok(!r.body.messages.some(m => m.role === 'assistant' || m.role === 'user' || m.role === 'result'));
+  const seqs = r.body.messages.map(m => m.seq);
+  assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), 'oldest first');
+  exec.manager.shutdown();
+  exec.link.stop();
+});
