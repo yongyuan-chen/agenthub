@@ -51,20 +51,10 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
     = useAttachments('draft', setErr);
 
   useEffect(() => {
-    // Both requests feed the same decision (which path to pre-fill), so they
-    // settle together — otherwise whichever resolved last would win.
-    Promise.all([
-      api.getSettings().catch(() => ({})),
-      api.recentRepos().catch(() => ({})),
-    ]).then(([s, r]) => {
-      setDefaultRepoUrl(s.defaultRepoUrl || '');
-      setRecents(r.repos || []);
-      setTopRepo(r.top || '');
-      // The path this scope's conversations use most wins over the account
-      // default: inside a project you're nearly always working in that
-      // project's checkout, and the account default is the global fallback.
-      setPath(prev => (pathTouched.current ? prev : (r.top || s.defaultRepoUrl || '')));
-    });
+    // Offered in the path picker, never pre-filled: it's one path for every
+    // machine, and the pre-fill has to be a path that exists on the node
+    // actually picked (see the per-node effect below).
+    api.getSettings().then(s => setDefaultRepoUrl(s.defaultRepoUrl || '')).catch(() => {});
     api.modelProfiles().then(r => {
       const profiles = r.profiles || [];
       setProfiles(profiles);
@@ -90,6 +80,25 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
   const autoNode = nodes.find(n => n.status === 'online') || nodes[0];
   const selectedNode = (nodeId && nodes.find(n => n.id === nodeId)) || autoNode;
   const selectedProfile = modelProfileId ? profiles.find(p => p.id === modelProfileId) : null;
+
+  // The pre-filled path follows the node: this project's most used path ON
+  // THAT MACHINE, else the scratch dir. A local path only exists where it was
+  // typed, so carrying one across a node switch (as this used to) defaults
+  // the new node to a directory it doesn't have. Switching node also drops a
+  // hand-picked path for the same reason.
+  const nodeKey = selectedNode?.id || null;
+  useEffect(() => {
+    if (!nodeKey) return undefined;
+    let stale = false;
+    pathTouched.current = false;
+    api.recentRepos(nodeKey).catch(() => ({})).then(r => {
+      if (stale) return;   // the user already moved on to another node
+      setRecents(r.repos || []);
+      setTopRepo(r.top || '');
+      setPath(prev => (pathTouched.current ? prev : (r.top || '')));
+    });
+    return () => { stale = true; };
+  }, [nodeKey]);
   // 默认配置 = the relay mirrored to every node; without a default profile
   // there's nothing behind it, so don't offer it.
   const hasDefault = profiles.some(p => p.isDefault);

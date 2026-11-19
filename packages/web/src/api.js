@@ -49,7 +49,7 @@ export const api = {
   me: () => req('GET', '/api/me'),
   getSettings: () => req('GET', '/api/settings'),
   saveSettings: (settings) => req('POST', '/api/settings', settings),
-  recentRepos: () => req('GET', '/api/recent-repos'),
+  recentRepos: (nodeId) => req('GET', `/api/recent-repos${nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : ''}`),
   browseNode: (nodeId, path) => req('GET', `/api/nodes/${nodeId}/browse?path=${encodeURIComponent(path)}`),
   // File browser. taskId with no path asks the node to start in that task's
   // own working directory — only it knows the worktree path.

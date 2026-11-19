@@ -1466,6 +1466,42 @@ test('recent-repos: `top` is the most-used path in the current scope, per projec
   assert.equal(personal.body.top, '/personal', '个人视角不受项目内路径影响');
 });
 
+// A local path only exists on the machine it was used on, so the new-chat
+// pane asks per node — switching node must not carry another box's path.
+test('recent-repos: ?nodeId narrows `top` and suggestions to that machine', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)').bind('team-n', 'P', now).run();
+  await cloud.db.prepare('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)')
+    .bind('team-n', 'user-test', 'owner', now).run();
+  for (const id of ['gpu-a', 'gpu-b', 'gpu-empty']) {
+    await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+      .bind(id, await sha256Hex('tok-' + id), 'user-test', now).run();
+    await cloud.db.prepare('INSERT INTO node_teams (node_id, team_id) VALUES (?, ?)').bind(id, 'team-n').run();
+  }
+  const teamCtx = { ...cloud.ctx, teamId: 'team-n' };
+  for (const [nodeId, repoUrl] of [['gpu-a', '/data/a'], ['gpu-a', '/data/a'], ['gpu-a', '/data/a2'], ['gpu-b', '/home/b'], ['gpu-a', '/data/a']]) {
+    assert.equal((await core.api(teamCtx, 'POST', '/api/tasks', { title: 't', spec: 'x', nodeId, repoUrl })).status, 200);
+  }
+  // A personal conversation on gpu-b: suggested there, but not this project's top.
+  await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'gpu-b', repoUrl: '/home/mine' });
+
+  const all = await core.api(teamCtx, 'GET', '/api/recent-repos', {});
+  assert.equal(all.body.top, '/data/a', 'no node given: project-wide, as before');
+
+  const a = await core.api(teamCtx, 'GET', '/api/recent-repos', { nodeId: 'gpu-a' });
+  assert.equal(a.body.top, '/data/a');
+  assert.deepEqual(a.body.repos, ['/data/a', '/data/a2'], 'nothing from gpu-b');
+
+  const b = await core.api(teamCtx, 'GET', '/api/recent-repos', { nodeId: 'gpu-b' });
+  assert.equal(b.body.top, '/home/b');
+  assert.deepEqual(b.body.repos.sort(), ['/home/b', '/home/mine']);
+
+  const empty = await core.api(teamCtx, 'GET', '/api/recent-repos', { nodeId: 'gpu-empty' });
+  assert.equal(empty.body.top, null, 'never used in this project on that node -> scratch dir');
+  assert.deepEqual(empty.body.repos, []);
+});
+
 test('model-profiles: CRUD + ownership isolation', async () => {
   const cloud = makeCloud();
   const now = Date.now();

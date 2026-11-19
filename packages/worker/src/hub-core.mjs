@@ -2413,20 +2413,34 @@ export async function api(ctx, method, pathname, body) {
   //  2. the account-wide recent list, so paths from other scopes are still
   //     one click away.
   if (method === 'GET' && route[0] === 'recent-repos' && route.length === 1) {
+    // ?nodeId= narrows everything to paths used on that machine. A local
+    // path only exists on the box it was typed on, so "this project's most
+    // used path" from some other node is a guaranteed-broken default — found
+    // live: switching node in the new-chat pane kept the old node's path.
+    const nodeId = body?.nodeId || null;
+    const nodeFilter = nodeId ? ' AND node_id = ?' : '';
+    const nodeArgs = nodeId ? [nodeId] : [];
     const scopedRows = ctx.teamId
       ? await q(ctx.db,
           `SELECT repo_url, COUNT(*) AS uses, MAX(created_at) AS last_used FROM tasks
            WHERE id IN (SELECT task_id FROM task_teams WHERE team_id = ?)
-             AND repo_url IS NOT NULL AND repo_url <> ''
-           GROUP BY repo_url ORDER BY uses DESC, last_used DESC LIMIT 8`, ctx.teamId).all()
+             AND repo_url IS NOT NULL AND repo_url <> ''${nodeFilter}
+           GROUP BY repo_url ORDER BY uses DESC, last_used DESC LIMIT 8`, ctx.teamId, ...nodeArgs).all()
       : await q(ctx.db,
           `SELECT repo_url, COUNT(*) AS uses, MAX(created_at) AS last_used FROM tasks
            WHERE owner_user_id = ? AND id NOT IN (SELECT task_id FROM task_teams)
-             AND repo_url IS NOT NULL AND repo_url <> ''
-           GROUP BY repo_url ORDER BY uses DESC, last_used DESC LIMIT 8`, userId).all();
+             AND repo_url IS NOT NULL AND repo_url <> ''${nodeFilter}
+           GROUP BY repo_url ORDER BY uses DESC, last_used DESC LIMIT 8`, userId, ...nodeArgs).all();
     const scoped = (scopedRows.results ?? scopedRows).map(r => r.repo_url);
-    const recentRows = await q(ctx.db,
-      'SELECT repo_url FROM recent_repos WHERE owner_user_id = ? ORDER BY last_used_at DESC LIMIT 8', userId).all();
+    // recent_repos doesn't record a node, so with a node picked the extra
+    // suggestions come from your own conversations on that machine instead.
+    const recentRows = nodeId
+      ? await q(ctx.db,
+          `SELECT repo_url, MAX(created_at) AS last_used FROM tasks
+           WHERE owner_user_id = ? AND node_id = ? AND repo_url IS NOT NULL AND repo_url <> ''
+           GROUP BY repo_url ORDER BY last_used DESC LIMIT 8`, userId, nodeId).all()
+      : await q(ctx.db,
+          'SELECT repo_url FROM recent_repos WHERE owner_user_id = ? ORDER BY last_used_at DESC LIMIT 8', userId).all();
     const repos = [...scoped];
     for (const r of (recentRows.results ?? recentRows)) {
       if (!repos.includes(r.repo_url)) repos.push(r.repo_url);
