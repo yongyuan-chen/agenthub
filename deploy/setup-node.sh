@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Enroll an ADDITIONAL server as an AgentHub executor node (M3 一键加机).
-# Run ON the new server, from a checkout of this repo:
-#   APP_URL=https://agenthub.win USER_TOKEN=xxx TEAM_ID=xxx bash deploy/setup-node.sh [node-id]
+# Run ON the new server, from a checkout of this repo (or via install.sh):
+#   APP_URL=https://agenthub.win bash deploy/setup-node.sh [node-id]
+# Prints a /connect link and waits; whoever opens it and clicks 连接 owns the
+# node (and picks its project there). For unattended installs pass
+# USER_TOKEN=<session token> [TEAM_ID=<project>] instead and no link is shown.
 # No LLM relay credentials needed here — the owning user's Settings-page
 # config is pushed to this node automatically the moment it connects.
-# TEAM_ID (optional) binds the node to that team at enrollment; leave unset
-# for a personal node only its registering user can see/use.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
 : "${APP_URL:?set APP_URL (e.g. https://agenthub.win)}"
-: "${USER_TOKEN:?set USER_TOKEN (your account session token)}"
+USER_TOKEN="${USER_TOKEN:-}"
 TEAM_ID="${TEAM_ID:-}"
 
 # Includes the OS username, not just the hostname — node ids are global
@@ -44,38 +45,93 @@ if [ "$HAS_CLAUDE" = 0 ] && [ "$HAS_CODEX" = 0 ]; then
   exit 1
 fi
 
-echo "[node] enrolling $NODE_ID at $APP_URL${TEAM_ID:+ (team $TEAM_ID)}"
-# Was `curl -sf ... >/dev/null` — with `set -e` that meant any non-2xx (most
-# commonly: another user already has a node with this id, since it defaults
-# to the bare hostname and two accounts sharing one physical box collide on
-# it) killed the script with zero output at all, right after the "enrolling"
-# line — found live: a second user on an already-enrolled shared GPU box saw
-# nothing but that one line and no error, no hint why. -f discards the
-# response body specifically to make scripting "did this succeed" easy, at
-# the cost of throwing away the one thing a human needs to see when it didn't.
-ENROLL_RESP="$(curl -s -w $'\n%{http_code}' -X POST "$APP_URL/api/nodes" \
-  -H "authorization: Bearer $USER_TOKEN" -H "content-type: application/json" \
-  ${TEAM_ID:+-H "x-team-id: $TEAM_ID"} \
-  -d "{\"id\":\"$NODE_ID\",\"tokenHash\":\"$TOKEN_HASH\",\"labels\":[\"$(uname -s | tr '[:upper:]' '[:lower:]')\"],\"autoName\":$AUTO_NAME}")"
-ENROLL_HTTP_CODE="${ENROLL_RESP##*$'\n'}"
-ENROLL_BODY="${ENROLL_RESP%$'\n'*}"
-if [ "$ENROLL_HTTP_CODE" != "200" ]; then
-  echo "[node] ERROR: enrollment failed (HTTP $ENROLL_HTTP_CODE): $ENROLL_BODY" >&2
-  if [ "$ENROLL_HTTP_CODE" = "409" ]; then
-    echo "[node] node id '$NODE_ID' is already taken by another account on this server (ids are global, and default to the hostname) — re-run with a unique NODE_ID, e.g.:" >&2
-    echo "  NODE_ID=\"$NODE_ID-$(whoami)\" APP_URL=... USER_TOKEN=... bash deploy/setup-node.sh" >&2
-  fi
-  exit 1
-fi
+json_field() {
+  node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const v=JSON.parse(d)[process.argv[1]];process.stdout.write(v==null?"":String(v))}catch{}})' "$1"
+}
+OS_LABEL="$(uname -s | tr '[:upper:]' '[:lower:]')"
 
-# Under AUTO_NAME the server may have handed back a different id than we asked
-# for (it stepped past a collision). Everything downstream — the config file,
-# the daemon's identity, the "done" message — has to use the id that was
-# actually registered, or this box would authenticate as nobody.
-REGISTERED_ID="$(printf '%s' "$ENROLL_BODY" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).id||"")}catch{process.stdout.write("")}})' 2>/dev/null || true)"
-if [ -n "$REGISTERED_ID" ] && [ "$REGISTERED_ID" != "$NODE_ID" ]; then
-  echo "[node] '$NODE_ID' was already in use; this machine was registered as '$REGISTERED_ID'"
+if [ -n "$USER_TOKEN" ]; then
+  echo "[node] enrolling $NODE_ID at $APP_URL${TEAM_ID:+ (team $TEAM_ID)}"
+  # Was `curl -sf ... >/dev/null` — with `set -e` that meant any non-2xx (most
+  # commonly: another user already has a node with this id, since it defaults
+  # to the bare hostname and two accounts sharing one physical box collide on
+  # it) killed the script with zero output at all, right after the "enrolling"
+  # line — found live: a second user on an already-enrolled shared GPU box saw
+  # nothing but that one line and no error, no hint why. -f discards the
+  # response body specifically to make scripting "did this succeed" easy, at
+  # the cost of throwing away the one thing a human needs to see when it didn't.
+  ENROLL_RESP="$(curl -s -w $'\n%{http_code}' -X POST "$APP_URL/api/nodes" \
+    -H "authorization: Bearer $USER_TOKEN" -H "content-type: application/json" \
+    ${TEAM_ID:+-H "x-team-id: $TEAM_ID"} \
+    -d "{\"id\":\"$NODE_ID\",\"tokenHash\":\"$TOKEN_HASH\",\"labels\":[\"$OS_LABEL\"],\"autoName\":$AUTO_NAME}")"
+  ENROLL_HTTP_CODE="${ENROLL_RESP##*$'\n'}"
+  ENROLL_BODY="${ENROLL_RESP%$'\n'*}"
+  if [ "$ENROLL_HTTP_CODE" != "200" ]; then
+    echo "[node] ERROR: enrollment failed (HTTP $ENROLL_HTTP_CODE): $ENROLL_BODY" >&2
+    if [ "$ENROLL_HTTP_CODE" = "409" ]; then
+      echo "[node] node id '$NODE_ID' is already taken by another account on this server (ids are global, and default to the hostname) — re-run with a unique NODE_ID, e.g.:" >&2
+      echo "  NODE_ID=\"$NODE_ID-$(whoami)\" APP_URL=... USER_TOKEN=... bash deploy/setup-node.sh" >&2
+    fi
+    exit 1
+  fi
+
+  # Under AUTO_NAME the server may have handed back a different id than we asked
+  # for (it stepped past a collision). Everything downstream — the config file,
+  # the daemon's identity, the "done" message — has to use the id that was
+  # actually registered, or this box would authenticate as nobody.
+  REGISTERED_ID="$(printf '%s' "$ENROLL_BODY" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{process.stdout.write(JSON.parse(d).id||"")}catch{process.stdout.write("")}})' 2>/dev/null || true)"
+  if [ -n "$REGISTERED_ID" ] && [ "$REGISTERED_ID" != "$NODE_ID" ]; then
+    echo "[node] '$NODE_ID' was already in use; this machine was registered as '$REGISTERED_ID'"
+    NODE_ID="$REGISTERED_ID"
+  fi
+else
+  # Tailscale-style: register a pending request carrying only the token's
+  # hash, print a link, wait for someone logged in to click 连接 there.
+  # A previous install's id (or an explicit node-id arg) rides along so that
+  # approving from the same account re-enrolls that node instead of minting
+  # "<host>-<user>-2" every time the installer is re-run.
+  EXISTING_ID=""
+  if [ "$AUTO_NAME" = false ]; then
+    EXISTING_ID="$NODE_ID"
+    NODE_ID="$(printf '%s-%s' "$(hostname -s)" "$(whoami)" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed -e 's/-*$//' -e 's/^-*//')"
+  elif [ -f "$HOME/.agenthub/executor.config.json" ]; then
+    EXISTING_ID="$(json_field nodeId < "$HOME/.agenthub/executor.config.json" 2>/dev/null || true)"
+  fi
+  NODE_ID="$(printf '%s' "${NODE_ID:-node}" | cut -c1-63)"
+  START_BODY="$(node -e 'const [id,existingId,tokenHash,label,hostname,user]=process.argv.slice(1);console.log(JSON.stringify({id,existingId:existingId||undefined,tokenHash,labels:[label],hostname,user}))' \
+    "$NODE_ID" "$EXISTING_ID" "$TOKEN_HASH" "$OS_LABEL" "$(hostname)" "$(whoami)")"
+  START_RESP="$(curl -s -w $'\n%{http_code}' -X POST "$APP_URL/api/node-auth/start" -H "content-type: application/json" -d "$START_BODY")"
+  START_HTTP_CODE="${START_RESP##*$'\n'}"
+  START_BODY="${START_RESP%$'\n'*}"
+  if [ "$START_HTTP_CODE" != "200" ]; then
+    echo "[node] ERROR: could not start the connect flow (HTTP $START_HTTP_CODE): $START_BODY" >&2
+    exit 1
+  fi
+  AUTH_CODE="$(printf '%s' "$START_BODY" | json_field code)"
+  AUTH_URL="$(printf '%s' "$START_BODY" | json_field url)"
+
+  printf '\n  To connect this machine to AgentHub, open:\n\n      \033[1;4m%s\033[0m\n\n  Log in if asked, then click Connect. Waiting...\n\n' "$AUTH_URL"
+  # Only on a desktop session sitting in front of this box — over SSH the
+  # browser would pop up on a screen nobody is looking at.
+  if [ -z "${SSH_CONNECTION:-}" ]; then
+    if [ "$(uname -s)" = "Darwin" ]; then open "$AUTH_URL" >/dev/null 2>&1 || true
+    elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v xdg-open >/dev/null; then xdg-open "$AUTH_URL" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  REGISTERED_ID=""
+  while [ -z "$REGISTERED_ID" ]; do
+    sleep 2
+    POLL="$(curl -s "$APP_URL/api/node-auth/$AUTH_CODE" || true)"
+    case "$(printf '%s' "$POLL" | json_field status)" in
+      approved) REGISTERED_ID="$(printf '%s' "$POLL" | json_field nodeId)" ;;
+      expired) echo "[node] ERROR: the connect link expired before anyone approved it — re-run the install command" >&2; exit 1 ;;
+      pending|approving|"") ;;  # "" = transient network/parse failure, keep waiting
+      *) echo "[node] ERROR: unexpected connect status: $POLL" >&2; exit 1 ;;
+    esac
+  done
   NODE_ID="$REGISTERED_ID"
+  echo "[node] connected as '$NODE_ID'"
 fi
 
 mkdir -p "$HOME/.agenthub"

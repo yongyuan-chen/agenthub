@@ -16,6 +16,7 @@ import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHM
 import * as accounts from './accounts.mjs';
 import { hashPassword } from './auth.mjs';
 import { cachedCliVersions } from './cli-releases.mjs';
+import { normalizeAuthCode } from './node-auth.mjs';
 
 const q = (db, sql, ...params) => db.prepare(sql).bind(...params);
 const SOURCE_CACHE_TTL_MS = 10 * 60_000;
@@ -1287,6 +1288,57 @@ async function createTask(ctx, body, userId, { adopting = true } = {}) {
 // ---------- user-facing API (returns {status, body}) ----------
 // ctx.userId must be set by the caller for every route below.
 
+// Shared by POST /api/nodes (installer holding a session token) and the
+// /connect approval (installer holding nothing). teamId is explicit rather
+// than read off ctx so the approval can bind to the project picked on the page.
+async function enrollNode(ctx, { id, tokenHash, labels, autoName, teamId }) {
+  const userId = ctx.userId;
+  // Two enrollment intents share this route, and they want opposite things
+  // when the id is already in use:
+  //
+  //   autoName=true  — "add a machine". The installer derived the id from
+  //     hostname+username without anyone choosing it, so a collision is an
+  //     accident, and the ON CONFLICT below would silently rotate the token
+  //     of whatever machine already holds that id, knocking it offline for
+  //     good (it can't re-auth, and nothing tells its owner why). Step to
+  //     the next free suffix instead and hand the real id back so the
+  //     installer writes *that* into its config.
+  //   autoName=false — "repair / re-enroll this exact node" (the offline
+  //     repair one-liner, which passes the existing id deliberately).
+  //     Rotating the token is the entire point there, so it is left alone.
+  let assignedId = id;
+  if (autoName) {
+    for (let suffix = 2; await q(ctx.db, 'SELECT 1 FROM nodes WHERE id = ?', assignedId).first(); suffix++) {
+      assignedId = `${id}-${suffix}`;
+    }
+  } else {
+    const existing = await q(ctx.db, 'SELECT owner_user_id FROM nodes WHERE id = ?', id).first();
+    if (existing && existing.owner_user_id !== userId) return err(409, 'node id already taken');
+  }
+  const registeredId = assignedId;
+  await q(ctx.db,
+    `INSERT INTO nodes (id, token_hash, owner_user_id, labels, status, created_at) VALUES (?, ?, ?, ?, 'offline', ?)
+     ON CONFLICT(id) DO UPDATE SET token_hash = excluded.token_hash, labels = excluded.labels`,
+    registeredId, tokenHash, userId, JSON.stringify(labels ?? []), ctx.now()).run();
+  // The team active in the browser when "添加节点" generated this install
+  // command (see board.jsx) becomes this node's initial project — same
+  // starting-point UX as before, but now additive rather than exclusive:
+  // re-running install against an existing node id doesn't remove any
+  // project associations it already picked up since then.
+  if (teamId) {
+    await q(ctx.db, 'INSERT OR IGNORE INTO node_teams (node_id, team_id) VALUES (?, ?)', registeredId, teamId).run();
+  }
+  // Tell any open browser about it right away. Enrollment used to be silent,
+  // so a freshly installed machine only showed up once its daemon connected
+  // and markNodeOnline() broadcast — leaving the first-run wizard, which
+  // promises the machine "will appear here automatically", staring at an
+  // empty list for however long the daemon took to start.
+  await broadcastNode(ctx, registeredId, userId);
+  // The installer must use the id we actually registered, not the one it
+  // asked for — under autoName they differ whenever there was a collision.
+  return ok({ id: registeredId });
+}
+
 export async function api(ctx, method, pathname, body) {
   const seg = pathname.split('/').filter(Boolean); // ['api', ...]
   const route = seg.slice(1);
@@ -2025,51 +2077,48 @@ export async function api(ctx, method, pathname, body) {
     const { id, tokenHash, labels, autoName } = body || {};
     if (!id || !tokenHash) return err(400, 'id + tokenHash required');
     if (!(await assertTeamMember(ctx, ctx.teamId))) return err(403, 'not a member of that team');
-
-    // Two enrollment intents share this route, and they want opposite things
-    // when the id is already in use:
-    //
-    //   autoName=true  — "add a machine". The installer derived the id from
-    //     hostname+username without anyone choosing it, so a collision is an
-    //     accident, and the ON CONFLICT below would silently rotate the token
-    //     of whatever machine already holds that id, knocking it offline for
-    //     good (it can't re-auth, and nothing tells its owner why). Step to
-    //     the next free suffix instead and hand the real id back so the
-    //     installer writes *that* into its config.
-    //   autoName=false — "repair / re-enroll this exact node" (the offline
-    //     repair one-liner, which passes the existing id deliberately).
-    //     Rotating the token is the entire point there, so it is left alone.
-    let assignedId = id;
-    if (autoName) {
-      for (let suffix = 2; await q(ctx.db, 'SELECT 1 FROM nodes WHERE id = ?', assignedId).first(); suffix++) {
-        assignedId = `${id}-${suffix}`;
-      }
-    } else {
-      const existing = await q(ctx.db, 'SELECT owner_user_id FROM nodes WHERE id = ?', id).first();
-      if (existing && existing.owner_user_id !== userId) return err(409, 'node id already taken');
+    return enrollNode(ctx, { id, tokenHash, labels, autoName, teamId: ctx.teamId });
+  }
+  // The browser half of the "run one command, click Connect" flow (see
+  // node-auth.mjs for the installer half). Turns a pending request into a
+  // node under whoever clicked, bound to the project they picked on the
+  // /connect page — not to whichever tab happened to be active.
+  if (method === 'POST' && route[0] === 'node-auth' && route.length === 3 && route[2] === 'approve') {
+    const teamId = body?.teamId || null;
+    if (!(await assertTeamMember(ctx, teamId))) return err(403, 'not a member of that team');
+    const code = normalizeAuthCode(route[1]);
+    const now = ctx.now();
+    // Claim first, enroll second: the conditional UPDATE is the one atomic
+    // step, so two tabs clicking 连接 at once can't both register a node.
+    const claimed = await q(ctx.db,
+      `UPDATE node_auth_requests SET approved_by = ?, approved_at = ?
+       WHERE code = ? AND approved_at IS NULL AND expires_at > ?`, userId, now, code, now).run();
+    if (!claimed.meta?.changes) {
+      const row = await q(ctx.db, 'SELECT approved_at, expires_at FROM node_auth_requests WHERE code = ?', code).first();
+      if (!row) return err(404, 'connect request not found');
+      return err(410, row.approved_at ? 'this machine has already been connected' : 'connect request expired — re-run the install command');
     }
-    const registeredId = assignedId;
-    await q(ctx.db,
-      `INSERT INTO nodes (id, token_hash, owner_user_id, labels, status, created_at) VALUES (?, ?, ?, ?, 'offline', ?)
-       ON CONFLICT(id) DO UPDATE SET token_hash = excluded.token_hash, labels = excluded.labels`,
-      registeredId, tokenHash, userId, JSON.stringify(labels ?? []), ctx.now()).run();
-    // The team active in the browser when "添加节点" generated this install
-    // command (see board.jsx) becomes this node's initial project — same
-    // starting-point UX as before, but now additive rather than exclusive:
-    // re-running install against an existing node id doesn't remove any
-    // project associations it already picked up since then.
-    if (ctx.teamId) {
-      await q(ctx.db, 'INSERT OR IGNORE INTO node_teams (node_id, team_id) VALUES (?, ?)', registeredId, ctx.teamId).run();
+    const req = await q(ctx.db, 'SELECT * FROM node_auth_requests WHERE code = ?', code).first();
+    // Re-running the installer on a box that's already one of YOUR nodes
+    // re-enrolls that node in place (fresh token, same id, same projects),
+    // like the repair one-liner. Someone else's id falls back to a new name.
+    const existing = req.existing_id
+      ? await q(ctx.db, 'SELECT owner_user_id FROM nodes WHERE id = ?', req.existing_id).first()
+      : null;
+    const reuse = existing?.owner_user_id === userId;
+    let labels = [];
+    try { labels = JSON.parse(req.labels || '[]'); } catch { /* keep [] */ }
+    const res = await enrollNode(ctx, {
+      id: reuse ? req.existing_id : req.suggested_id, tokenHash: req.token_hash, labels, autoName: !reuse, teamId,
+    });
+    if (res.status !== 200) {
+      // Hand the request back so the installer (still polling) isn't stuck
+      // on 'approving' forever and someone can retry the click.
+      await q(ctx.db, 'UPDATE node_auth_requests SET approved_by = NULL, approved_at = NULL WHERE code = ?', code).run();
+      return res;
     }
-    // Tell any open browser about it right away. Enrollment used to be silent,
-    // so a freshly installed machine only showed up once its daemon connected
-    // and markNodeOnline() broadcast — leaving the first-run wizard, which
-    // promises the machine "will appear here automatically", staring at an
-    // empty list for however long the daemon took to start.
-    await broadcastNode(ctx, registeredId, userId);
-    // The installer must use the id we actually registered, not the one it
-    // asked for — under autoName they differ whenever there was a collision.
-    return ok({ id: registeredId });
+    await q(ctx.db, 'UPDATE node_auth_requests SET node_id = ? WHERE code = ?', res.body.id, code).run();
+    return ok({ id: res.body.id, reused: reuse });
   }
   // Add/remove an EXISTING node to/from a project after the fact — a node
   // can be shared with several projects at once, same as tasks. Owner-only;

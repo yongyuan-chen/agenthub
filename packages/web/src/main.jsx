@@ -7,6 +7,7 @@ import { SettingsModal } from './settings.jsx';
 import { AppShell } from './shell.jsx';
 import { SupervisorPage } from './supervisor.jsx';
 import { OnboardingModal, useSetupStatus } from './onboarding.jsx';
+import { ConnectPage } from './connect.jsx';
 
 function useStore() {
   return useSyncExternalStore(subscribe, getVersion);
@@ -21,6 +22,8 @@ function useHashRoute() {
   }, []);
   return hash;
 }
+
+const connectCode = location.pathname.match(/^\/connect\/([A-Za-z0-9-]+)\/?$/)?.[1] || null;
 
 const ACTIVE_TEAM_KEY = 'agenthub_active_team';
 state.activeTeamId = localStorage.getItem(ACTIVE_TEAM_KEY) || null;
@@ -261,6 +264,10 @@ function App() {
   };
 
   if (!authed) return <AuthScreen onOk={(u) => { setUser(u); setAuthed(true); }} />;
+
+  // install.sh's "open this link and click 连接" — a real path rather than a
+  // hash route so it reads cleanly in a terminal; the SPA fallback serves it.
+  if (connectCode) return <ConnectPage code={connectCode} />;
 
   // The supervisor spans every project at once, so it deliberately renders
   // outside AppShell's per-scope board rather than as another pane inside it.

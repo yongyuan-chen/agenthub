@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { api, getToken } from './api.js';
+import { api } from './api.js';
 import {
   buildNodeInstallCommand, buildNodeInstallPrompt, nodeDisplayName, nodeLabels,
   nodeProjectLabels, nodeRepairCommands,
@@ -17,8 +17,7 @@ export function NodeInstallPanel() {
   const [os, setOs] = useState('unix'); // 'unix' | 'windows'
   const [copied, setCopied] = useState('');
   const [showPrompt, setShowPrompt] = useState(false);
-  const token = useRef(getToken()).current;
-  const shared = { os, origin: location.origin, token, teamId: state.activeTeamId };
+  const shared = { os, origin: location.origin };
   // No node id is passed: the installer derives one from the target machine's
   // hostname + OS username, and the server steps past any collision (see the
   // autoName branch in hub-core.mjs).
@@ -36,8 +35,12 @@ export function NodeInstallPanel() {
         <button type="button" className={os === 'unix' ? 'active' : ''} onClick={() => setOs('unix')}>macOS / Linux</button>
         <button type="button" className={os === 'windows' ? 'active' : ''} onClick={() => setOs('windows')}>Windows</button>
       </nav>
-      <textarea readOnly rows={4} value={cmd} onClick={e => e.target.select()} />
+      <textarea readOnly rows={os === 'windows' ? 3 : 1} value={cmd} onClick={e => e.target.select()} />
       <button type="button" onClick={() => copy('cmd', cmd)}>{copied === 'cmd' ? '已复制 ✓' : '复制命令'}</button>
+      <p className="muted">
+        运行后终端会打印一个链接,在浏览器里打开它、点「连接」,这台机器就接入了。
+        命令里不含任何密钥,可以放心粘贴。
+      </p>
 
       <div className="install-fallback">
         <button type="button" className="ghost link" onClick={() => setShowPrompt(v => !v)}>
@@ -47,9 +50,7 @@ export function NodeInstallPanel() {
           <>
             <p className="muted">
               把下面这段话发给那台机器上的 Claude Code(或任何能执行命令的 AI),它会自己装、自己排错、装完验证。
-            </p>
-            <p className="err">
-              ⚠️ 这段话里带着你的登录令牌,拿到的人可以操作你的账号。只发给你自己机器上的 AI,别贴到公开的地方。
+              中途它会把连接链接发给你,打开点「连接」即可。
             </p>
             <textarea readOnly rows={7} value={prompt} onClick={e => e.target.select()} />
             <button type="button" className="ghost" onClick={() => copy('prompt', prompt)}>
@@ -62,25 +63,16 @@ export function NodeInstallPanel() {
   );
 }
 
+// Which project the machine joins is picked on the /connect page now (see
+// connect.jsx), not inherited from the active tab when the command is copied.
 export function AddNodeModal({ onClose }) {
-  // Whichever scope is active right now (个人 / a specific team) becomes the
-  // node's permanent binding at enrollment — nodes aren't auto-shared with
-  // every team the registering user happens to belong to (see hub-core.mjs's
-  // team-sharing redesign notes), so this is the only place that decision
-  // gets made.
-  const activeTeam = state.teams.find(t => t.id === state.activeTeamId);
-
   return createPortal(
     <ModalBackdrop onClose={onClose}>
       <div className="modal add-node-modal" onClick={e => e.stopPropagation()}>
         <h2>添加执行节点</h2>
         <p className="muted">
-          在要接入的机器上执行下面这条命令就行。节点名字会自动按「主机名-用户名」生成,重名会自动加后缀,
-          之后可以在「节点管理」里改显示名。缺 Node.js / Git / claude / codex 会自动装好。
-        </p>
-        <p className="muted">
-          这台机器会加入:<b>{activeTeam ? activeTeam.name : '个人'}</b>
-          {activeTeam ? '(项目成员都能用它建任务)' : '(只有你自己能用)'} — 切换左侧项目 tab 可改变这里。
+          在要接入的机器上执行下面这条命令就行。缺 Node.js / Git / claude 会自动装好。
+          节点名字会自动按「主机名-用户名」生成,加入个人还是某个项目在点「连接」时选。
         </p>
         <NodeInstallPanel />
         <div className="modal-actions">
@@ -102,9 +94,7 @@ export function AddNodeModal({ onClose }) {
 function NodeRepairGuide({ node }) {
   const [copied, setCopied] = useState(false);
   const repair = nodeRepairCommands(node, location.origin);
-  const cmd = buildNodeInstallCommand({
-    os: repair.os, origin: location.origin, token: getToken(), nodeId: node.id,
-  });
+  const cmd = buildNodeInstallCommand({ os: repair.os, origin: location.origin, nodeId: node.id });
   const copy = async () => {
     try { await navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 2000); }
     catch { /* clipboard unavailable, user can select manually */ }
@@ -114,7 +104,7 @@ function NodeRepairGuide({ node }) {
       <ol>
         <li>先确认服务器本身开机且能访问本站:在服务器的{repair.shell}里执行 <code>{repair.connectivity}</code>,{repair.connectivityExpected}。</li>
         <li>
-          <b>推荐的一步修复</b>:在服务器的{repair.shell}里重新运行安装命令(可重复执行:自动更新代码、重写配置并重启守护进程,节点身份不变):
+          <b>推荐的一步修复</b>:在服务器的{repair.shell}里重新运行安装命令,打开它打印的链接点「连接」(可重复执行:自动更新代码、重写配置并重启守护进程,节点身份不变):
           <textarea readOnly rows={3} value={cmd} onClick={e => e.target.select()} />
           <button type="button" className="ghost" onClick={copy}>{copied ? '已复制 ✓' : '复制命令'}</button>
         </li>

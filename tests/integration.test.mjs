@@ -16,6 +16,7 @@ import { SessionManager } from '../packages/executor/src/manager.mjs';
 import { CloudLink } from '../packages/executor/src/cloudlink.mjs';
 import { sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, PROTOCOL_VERSION, OUTBOUND_MESSAGE_TTL_MS, FEATURE_CLI_UPGRADE } from '../packages/shared/protocol.mjs';
 import * as accounts from '../packages/worker/src/accounts.mjs';
+import * as nodeAuth from '../packages/worker/src/node-auth.mjs';
 import { nativeSessionFile } from '../packages/executor/src/sessions.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -3806,6 +3807,85 @@ test('node enrollment: autoName steps past a collision instead of hijacking the 
   assert.equal(repair.status, 200);
   assert.equal(repair.body.id, 'ubuntu-root');
   assert.equal((await cloud.db.prepare('SELECT token_hash FROM nodes WHERE id = ?').bind('ubuntu-root').first()).token_hash, 'hash-repaired');
+});
+
+// Tailscale-style enrollment: the installer holds no credential, registers a
+// pending request with only its token's hash, and polls; a logged-in user
+// clicking 连接 on /connect/<code> creates the node under their account.
+test('node connect flow: approve turns a pending request into a node under the approver', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-test', 'tester', 'x', 0, now).run();
+  await cloud.db.prepare('INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)').bind('team-1', 'P', now).run();
+  await cloud.db.prepare('INSERT INTO team_members (team_id, user_id) VALUES (?, ?)').bind('team-1', 'user-test').run();
+  const tokenHash = await sha256Hex('node-secret');
+
+  assert.equal((await nodeAuth.start(cloud.db, { id: 'Bad Id', tokenHash }, 'https://h', now)).status, 400);
+  assert.equal((await nodeAuth.start(cloud.db, { id: 'box-me', tokenHash: 'nothex' }, 'https://h', now)).status, 400);
+
+  const started = await nodeAuth.start(cloud.db, {
+    id: 'box-me', tokenHash, labels: ['linux'], hostname: 'box', user: 'me',
+  }, 'https://h', now);
+  assert.equal(started.status, 200);
+  const { code } = started.body;
+  assert.match(code, /^[A-Z0-9]{4}-[A-Z0-9]{4}$/);
+  assert.equal(started.body.url, `https://h/connect/${code}`);
+
+  const pending = await nodeAuth.status(cloud.db, code.toLowerCase().replace('-', ''), now);
+  assert.equal(pending.body.status, 'pending', 'codes are case/dash-insensitive');
+  assert.equal(pending.body.hostname, 'box');
+  assert.equal(pending.body.nodeId, null);
+  assert.equal(JSON.stringify(pending.body).includes(tokenHash), false, 'status never echoes the token hash');
+
+  // Binding to a project the approver isn't in is refused outright.
+  assert.equal((await cloud.api('POST', `/api/node-auth/${code}/approve`, { teamId: 'team-nope' })).status, 403);
+
+  const approved = await cloud.api('POST', `/api/node-auth/${code}/approve`, { teamId: 'team-1' });
+  assert.equal(approved.status, 200);
+  assert.equal(approved.body.id, 'box-me');
+  const node = await cloud.db.prepare('SELECT owner_user_id, token_hash, labels FROM nodes WHERE id = ?').bind('box-me').first();
+  assert.equal(node.owner_user_id, 'user-test');
+  assert.equal(node.token_hash, tokenHash);
+  assert.equal(node.labels, '["linux"]');
+  assert.ok(await cloud.db.prepare('SELECT 1 FROM node_teams WHERE node_id = ? AND team_id = ?').bind('box-me', 'team-1').first());
+  assert.ok(cloud.broadcasts.some(m => m.t === 'node' && m.node.id === 'box-me'));
+
+  const done = await nodeAuth.status(cloud.db, code, now);
+  assert.equal(done.body.status, 'approved');
+  assert.equal(done.body.nodeId, 'box-me');
+
+  // A code is single-use.
+  assert.equal((await cloud.api('POST', `/api/node-auth/${code}/approve`, {})).status, 410);
+  assert.equal((await cloud.api('POST', '/api/node-auth/ZZZZ-ZZZZ/approve', {})).status, 404);
+});
+
+test('node connect flow: expiry, and re-running the installer re-enrolls in place', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  for (const [id, name] of [['user-test', 'tester'], ['user-bob', 'bob']]) {
+    await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(id, name, 'x', 0, now).run();
+  }
+  const h = (s) => sha256Hex(s);
+
+  const stale = await nodeAuth.start(cloud.db, { id: 'box-me', tokenHash: await h('a') }, 'https://h', now - 16 * 60_000);
+  assert.equal((await nodeAuth.status(cloud.db, stale.body.code, now)).body.status, 'expired');
+  assert.equal((await cloud.api('POST', `/api/node-auth/${stale.body.code}/approve`, {})).status, 410);
+
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('box-me', await h('old'), 'user-test', now).run();
+  // Same owner re-runs the installer: same id, rotated token, no "-2".
+  const again = await nodeAuth.start(cloud.db, { id: 'box-me', existingId: 'box-me', tokenHash: await h('new') }, 'https://h', now);
+  const r1 = await cloud.api('POST', `/api/node-auth/${again.body.code}/approve`, {});
+  assert.deepEqual([r1.body.id, r1.body.reused], ['box-me', true]);
+  assert.equal((await cloud.db.prepare('SELECT token_hash FROM nodes WHERE id = ?').bind('box-me').first()).token_hash, await h('new'));
+
+  // Someone else approving a request that names box-me must not take it over.
+  const foreign = await nodeAuth.start(cloud.db, { id: 'box-me', existingId: 'box-me', tokenHash: await h('bob') }, 'https://h', now);
+  const r2 = await core.api({ ...cloud.ctx, userId: 'user-bob' }, 'POST', `/api/node-auth/${foreign.body.code}/approve`, {});
+  assert.deepEqual([r2.body.id, r2.body.reused], ['box-me-2', false]);
+  assert.equal((await cloud.db.prepare('SELECT owner_user_id, token_hash FROM nodes WHERE id = ?').bind('box-me').first()).token_hash, await h('new'));
 });
 
 // ---- Phase 3: admin user management + global overview ----

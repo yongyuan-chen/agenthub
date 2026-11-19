@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildNodeInstallCommand,
+  buildNodeInstallPrompt,
   nodeDisplayName,
   nodeLabels,
   nodeProjectLabels,
@@ -23,23 +24,34 @@ test('node enrollment: presentation helpers have honest legacy fallbacks', () =>
   assert.deepEqual(nodeProjectLabels(nodes[1], teamNames), ['个人']);
 });
 
-test('node enrollment: add and repair flows share the same command builder', () => {
+test('node enrollment: add and repair flows share one credential-free command builder', () => {
   assert.equal(
-    buildNodeInstallCommand({
-      os: 'unix', origin: 'https://agenthub.win', token: "tok'en", nodeId: 'gpu31', teamId: 'team-a',
-    }),
-    "curl -fsSL https://agenthub.win/install.sh | APP_URL='https://agenthub.win' USER_TOKEN='tok'\\''en' TEAM_ID='team-a' NODE_ID='gpu31' bash",
+    buildNodeInstallCommand({ os: 'unix', origin: 'https://agenthub.win' }),
+    'curl -fsSL https://agenthub.win/install.sh | bash',
   );
   assert.equal(
-    buildNodeInstallCommand({ os: 'windows', origin: 'https://agenthub.win', token: 'token', nodeId: 'gpu31' }),
-    "$env:APP_URL='https://agenthub.win'; $env:USER_TOKEN='token'; $env:NODE_ID='gpu31'; Write-Host '[install] downloading AgentHub bootstrap...'; $agenthubInstaller = irm https://agenthub.win/install.ps1 -TimeoutSec 60; & ([scriptblock]::Create($agenthubInstaller))",
+    buildNodeInstallCommand({ os: 'unix', origin: 'https://agenthub.win', nodeId: "gp'u31" }),
+    "curl -fsSL https://agenthub.win/install.sh | NODE_ID='gp'\\''u31' bash",
+  );
+  assert.equal(
+    buildNodeInstallCommand({ os: 'windows', origin: 'https://agenthub.win', nodeId: 'gpu31' }),
+    "$env:NODE_ID='gpu31'; Write-Host '[install] downloading AgentHub bootstrap...'; $agenthubInstaller = irm https://agenthub.win/install.ps1 -TimeoutSec 60; & ([scriptblock]::Create($agenthubInstaller))",
   );
 });
 
+test('node enrollment: neither the command nor the AI prompt carries an account token', () => {
+  for (const os of ['unix', 'windows']) {
+    const cmd = buildNodeInstallCommand({ os, origin: 'https://agenthub.win' });
+    const prompt = buildNodeInstallPrompt({ os, origin: 'https://agenthub.win' });
+    for (const text of [cmd, prompt]) {
+      assert.doesNotMatch(text, /USER_TOKEN|TEAM_ID|APP_URL/);
+    }
+    assert.match(prompt, /\/connect\//, 'the agent must know to hand the connect link back');
+  }
+});
+
 test('node enrollment: Windows one-liner gives immediate progress and bounds bootstrap download time', () => {
-  const command = buildNodeInstallCommand({
-    os: 'windows', origin: 'https://agenthub.win', token: 'token', teamId: 'project-id',
-  });
+  const command = buildNodeInstallCommand({ os: 'windows', origin: 'https://agenthub.win' });
   assert.match(command, /Write-Host '\[install\] downloading AgentHub bootstrap\.\.\.'/);
   assert.match(command, /irm https:\/\/agenthub\.win\/install\.ps1 -TimeoutSec 60/);
   assert.match(command, /\[scriptblock\]::Create\(\$agenthubInstaller\)/);

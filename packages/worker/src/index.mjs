@@ -4,6 +4,7 @@ export { Hub } from './hub.mjs';
 export { SupervisorAgent } from './supervisor.mjs';
 import { getAgentByName } from 'agents';
 import * as accounts from './accounts.mjs';
+import * as nodeAuth from './node-auth.mjs';
 
 async function resolveUser(request, url, env) {
   const header = request.headers.get('authorization') || '';
@@ -55,6 +56,31 @@ export default {
       const token = header.startsWith('Bearer ') ? header.slice(7) : '';
       const { status, body: resBody } = await accounts.logout(env.DB, token);
       return Response.json(resBody, { status });
+    }
+
+    if (pathname === '/api/node-auth/start' && request.method === 'POST') {
+      let body = {};
+      try { body = await request.json(); } catch { /* empty */ }
+      const { status, body: resBody } = await nodeAuth.start(env.DB, body, url.origin, Date.now());
+      return Response.json(resBody, { status });
+    }
+
+    // GET only: POST /api/node-auth/<code>/approve is the authenticated half
+    // and falls through to the Hub below like any other /api route.
+    const authMatch = pathname.match(/^\/api\/node-auth\/([A-Za-z0-9-]+)$/);
+    if (authMatch && request.method === 'GET') {
+      const { status, body: resBody } = await nodeAuth.status(env.DB, authMatch[1], Date.now());
+      return Response.json(resBody, { status });
+    }
+
+    // The installers are static assets, but the one-liner shouldn't have to
+    // tell them where they came from — fill in this site's origin so
+    // `curl -fsSL <site>/install.sh | bash` is the whole command.
+    if ((pathname === '/install.sh' || pathname === '/install.ps1') && request.method === 'GET') {
+      const asset = await env.ASSETS.fetch(request);
+      if (!asset.ok) return asset;
+      const text = (await asset.text()).replaceAll('__AGENTHUB_ORIGIN__', url.origin);
+      return new Response(text, { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache' } });
     }
 
     if (pathname === '/api/vapid') {

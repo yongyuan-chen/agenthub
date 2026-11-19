@@ -1,7 +1,10 @@
 # Enroll an ADDITIONAL Windows server as an AgentHub executor node.
 # Run ON the new server, from a checkout of this repo (or via install.ps1):
-#   $env:APP_URL='https://agenthub.win'; $env:USER_TOKEN='xxx'
+#   $env:APP_URL='https://agenthub.win'
 #   powershell -ExecutionPolicy Bypass -File deploy\setup-node.ps1 [node-id]
+# Prints a /connect link and waits for someone logged in to click 连接 there
+# (same flow as setup-node.sh). Set $env:USER_TOKEN (+ optional TEAM_ID) for
+# an unattended install that skips the link.
 # No LLM relay credentials needed here — the owning user's Settings-page
 # config is pushed to this node automatically the moment it connects.
 param([string]$NodeIdArg)
@@ -9,7 +12,6 @@ $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path "$PSScriptRoot\..").Path
 
 if (-not $env:APP_URL) { throw 'set APP_URL (e.g. https://agenthub.win)' }
-if (-not $env:USER_TOKEN) { throw 'set USER_TOKEN (your account session token)' }
 $AppUrl = $env:APP_URL
 $UserToken = $env:USER_TOKEN
 $TeamId = $env:TEAM_ID  # optional — binds this node to a team at enrollment
@@ -38,18 +40,52 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
   Write-Warning "'claude' CLI not found on PATH; install it first (npm i -g @anthropic-ai/claude-code)"
 }
 
-Write-Host "[node] enrolling $NodeId at $AppUrl$(if ($TeamId) { " (team $TeamId)" })"
-$body = @{ id = $NodeId; tokenHash = $TokenHash; labels = @('windows'); autoName = $AutoName } | ConvertTo-Json -Compress
-$Headers = @{ Authorization = "Bearer $UserToken" }
-if ($TeamId) { $Headers['x-team-id'] = $TeamId }
-$Enrolled = Invoke-RestMethod -Method Post -Uri "$AppUrl/api/nodes" `
-  -Headers $Headers -ContentType 'application/json' -Body $body
-# Under $AutoName the server may hand back a different id than we asked for
-# (it stepped past a collision); the config below has to use the id actually
-# registered or this box would authenticate as nobody.
-if ($Enrolled.id -and $Enrolled.id -ne $NodeId) {
-  Write-Host "[node] '$NodeId' was already in use; this machine was registered as '$($Enrolled.id)'"
-  $NodeId = $Enrolled.id
+if ($UserToken) {
+  Write-Host "[node] enrolling $NodeId at $AppUrl$(if ($TeamId) { " (team $TeamId)" })"
+  $body = @{ id = $NodeId; tokenHash = $TokenHash; labels = @('windows'); autoName = $AutoName } | ConvertTo-Json -Compress
+  $Headers = @{ Authorization = "Bearer $UserToken" }
+  if ($TeamId) { $Headers['x-team-id'] = $TeamId }
+  $Enrolled = Invoke-RestMethod -Method Post -Uri "$AppUrl/api/nodes" `
+    -Headers $Headers -ContentType 'application/json' -Body $body
+  # Under $AutoName the server may hand back a different id than we asked for
+  # (it stepped past a collision); the config below has to use the id actually
+  # registered or this box would authenticate as nobody.
+  if ($Enrolled.id -and $Enrolled.id -ne $NodeId) {
+    Write-Host "[node] '$NodeId' was already in use; this machine was registered as '$($Enrolled.id)'"
+    $NodeId = $Enrolled.id
+  }
+} else {
+  # See setup-node.sh's connect branch: only the token's hash leaves this box,
+  # and a previous install's id rides along so re-running re-enrolls in place.
+  $ExistingId = $null
+  $ConfigPath = "$env:USERPROFILE\.agenthub\executor.config.json"
+  if (-not $AutoName) {
+    $ExistingId = $NodeId
+    $NodeId = ("$env:COMPUTERNAME-$env:USERNAME".ToLower() -replace '[^a-z0-9-]', '-') -replace '-+$', '' -replace '^-+', ''
+  } elseif (Test-Path $ConfigPath) {
+    try { $ExistingId = (Get-Content $ConfigPath -Raw | ConvertFrom-Json).nodeId } catch { }
+  }
+  if (-not $NodeId) { $NodeId = 'node' }
+  if ($NodeId.Length -gt 63) { $NodeId = $NodeId.Substring(0, 63) }
+  $StartBody = @{ id = $NodeId; existingId = $ExistingId; tokenHash = $TokenHash; labels = @('windows'); hostname = $env:COMPUTERNAME; user = $env:USERNAME } | ConvertTo-Json -Compress
+  $Start = Invoke-RestMethod -Method Post -Uri "$AppUrl/api/node-auth/start" -ContentType 'application/json' -Body $StartBody
+  Write-Host ''
+  Write-Host '  To connect this machine to AgentHub, open:'
+  Write-Host ''
+  Write-Host "      $($Start.url)" -ForegroundColor Cyan
+  Write-Host ''
+  Write-Host '  Log in if asked, then click Connect. Waiting...'
+  Write-Host ''
+  if (-not $env:SSH_CONNECTION) { try { Start-Process $Start.url } catch { } }
+  $Registered = $null
+  while (-not $Registered) {
+    Start-Sleep -Seconds 2
+    try { $Poll = Invoke-RestMethod -Uri "$AppUrl/api/node-auth/$($Start.code)" -TimeoutSec 30 } catch { continue }
+    if ($Poll.status -eq 'approved') { $Registered = $Poll.nodeId }
+    elseif ($Poll.status -eq 'expired') { throw 'the connect link expired before anyone approved it - re-run the install command' }
+  }
+  $NodeId = $Registered
+  Write-Host "[node] connected as '$NodeId'"
 }
 
 $ConfigDir = "$env:USERPROFILE\.agenthub"

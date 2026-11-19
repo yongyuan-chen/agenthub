@@ -86,6 +86,10 @@ export const api = {
   adminToggleAdmin: (id) => req('POST', `/api/admin/users/${id}/toggle-admin`),
   adminOverview: () => req('GET', '/api/admin/overview'),
   myTeams: () => req('GET', '/api/teams'),
+  // Unauthenticated read (the installer polls the same route); approval is not.
+  nodeAuthStatus: (code) => fetch(`/api/node-auth/${encodeURIComponent(code)}`).then(r => r.json()),
+  approveNodeAuth: (code, teamId) =>
+    req('POST', `/api/node-auth/${encodeURIComponent(code)}/approve`, { teamId }, { skipTeamHeader: true }),
   createTeam: (name, kind) => req('POST', '/api/teams', { name, kind }),
   projectMembers: (teamId) => req('GET', `/api/teams/${teamId}/members`),
   addProjectMember: (teamId, username) => req('POST', `/api/teams/${teamId}/members`, { username }),

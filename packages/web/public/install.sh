@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# AgentHub node installer — piped in from the web UI's "添加节点" dialog.
-# Usage (values filled in by the UI, then copy/paste on the new server):
-#   curl -fsSL https://<your-domain>/install.sh | APP_URL=... USER_TOKEN=... NODE_ID=... TEAM_ID=... bash
+# AgentHub node installer — the whole "add a machine" flow is:
+#   curl -fsSL https://<your-domain>/install.sh | bash
+# It installs whatever's missing, then prints a link; open it, log in, click
+# 连接, and this machine is a node on your board (Tailscale-style). No secret
+# is ever in the command: the node token is generated here and only its hash
+# goes to the server. The site fills in __AGENTHUB_ORIGIN__ when serving this.
+# Optional env:
+#   NODE_ID     re-enroll this exact node (the repair flow)
+#   USER_TOKEN  non-interactive enrollment with an account session token
+#               (scripts / CI); TEAM_ID then picks the project to bind to
 # No LLM relay credentials needed here — save those once in the web UI's
 # "设置" page and the cloud pushes them to every node you own automatically.
-# TEAM_ID (optional) binds this node to a team at enrollment — the UI fills
-# it in based on whichever team tab was active when the command was
-# generated; leave unset for a personal (unshared) node.
 set -euo pipefail
 
-: "${APP_URL:?missing APP_URL}"
-: "${USER_TOKEN:?missing USER_TOKEN}"
+APP_URL="${APP_URL:-__AGENTHUB_ORIGIN__}"
+case "$APP_URL" in http://*|https://*) ;; *) echo "[install] ERROR: set APP_URL (e.g. https://agenthub.win)" >&2; exit 1 ;; esac
+USER_TOKEN="${USER_TOKEN:-}"
 NODE_ID="${NODE_ID:-}"
 TEAM_ID="${TEAM_ID:-}"
 

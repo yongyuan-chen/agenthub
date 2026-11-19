@@ -58,8 +58,9 @@ phone / browser ──HTTPS/WS──► Cloudflare Worker (board + API + push)
 **https://agenthub.win/** is already running and open for sign-ups. Nothing to deploy:
 
 1. Create an account.
-2. **Add node** in the UI hands you a one-line install command with your token already in
-   it. Run it on each machine you want agents working on — macOS, Linux or Windows.
+2. On each machine you want agents working on, run
+   `curl -fsSL https://agenthub.win/install.sh | bash` (Windows: the PowerShell line from
+   **Add node** in the UI). It prints a link — open it, log in, click **连接**. Done.
 3. **Settings → Models**: save your Anthropic-compatible relay base URL and key. It syncs
    out to every node from there.
 4. Add the site to your phone's home screen so approval pushes arrive.
@@ -143,8 +144,9 @@ The script prints your site URL and a generated admin password when it finishes.
 save your API relay under **Settings → Models** (it syncs to every node from then on), and
 add the site to your home screen so push notifications work.
 
-**Adding another machine** — grab the ready-made one-liner from the "Add node" dialog in
-the web UI; it already has your token in it. No relay config needed, it syncs over.
+**Adding another machine** — run `curl -fsSL https://<your-domain>/install.sh | bash` on
+it, open the link it prints and click **连接**. The command carries no secret; no relay
+config needed either, it syncs over.
 
 ---
 

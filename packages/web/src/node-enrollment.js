@@ -18,23 +18,25 @@ export function nodeProjectLabels(node, teamNames = new Map()) {
   return teamIds.length ? teamIds.map(id => teamNames.get(id) || id) : ['个人'];
 }
 
-export function buildNodeInstallCommand({ os, origin, token, nodeId = '', teamId = '' }) {
+// No credential in either form: the installer prints a /connect link and the
+// account is chosen by whoever opens it (see node-auth.mjs). That's what lets
+// this be the same command for everyone — and safe to paste anywhere.
+// nodeId is the repair flow's "re-enroll this exact node" hint.
+export function buildNodeInstallCommand({ os, origin, nodeId = '' }) {
   if (os === 'windows') {
-    return `$env:APP_URL='${origin}'; $env:USER_TOKEN='${token}'; ${teamId ? `$env:TEAM_ID='${teamId}'; ` : ''}${nodeId ? `$env:NODE_ID='${nodeId}'; ` : ''}Write-Host '[install] downloading AgentHub bootstrap...'; $agenthubInstaller = irm ${origin}/install.ps1 -TimeoutSec 60; & ([scriptblock]::Create($agenthubInstaller))`;
+    return `${nodeId ? `$env:NODE_ID='${nodeId}'; ` : ''}Write-Host '[install] downloading AgentHub bootstrap...'; $agenthubInstaller = irm ${origin}/install.ps1 -TimeoutSec 60; & ([scriptblock]::Create($agenthubInstaller))`;
   }
-  return `curl -fsSL ${origin}/install.sh | APP_URL=${shQuote(origin)} USER_TOKEN=${shQuote(token)}${teamId ? ` TEAM_ID=${shQuote(teamId)}` : ''}${nodeId ? ` NODE_ID=${shQuote(nodeId)}` : ''} bash`;
+  return `curl -fsSL ${origin}/install.sh | ${nodeId ? `NODE_ID=${shQuote(nodeId)} ` : ''}bash`;
 }
 
 // The one-liner is the happy path, but it can still fail on a machine with an
 // old Node, no git, a proxy in the way, or a service manager that refuses to
 // start — situations where the useful next step is to read an error, not to
 // re-run the same command. This hands the whole job (including that
-// troubleshooting) to a coding agent running on the target machine.
-//
-// Deliberately carries the same USER_TOKEN the command does: it has to, or the
-// agent cannot enroll anything. The UI warns that this makes it a secret.
-export function buildNodeInstallPrompt({ os, origin, token, teamId = '' }) {
-  const cmd = buildNodeInstallCommand({ os, origin, token, teamId });
+// troubleshooting) to a coding agent running on the target machine. The agent
+// can't click 连接 for you, so it has to hand the link back.
+export function buildNodeInstallPrompt({ os, origin }) {
+  const cmd = buildNodeInstallCommand({ os, origin });
   const shell = os === 'windows' ? 'PowerShell' : 'a terminal';
   const logPath = os === 'windows'
     ? '$env:USERPROFILE\\agenthub\\logs\\executor.log'
@@ -49,7 +51,7 @@ export function buildNodeInstallPrompt({ os, origin, token, teamId = '' }) {
     '',
     cmd,
     '',
-    'It installs missing dependencies (Node.js, git, the claude/codex CLI) into my user directory, registers this machine, writes its config, and installs a background service that restarts on boot.',
+    'It installs missing dependencies (Node.js, git, the claude/codex CLI) into my user directory, then prints a link like ' + `${origin}/connect/XXXX-XXXX` + ' and waits. Show me that link right away — I will open it and click Connect — and keep the command running until it finishes on its own (the link is valid for 15 minutes). After approval it writes its config and installs a background service that restarts on boot.',
     '',
     'If it fails, do not just re-run it — read the actual error and fix the cause. Most likely:',
     `- Node.js older than 22.5, or missing entirely (the executor needs node:sqlite)`,

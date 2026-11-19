@@ -162,6 +162,13 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline: non
 .login-card input { padding: 12px 13px; }
 .login-card > button { padding: 12px; font-size: 15px; margin-top: 4px; border-radius: 12px; }
 .login-footnote { text-align: center; color: var(--muted); font-size: 12px; }
+.connect-card { width: 440px; }
+.connect-card > button.ghost { margin-top: -6px; }
+.connect-machine { display: grid; grid-template-columns: auto 1fr; gap: 8px 14px; margin: 0; font-size: 13.5px; }
+.connect-machine dt { color: var(--muted); }
+.connect-machine dd { margin: 0; word-break: break-all; }
+.connect-card select { padding: 10px 12px; }
+.connect-warning { font-size: 12.5px; margin: 0; }
 .auth-tabs { display: flex; gap: 4px; background: rgba(var(--brand-rgb), .08); border-radius: 11px; padding: 4px; }
 .auth-tabs button { flex: 1; background: transparent; color: var(--muted); padding: 7px; box-shadow: none; }
 .auth-tabs button:hover { background: rgba(255, 255, 255, .6); color: var(--fg); }

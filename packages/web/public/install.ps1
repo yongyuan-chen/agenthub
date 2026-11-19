@@ -1,6 +1,8 @@
-# AgentHub node installer for Windows — piped in from the web UI's "添加节点" dialog.
-# Usage (values filled in by the UI, then copy/paste in PowerShell):
-#   $env:APP_URL='...'; $env:USER_TOKEN='...'; irm https://<your-domain>/install.ps1 | iex
+# AgentHub node installer for Windows. The whole "add a machine" flow is:
+#   irm https://<your-domain>/install.ps1 | iex
+# then open the printed link, log in and click 连接. The site fills in
+# __AGENTHUB_ORIGIN__ when serving this file; $env:USER_TOKEN / TEAM_ID /
+# NODE_ID remain available for unattended installs and repair.
 # Missing Node.js, Git, and Claude Code are installed into the current user's
 # profile automatically. Administrator privileges and a package manager are not
 # required. Relay credentials still come from the owning user's AgentHub settings.
@@ -197,8 +199,8 @@ function Install-ClaudeCode {
 }
 
 Log 'AgentHub Windows node installer starting...'
-if (-not $env:APP_URL) { Fail 'missing APP_URL' }
-if (-not $env:USER_TOKEN) { Fail 'missing USER_TOKEN' }
+if (-not $env:APP_URL) { $env:APP_URL = '__AGENTHUB_ORIGIN__' }
+if ($env:APP_URL -notmatch '^https?://') { Fail 'set $env:APP_URL (e.g. https://agenthub.win)' }
 
 $Architecture = Get-WindowsArchitecture
 $RuntimeRoot = Join-Path $env:USERPROFILE '.agenthub\runtime'

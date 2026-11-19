@@ -415,3 +415,23 @@ CREATE TABLE IF NOT EXISTS task_reads (
   PRIMARY KEY (user_id, task_id)
 );
 CREATE INDEX IF NOT EXISTS idx_task_reads_user ON task_reads(user_id);
+
+-- Tailscale-style "run one command, click Connect" node enrollment. The
+-- installer generates the node token locally and only ever sends its hash
+-- here, then prints /connect/<code> and polls; a logged-in user opening that
+-- link and clicking 连接 turns the request into a real nodes row under their
+-- account. Nothing secret is in the install command or the link.
+CREATE TABLE IF NOT EXISTS node_auth_requests (
+  code TEXT PRIMARY KEY,           -- what the /connect/<code> link carries
+  token_hash TEXT NOT NULL,        -- sha256 of the node token the machine generated
+  suggested_id TEXT NOT NULL,      -- hostname-user slug, autoName semantics
+  existing_id TEXT,                -- id from a previous install on this box (re-enroll)
+  labels TEXT DEFAULT '[]',
+  hostname TEXT,
+  os_user TEXT,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  approved_by TEXT,
+  approved_at INTEGER,
+  node_id TEXT                     -- the id actually registered, once approved
+);
