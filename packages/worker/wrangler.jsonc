@@ -13,7 +13,14 @@
   "assets": {
     "directory": "../web/dist",
     "binding": "ASSETS",
-    "not_found_handling": "single-page-application"
+    "not_found_handling": "single-page-application",
+    // Assets matching a request are otherwise served without ever invoking
+    // the Worker — and index.mjs has to fill this site's origin into the
+    // installers so `curl -fsSL <site>/install.sh | bash` needs no APP_URL.
+    // Once this is a list, anything NOT on it is asset-first, and the SPA
+    // fallback answers every unknown path with index.html — so every route
+    // index.mjs handles has to be listed, not just the installers.
+    "run_worker_first": ["/api/*", "/ws/*", "/supervisor", "/supervisor/*", "/install.sh", "/install.ps1"]
   },
   "durable_objects": {
     "bindings": [
