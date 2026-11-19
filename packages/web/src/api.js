@@ -114,7 +114,7 @@ export const api = {
   // ones") and then to walk up its history one screenful at a time. Answers
   // with hasMore so the client knows whether anything older is left.
   messagesBefore: (id, beforeSeq = 0, limit = 60) =>
-    req('GET', `/api/tasks/${id}/messages?before_seq=${beforeSeq}&limit=${limit}`),
+    req('GET', `/api/tasks/${id}/messages?before_seq=${beforeSeq}&limit=${limit}&chat=1`),
   subagentMessages: (id) => req('GET', `/api/tasks/${id}/subagent-messages`),
   // clientMessageId makes the send durable and idempotent end-to-end: the
   // cloud stores it before answering, keeps redelivering until the node
@@ -125,6 +125,8 @@ export const api = {
   // keeps the behaviour it was written against.
   sendMessage: (id, text, images, clientMessageId, queue = true) =>
     req('POST', `/api/tasks/${id}/message`, { text, clientMessageId, queue, ...(images?.length ? { images } : {}) }),
+  editLastMessage: (id, seq, text, images, clientMessageId) =>
+    req('POST', `/api/tasks/${id}/edit-message`, { seq, text, images, clientMessageId }),
   retryMessage: (id, clientMessageId) => req('POST', `/api/tasks/${id}/retry-message`, { clientMessageId }),
   editQueuedMessage: (id, clientMessageId, text) =>
     req('POST', `/api/tasks/${id}/queued-message`, { clientMessageId, text }),

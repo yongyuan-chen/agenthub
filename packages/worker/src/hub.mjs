@@ -88,6 +88,13 @@ export class Hub {
       } : null)),
       // Same generous timeout as readFile, and for the same reason: this
       // reads a transcript that can run to tens of megabytes.
+      editMessage: async (nodeId, command) => {
+        const result = await this.askNode(nodeId, { t: 'edit_message', ...command }, 30_000);
+        // The executor sends durable events before the RPC reply. Let the
+        // serialized event pump finish before the HTTP client reloads.
+        await this._processing;
+        return result;
+      },
       forkSession: (nodeId, taskId, sessionId, dropTrailingTurns, newSessionId) => this.askNode(nodeId, {
         t: 'fork_session', taskId, sessionId, dropTrailingTurns, newSessionId,
       }, 20_000),
@@ -108,7 +115,7 @@ export class Hub {
         this.pendingAsks.delete(requestId);
         resolve(null);
       }, timeoutMs);
-      this.pendingAsks.set(requestId, { resolve, timer });
+      this.pendingAsks.set(requestId, { resolve, timer, nodeId });
     });
   }
 
@@ -170,7 +177,16 @@ export class Hub {
       const teamId = request.headers.get('x-team-id') || null;
       const invoke = () => core.api(this.ctx(userId, teamId), request.method, url.pathname, body);
       let result;
-      if (request.method === 'GET') {
+      const taskMutation = request.method !== 'GET' && url.pathname.match(/^\/api\/tasks\/([^/]+)/);
+      this._editingTasks ??= new Set();
+      if (taskMutation && this._editingTasks.has(taskMutation[1])) return Response.json({ error: 'message edit in progress' }, { status: 409 });
+      if (request.method === 'POST' && url.pathname.endsWith('/edit-message') && taskMutation) {
+        // Never await an executor RPC inside the D1 event chain: its reset
+        // must be absorbed by that very chain before the RPC can complete.
+        this._editingTasks.add(taskMutation[1]);
+        try { await this._processing; result = await invoke(); }
+        finally { this._editingTasks.delete(taskMutation[1]); }
+      } else if (request.method === 'GET') {
         result = await invoke();
       } else {
         const run = this._processing.then(invoke, invoke);
@@ -198,6 +214,7 @@ export class Hub {
     }
     if (msg.requestId && this.pendingAsks.has(msg.requestId)) {
       const pending = this.pendingAsks.get(msg.requestId);
+      if (pending.nodeId !== att.nodeId) return;
       clearTimeout(pending.timer);
       this.pendingAsks.delete(msg.requestId);
       pending.resolve(msg);

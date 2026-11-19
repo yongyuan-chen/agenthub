@@ -5109,6 +5109,63 @@ test('queued messages: a send during a running turn is held, not dispatched', as
   assert.equal(lateEdit.status, 404);
 });
 
+test('queued messages: 停止 keeps what was queued and releases it once the turn is cancelled', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-test', 'tester', 'x', 0, now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('n1', 'h', 'user-test', 'online', now).run();
+  await cloud.db.prepare(`INSERT INTO tasks (id, title, spec, node_id, owner_user_id, status, lease, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind('t1', 'busy task', 'spec', 'n1', 'user-test', 'running', 'daemon', now, now).run();
+  const sent = [];
+  cloud.ctx.sendToNode = (nodeId, payload) => { if (['user_message', 'cancel'].includes(payload.t)) sent.push(payload); return true; };
+
+  await cloud.api('POST', '/api/tasks/t1/message', { text: '排在前面', clientMessageId: 'm-before' });
+  assert.equal((await cloud.api('POST', '/api/tasks/t1/cancel')).status, 200);
+  // Sent after clicking 停止 but before the node reports back: still looks busy.
+  const late = await cloud.api('POST', '/api/tasks/t1/message', { text: '停止后发的', clientMessageId: 'm-after' });
+  assert.equal(late.body.delivery, 'held');
+  assert.deepEqual(sent.map(s => s.t), ['cancel'], 'stopping drops neither held message');
+
+  await core.absorbEvent(cloud.ctx, 'n1', { taskId: 't1', seq: 1, ev: { k: 'status', status: 'cancelled' } });
+  assert.deepEqual(sent.filter(s => s.t === 'user_message').map(s => s.text), ['排在前面'],
+    'the cancelled turn counts as ended: the oldest held message goes out');
+  const row = await cloud.db.prepare('SELECT state FROM outbound_messages WHERE client_message_id = ?').bind('m-after').first();
+  assert.equal(row.state, 'queued', 'the rest waits for the next turn as usual');
+});
+
+test('project members can stop a shared conversation and manage only their own queued messages', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  for (const [id, name] of [['user-test', 'alice'], ['user-bob', 'bob']]) await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind(id, name, 'x', 0, now).run();
+  await cloud.db.prepare('INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)').bind('team-1', 'Alpha', now).run();
+  for (const [id, role] of [['user-test', 'owner'], ['user-bob', 'member']]) await cloud.db.prepare('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)')
+    .bind('team-1', id, role, now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('n1', 'h', 'user-test', 'online', now).run();
+  await cloud.db.prepare(`INSERT INTO tasks (id, title, spec, node_id, owner_user_id, status, lease, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind('t1', 'shared', 'spec', 'n1', 'user-test', 'running', 'daemon', now, now).run();
+  await cloud.db.prepare('INSERT INTO task_teams (task_id, team_id) VALUES (?, ?)').bind('t1', 'team-1').run();
+  const sent = [];
+  cloud.ctx.sendToNode = (nodeId, payload) => { sent.push(payload); return true; };
+  const bob = (method, path, body) => core.api({ ...cloud.ctx, userId: 'user-bob', teamId: 'team-1' }, method, path, body);
+
+  await cloud.api('POST', '/api/tasks/t1/message', { text: 'alice 的', clientMessageId: 'm-alice' });
+  assert.equal((await bob('POST', '/api/tasks/t1/message', { text: 'bob 的', clientMessageId: 'm-bob' })).body.delivery, 'held');
+  assert.equal((await bob('POST', '/api/tasks/t1/queued-message', { clientMessageId: 'm-alice', text: '改别人的' })).status, 403);
+  assert.equal((await bob('DELETE', '/api/tasks/t1/queued-message/m-alice')).status, 403);
+  assert.equal((await bob('POST', '/api/tasks/t1/queued-message', { clientMessageId: 'm-bob', text: 'bob 改过' })).status, 200);
+  assert.equal((await bob('DELETE', '/api/tasks/t1/queued-message/m-bob')).status, 200);
+
+  assert.equal((await bob('POST', '/api/tasks/t1/cancel', {})).status, 200, 'a member can stop the running turn');
+  assert.ok(sent.some(c => c.t === 'cancel' && c.taskId === 't1'));
+  assert.equal((await bob('POST', '/api/tasks/t1/done', {})).status, 403, 'other lifecycle actions stay creator-only');
+});
+
 test('queued messages: releases one per turn, and queue=false bypasses holding entirely', async () => {
   const cloud = makeCloud();
   const now = Date.now();
@@ -6159,6 +6216,15 @@ test('multiagent: the subagent history comes back whole, even when the chat wind
   assert.ok(!r.body.messages.some(m => m.role === 'assistant' || m.role === 'user' || m.role === 'result'));
   const seqs = r.body.messages.map(m => m.seq);
   assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), 'oldest first');
+
+  // The chat's own paging (chat=1) skips what the chat never renders —
+  // lifecycle events and subagent internals — so the same 60 rows now reach
+  // all the way back to the human's message instead of 60 hidden rows.
+  const chat = await core.api(teamCtx, 'GET', `/api/tasks/${taskId}/messages`, { before_seq: 0, limit: 60, chat: '1' });
+  assert.equal(chat.body.hasMore, false);
+  assert.ok(chat.body.messages.some(m => m.role === 'user'), "the human's message is in the first page");
+  assert.ok(chat.body.messages.some(m => m.content.id === 'spA'));
+  assert.ok(!chat.body.messages.some(m => m.role === 'agent_event' || m.content.parentToolUseId));
   exec.manager.shutdown();
   exec.link.stop();
 });

@@ -208,11 +208,15 @@ export const FEATURE_MESSAGE_ACK = 'message-ack';
 export const FEATURE_TASK_IMAGES = 'task-images';
 export const FEATURE_FILE_IO = 'file-io';
 export const FEATURE_SESSION_FORK = 'session-fork';
+// -2: the first version moved an edited ordinary task into ~/.claude, which
+// swapped AgentHub's relay key for that home's own credentials. Bumped so the
+// cloud refuses edits on nodes still running it.
+export const FEATURE_MESSAGE_REWIND = 'message-rewind-2';
 export const FEATURE_CLI_UPGRADE = 'cli-upgrade';
 export const FEATURE_MULTI_AGENT = 'multi-agent';
 export const EXECUTOR_FEATURES = [
   FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_CLI_UPGRADE,
-  FEATURE_MULTI_AGENT,
+  FEATURE_MULTI_AGENT, FEATURE_MESSAGE_REWIND,
 ];
 
 // Caps for the file browser, shared so the executor and the cloud agree.
@@ -299,3 +303,13 @@ export async function sha256Hex(text) {
 }
 
 export function nowMs() { return Date.now(); }
+
+// Same-task edit (creator only, daemon lease). A request/response RPC, never
+// queued for an offline node: {t:'edit_message',requestId,taskId,sessionId,
+// seq,expectedText,text,images,clientMessageId,senderUserId} ->
+// {t:'edit_message_result',requestId,ok,error?,resetSeq?,sessionId?}.
+// Durable outbox event {k:'messages_reset',targetSeq,sessionId,cwd,
+// clientMessageId} deletes the projection at seq >= targetSeq. The outbox
+// sequence itself NEVER rewinds. Cloud retains a reset high-water mark so old
+// replay cannot resurrect the deleted suffix. Browser notification is only
+// {t:'messages_reset',taskId}; discard in-flight history pages and reload.

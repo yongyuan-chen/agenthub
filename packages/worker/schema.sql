@@ -416,6 +416,22 @@ CREATE TABLE IF NOT EXISTS task_reads (
 );
 CREATE INDEX IF NOT EXISTS idx_task_reads_user ON task_reads(user_id);
 
+-- A reset is an ordered executor event, not an HTTP-side deletion. Retain
+-- its watermark independently of tasks.last_seq (which also advances for
+-- ordinary events) so old outbox replay cannot resurrect removed messages.
+CREATE TABLE IF NOT EXISTS task_message_resets (
+  task_id TEXT PRIMARY KEY,
+  reset_seq INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS task_message_edits (
+  task_id TEXT NOT NULL,
+  client_message_id TEXT NOT NULL,
+  target_seq INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  reset_seq INTEGER NOT NULL,
+  PRIMARY KEY(task_id,client_message_id)
+);
+
 -- Tailscale-style "run one command, click Connect" node enrollment. The
 -- installer generates the node token locally and only ever sends its hash
 -- here, then prints /connect/<code> and polls; a logged-in user opening that

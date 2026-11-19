@@ -2,7 +2,7 @@ import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 're
 import { api } from './api.js';
 import {
   state, taskMessages, addMessage, setMessageWindow, bump, taskPendingMessages, setPendingMessages, upsertPendingMessage,
-  isTaskUnread, setTaskSeen,
+  isTaskUnread, setTaskSeen, resetMessages, messageLoadGuard, acceptMessageResetSeq,
 } from './store.js';
 import { renderMarkdown } from './md.js';
 import { STATUS_META } from './board.jsx';
@@ -33,7 +33,14 @@ function newClientMessageId() {
 // downloading (and the browser laying out) history nobody asked to see just to
 // show the last exchange. Everything older is still there, one scroll away.
 const TAIL_PAGE = 60;
-const OLDER_PAGE = 60;
+// One scroll-up keeps paging until it reaches an earlier message of yours: in
+// an agent run a 60-row page can be nothing but tool calls that collapse into
+// a single line, so a fixed page size read as "clicked, nothing happened".
+const OLDER_PAGE = 500;
+// Upper bound for one walk back, so a turn with tens of thousands of tool calls
+// stops (and offers the button again) instead of downloading the whole log.
+const OLDER_MAX = 2000;
+const isRootUserMessage = m => m.role === 'user' && !isSubagentInternal(m);
 // Distance from the top at which the next older page starts loading, so it is
 // usually already there by the time the user scrolls into it.
 const LOAD_OLDER_AT = 400;
@@ -56,7 +63,7 @@ async function fetchAllMessagesSince(taskId, after, isCancelled) {
   let cursor = after;
   for (;;) {
     const r = await api.messages(taskId, cursor);
-    if (isCancelled()) return;
+    if (isCancelled() || !acceptMessageResetSeq(taskId, r.resetSeq)) return;
     if (r.messages.length) {
       for (const m of r.messages) addMessage(taskId, m);
       bump();
@@ -739,14 +746,17 @@ async function branchFrom(taskId, seq) {
   } catch (e) { alert(e.message); }
 }
 
-export function Message({ task, msg, resultByToolId, isCreator, onImageClick, canBranch = false }) {
+export function Message({ task, msg, resultByToolId, isCreator, onImageClick, canBranch = false, onEdit }) {
   switch (msg.role) {
     case 'user':
       return (
-        <div className="msg-row user">
+        <div className="msg-row user" onDoubleClick={onEdit ? () => onEdit(msg) : undefined}>
           <div className="msg-col">
             {!!msg.content.text && <Md text={msg.content.text} />}
             <AttachedImages images={msg.content.images} onImageClick={onImageClick} />
+            {onEdit && <div className="msg-actions user-edit-actions">
+              <button type="button" className="ghost" aria-label="编辑最后一条用户消息" onClick={() => onEdit(msg)}>编辑</button>
+            </div>}
           </div>
         </div>
       );
@@ -782,7 +792,7 @@ export function Message({ task, msg, resultByToolId, isCreator, onImageClick, ca
 
 const messageKey = message => message.historyKey ?? message.seq;
 
-export function ConversationMessages({ messages: allMessages, task = null, isCreator = false, staticHistory = false, onImageClick = () => {}, hideEmpty = false }) {
+export function ConversationMessages({ messages: allMessages, task = null, isCreator = false, staticHistory = false, onImageClick = () => {}, hideEmpty = false, onEdit, userId }) {
   // Subagent lifecycle is never chat content; in a multiagent conversation
   // neither is what the subagents say and do — that's the 子代理 tab's, and
   // left in it would break the orchestrator's own tool chains into pieces.
@@ -800,6 +810,9 @@ export function ConversationMessages({ messages: allMessages, task = null, isCre
   // Branching needs a live task to fork from and creator rights to do it; the
   // read-only history viewer reuses this component and has neither.
   const canBranch = !!task && !staticHistory && isCreator;
+  const latestUser = [...allMessages].reverse().find(m => m.role === 'user' && !isSubagentInternal(m));
+  const editableSeq = canBranch && task.lease !== 'human' && onEdit
+    && (!latestUser?.content?.senderUserId || latestUser.content.senderUserId === userId) ? latestUser?.seq : null;
   return (
     <>
       {groups.map(group => group.type === 'chain'
@@ -807,7 +820,7 @@ export function ConversationMessages({ messages: allMessages, task = null, isCre
             key={messageKey(group.msgs[0])} resultByToolId={resultByToolId} defaultOpen={!staticHistory && !group.done}
             toolUses={group.msgs.filter(message => message.role === 'tool_use')}
           />
-        : <Message key={messageKey(group.msg)} task={task} msg={group.msg} resultByToolId={resultByToolId} isCreator={isCreator} onImageClick={onImageClick} canBranch={canBranch} />)}
+        : <Message key={messageKey(group.msg)} task={task} msg={group.msg} resultByToolId={resultByToolId} isCreator={isCreator} onImageClick={onImageClick} canBranch={canBranch} onEdit={group.msg.seq != null && group.msg.seq === editableSeq ? onEdit : undefined} />)}
       {!messages.length && !hideEmpty && <div className="empty">暂无消息</div>}
     </>
   );
@@ -841,6 +854,16 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
   };
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [editingMessage, setEditingMessage] = useState(null);
+  const composerRef = useRef(null);
+  const sendRequestRef = useRef(null);
+  const stoppingRef = useRef(false);
+  // Held messages don't count: they're waiting on the agent, not running, and
+  // sending more while a turn runs is exactly what the queue is for.
+  const stopMode = busy || ['running', 'starting', 'waiting_human'].includes(task?.status)
+    || pendingMessages.some(p => p.state !== 'failed' && p.state !== 'queued');
+  const messageEpoch = state.messageEpochs[taskId] || 0;
   const [sendError, setSendError] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const [lightboxSrc, setLightboxSrc] = useState(null);
@@ -858,6 +881,9 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
   const [titleDraft, setTitleDraft] = useState('');
   const [hasOlder, setHasOlder] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  // Rows fetched by the walk in progress (progress bar), and the last walk's failure.
+  const [olderLoaded, setOlderLoaded] = useState(0);
+  const [olderError, setOlderError] = useState(null);
   const listRef = useRef(null);
   const loadedRef = useRef(false);
   const firstPinRef = useRef(false);
@@ -909,17 +935,30 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
     loadedRef.current = false;
     loadGenerationRef.current++;
     let cancelled = false;
+    const isCurrent = messageLoadGuard(taskId);
+    setHasOlder(false);
+    setLoadingOlder(false);
+    setOlderLoaded(0);
+    setOlderError(null);
+    loadingOlderRef.current = false;
+    preserveRef.current = null;
+    const generation = loadGenerationRef.current;
     api.messagesBefore(taskId, 0, TAIL_PAGE)
       .then(r => {
-        if (cancelled) return;
+        if (cancelled || !isCurrent() || !acceptMessageResetSeq(taskId, r.resetSeq)) return;
         setMessageWindow(taskId, r.messages);
         setPendingMessages(taskId, r.pending);
         setHasOlder(!!r.hasMore);
+        // The tail is mid-turn (no message of yours in it): keep going back
+        // until the command that started this turn is on screen too.
+        if (r.hasMore && r.messages.length && !r.messages.some(isRootUserMessage)) {
+          queueMicrotask(() => walkBack(generation, isCurrent));
+        }
       })
       .catch(() => {})
-      .then(() => { if (!cancelled) { loadedRef.current = true; bump(); } });
+      .then(() => { if (!cancelled && isCurrent()) { loadedRef.current = true; bump(); } });
     return () => { cancelled = true; };
-  }, [taskId]);
+  }, [taskId, messageEpoch]);
 
   // The row the reader is actually looking at — the first one reaching into the
   // viewport — so the layout effect below can put it back where it was after a
@@ -941,28 +980,46 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
     return node ? { node, offset: node.getBoundingClientRect().top - top } : null;
   };
 
-  // Scrolling up (or the button at the top of the list) walks one page further
-  // back.
-  const loadOlder = async () => {
-    if (!hasOlder || loadingOlderRef.current) return;
-    const known = taskMessages(taskId);
-    if (!known.length) return;
-    const generation = loadGenerationRef.current;
+  // Scrolling up (or the button at the top of the list) walks back until it
+  // has loaded an earlier message of yours (or OLDER_MAX rows, or the start).
+  const walkBack = async (generation, isCurrent) => {
+    if (loadingOlderRef.current) return;
+    const live = () => generation === loadGenerationRef.current && isCurrent();
     loadingOlderRef.current = true;
     setLoadingOlder(true);
-    preserveRef.current = captureScrollAnchor();
+    setOlderLoaded(0);
+    setOlderError(null);
+    let loaded = 0;
     try {
-      const r = await api.messagesBefore(taskId, known[0].seq, OLDER_PAGE);
-      if (generation !== loadGenerationRef.current) { preserveRef.current = null; return; }
-      for (const m of r.messages) addMessage(taskId, m);
-      setHasOlder(!!r.hasMore);
-      bump();
-    } catch {
-      preserveRef.current = null;
+      for (;;) {
+        const known = taskMessages(taskId);
+        if (!known.length) break;
+        const r = await api.messagesBefore(taskId, known[0].seq, OLDER_PAGE);
+        if (!live() || !acceptMessageResetSeq(taskId, r.resetSeq)) return;
+        // Captured per page, right before the prepend it has to compensate for.
+        preserveRef.current = captureScrollAnchor();
+        for (const m of r.messages) addMessage(taskId, m);
+        loaded += r.messages.length;
+        setHasOlder(!!r.hasMore);
+        setOlderLoaded(loaded);
+        bump();
+        if (!r.hasMore || !r.messages.length || r.messages.some(isRootUserMessage) || loaded >= OLDER_MAX) break;
+      }
+    } catch (e) {
+      if (live()) {
+        preserveRef.current = null;
+        setOlderError(e?.message || '网络错误');
+      }
     } finally {
-      loadingOlderRef.current = false;
-      setLoadingOlder(false);
+      if (live()) {
+        loadingOlderRef.current = false;
+        setLoadingOlder(false);
+      }
     }
+  };
+  const loadOlder = () => {
+    if (!hasOlder) return;
+    walkBack(loadGenerationRef.current, messageLoadGuard(taskId));
   };
 
   // WS reconnected: backfill anything missed while disconnected/locked.
@@ -978,13 +1035,15 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
   useEffect(() => {
     if (!wsConnected || !loadedRef.current) return;
     let cancelled = false;
+    const isCurrent = messageLoadGuard(taskId);
     const timer = setTimeout(() => {
+      if (!isCurrent()) return;
       const known = taskMessages(taskId);
       const after = known.length ? known[known.length - 1].seq : 0;
-      fetchAllMessagesSince(taskId, after, () => cancelled).catch(() => {});
+      fetchAllMessagesSince(taskId, after, () => cancelled || !isCurrent()).catch(() => {});
     }, 1500);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [wsConnected, taskId]);
+  }, [wsConnected, taskId, messageEpoch]);
 
   const cancelPin = () => {
     if (!pinFrameRef.current) return;
@@ -1095,8 +1154,19 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
 
   const send = async (e) => {
     e?.preventDefault();
+    const liveTask = state.tasks.get(taskId);
+    if (!liveTask || liveTask.lease === 'human') return;
+    if (editingMessage) {
+      const latest = [...taskMessages(taskId)].reverse().find(m => m.role === 'user' && !isSubagentInternal(m));
+      if (latest?.seq !== editingMessage.seq) { setSendError('最后一条消息已改变,请取消编辑后重试'); return; }
+      if (latest.content?.senderUserId && latest.content.senderUserId !== user?.id) return;
+    }
     const t = text.trim();
-    if ((!t && !attachments.length) || attachmentError || sendingRef.current) return;
+    // A running turn doesn't block sending — the server holds the message
+    // until the turn ends (see queueEnabled).
+    if (stoppingRef.current
+      || (!t && !attachments.length && !editingMessage?.images.length) || attachmentError || sendingRef.current) return;
+    if (editingMessage && (!isCreator || (liveTask.owner_user_id && liveTask.owner_user_id !== user?.id))) return;
     sendingRef.current = true;
     setBusy(true);
     setSendError(null);
@@ -1105,7 +1175,7 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
     // so a retry of a request whose response was lost reuses it and can never
     // produce a second copy of the message.
     const clientMessageId = newClientMessageId();
-    const images = wireImages();
+    const images = [...(editingMessage?.images || []), ...wireImages()];
     // alert() alone isn't enough here — found live: a message sent right
     // before the sender stepped away (network/device went to sleep right
     // after) failed silently, the alert had no one there to see it, and
@@ -1114,7 +1184,20 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
     // coming back later still shows what happened. Attachments are left
     // intact on failure too, same reasoning — nothing lost, easy to retry.
     try {
-      const res = await api.sendMessage(taskId, t, images, clientMessageId, queueEnabled);
+      const isCurrent = messageLoadGuard(taskId);
+      sendRequestRef.current = editingMessage
+        ? api.editLastMessage(taskId, editingMessage.seq, t, images, clientMessageId)
+        : api.sendMessage(taskId, t, images, clientMessageId, queueEnabled);
+      const res = await sendRequestRef.current;
+      if (editingMessage) {
+        setEditingMessage(null);
+        // Also refresh without WS; never merge a shortened transcript into the old window.
+        if (isCurrent()) { resetMessages(taskId); bump(); }
+        setText('');
+        clearAttachments();
+        return;
+      }
+      if (!isCurrent()) return;
       // The composer only clears once the cloud has *stored* the send. Until
       // then the text stays where the user can see (and re-send) it — the
       // old code cleared on a 200 that only meant "handed to a socket",
@@ -1131,13 +1214,45 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
         // 'held' means the server is holding it until the current turn ends —
         // a different bubble from 'pending' (on its way to the node), so the
         // optimistic copy has to agree with what the broadcast will say.
-        clientMessageId, text: t, images,
+        clientMessageId, text: t, images, senderUserId: user?.id ?? null,
         state: res?.delivery === 'held' ? 'queued' : 'pending', createdAt: Date.now(),
       });
       bump();
     } catch (e2) { setSendError(e2.message || '发送失败'); }
-    sendingRef.current = false;
-    setBusy(false);
+    finally {
+      sendRequestRef.current = null;
+      sendingRef.current = false;
+      setBusy(false);
+    }
+  };
+
+  const stop = async () => {
+    if (task.lease === 'human' || stoppingRef.current || !stopMode) return;
+    stoppingRef.current = true;
+    setStopping(true);
+    setSendError(null);
+    try {
+      // Let an in-flight POST become durable before cancelling its outbound delivery.
+      await sendRequestRef.current?.catch(() => {});
+      const liveTask = state.tasks.get(taskId);
+      if (!liveTask || liveTask.lease === 'human') return;
+      await api.cancel(taskId);
+    } catch (e) { setSendError(e.message || '停止失败'); }
+    finally { stoppingRef.current = false; setStopping(false); }
+  };
+
+  const startEdit = (msg) => {
+    if (!isCreator || task.lease === 'human' || busy || stopping) return;
+    if (text.trim() && !editingMessage && !confirm('用这条消息替换输入框中的草稿?')) return;
+    setEditingMessage({ seq: msg.seq, images: msg.content.images || [], draft: editingMessage?.draft ?? text });
+    setText(msg.content.text || '');
+    setSendError(null);
+    composerRef.current?.focus();
+  };
+  const cancelEdit = () => {
+    setText(editingMessage?.draft || '');
+    setEditingMessage(null);
+    setSendError(null);
   };
 
   const retryPending = async (clientMessageId) => {
@@ -1260,16 +1375,26 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
                 looks like while it happens, and the way out if the automatic
                 trigger can't fire (a list too short to scroll, a failed
                 page the user wants to retry). */}
-            {hasOlder && (
+            {(hasOlder || loadingOlder) && (
               <div className="history-page-actions">
-                <button type="button" className="ghost" onClick={loadOlder} disabled={loadingOlder}>
-                  {loadingOlder ? '正在加载更早消息…' : '加载更早消息'}
-                </button>
+                {loadingOlder ? (
+                  <div className="history-loading" role="status">
+                    <div className="history-progress"><span /></div>
+                    <span>正在加载更早消息{olderLoaded ? `,已加载 ${olderLoaded} 条` : ''}…</span>
+                  </div>
+                ) : (
+                  <>
+                    {olderError && <span className="history-error">加载失败:{olderError}</span>}
+                    <button type="button" className="ghost" onClick={loadOlder}>
+                      {olderError ? '重试' : '加载更早消息'}
+                    </button>
+                  </>
+                )}
               </div>
             )}
             <ConversationMessages
               messages={messages} task={task} isCreator={isCreator} onImageClick={setLightboxSrc}
-              hideEmpty={pendingMessages.length > 0}
+              hideEmpty={pendingMessages.length > 0} onEdit={startEdit} userId={user?.id}
             />
             {inFlightMessages.map(pending => (
               <PendingMessage
@@ -1334,7 +1459,7 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
           )}
           {sendError && (
             <div className="review-bar">
-              <span className="err">⚠️ 上一条消息发送失败:{sendError} — 消息还在输入框里,可以重试</span>
+              <span className="err">操作失败:{sendError}</span>
               <button className="ghost" onClick={() => setSendError(null)}>知道了</button>
             </div>
           )}
@@ -1345,7 +1470,7 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
             <div className="queued-strip">
               {queuedMessages.map(pending => (
                 <QueuedMessage
-                  key={pending.clientMessageId} pending={pending} canEdit={isCreator}
+                  key={pending.clientMessageId} pending={pending} canEdit={isCreator || pending.senderUserId === user?.id}
                   waitingDecision={task.status === 'waiting_human'}
                   onEdit={editQueued} onCancel={cancelQueued} onSendNow={sendQueuedNow}
                 />
@@ -1369,11 +1494,15 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
             onDragLeave={() => setDragOver(false)}
             onDrop={e => { e.preventDefault(); setDragOver(false); if (task.lease !== 'human') addFiles(e.dataTransfer.files); }}
           >
+            {editingMessage && <div className="composer-edit-banner" role="status">
+              <span>正在编辑最后一条消息{editingMessage.images.length ? ` · 保留 ${editingMessage.images.length} 张原图` : ''} — 将重新生成后续回复</span>
+              <button type="button" className="ghost" disabled={busy || stopping} onClick={cancelEdit}>取消编辑</button>
+            </div>}
             <AttachmentStrip attachments={attachments} onRemove={removeAttachment} />
             <div className="composer-row">
               <AttachButton onFiles={addFiles} disabled={task.lease === 'human' || busy} />
               <textarea
-                value={text} onChange={e => setText(e.target.value)} rows={2}
+                ref={composerRef} value={text} onChange={e => setText(e.target.value)} rows={2}
                 placeholder={task.lease === 'human' ? 'IDE 接管中,看板只读' : '发消息继续对话…(Enter 发送,Shift+Enter 换行,可直接粘贴/拖拽图片)'}
                 disabled={task.lease === 'human' || busy}
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); } }}
@@ -1382,7 +1511,8 @@ export function TaskPane({ taskId, user, onClose, onOpenFiles, maximized, onTogg
                   if (files.length) { e.preventDefault(); addFiles(files); }
                 }}
               />
-              <button disabled={busy || task.lease === 'human' || (!text.trim() && !attachments.length) || attachmentError}>发送</button>
+              {stopMode && <button type="button" className="composer-stop deny" aria-label="停止任务" disabled={task.lease === 'human' || stopping} onClick={stop}>{stopping ? '停止中…' : '停止'}</button>}
+              <button type="submit" disabled={busy || stopping || task.lease === 'human' || (!text.trim() && !attachments.length && !editingMessage?.images.length) || attachmentError}>{editingMessage ? '保存并重新发送' : '发送'}</button>
             </div>
           </form>
           {lightboxSrc && (

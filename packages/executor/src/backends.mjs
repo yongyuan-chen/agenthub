@@ -95,10 +95,16 @@ const claude = {
   // The branch resumes in the same directory the source task works in — see
   // manager.mjs's _maybeStart, where a task that already has a session id
   // skips worktree creation and runs directly in that path.
-  forkSession(config, t, { dropTrailingTurns, newSessionId }) {
+  // inPlace keeps the fork in whichever config dir the task already runs
+  // against (message edit); otherwise it lands in ~/.claude for a new
+  // real_config_dir task (branching). Moving an ordinary task into ~/.claude
+  // silently swaps AgentHub's relay key for whatever credentials that
+  // home's settings carry — found live as a 401 from a disabled key.
+  forkSession(config, t, { dropTrailingTurns, newSessionId, allowEmptyPrefix, expectedLastUserText, expectedLastUserImages, expectedLastUserTs, previousUserText, previousUserImages, inPlace = false }) {
     return claudeTx.forkSession({
-      sourceFile: this.transcriptFile(config, t), cwd: t.dir, newSessionId, dropTrailingTurns,
-      projectsRoot: config.claudeProjectsRoot,
+      sourceFile: this.transcriptFile(config, t), cwd: t.dir, newSessionId, dropTrailingTurns, allowEmptyPrefix, expectedLastUserText, expectedLastUserImages,
+      expectedLastUserTs, previousUserText, previousUserImages,
+      projectsRoot: inPlace && !t.real_config_dir ? path.join(config.workRoot, 'claude-config', 'projects') : config.claudeProjectsRoot,
     });
   },
 };
@@ -155,10 +161,11 @@ const codex = {
     return codexTx.listExternalSessionsForPaths(paths, codexExternalRoot(config));
   },
 
-  forkSession(config, t, { dropTrailingTurns, newSessionId }) {
+  forkSession(config, t, { dropTrailingTurns, newSessionId, allowEmptyPrefix, expectedLastUserText, expectedLastUserImages, expectedLastUserTs, previousUserText, previousUserImages, inPlace = false }) {
     return codexTx.forkSession({
-      sourceFile: this.transcriptFile(config, t), newSessionId, dropTrailingTurns,
-      sessionsRoot: codexExternalRoot(config),
+      sourceFile: this.transcriptFile(config, t), newSessionId, dropTrailingTurns, allowEmptyPrefix, expectedLastUserText, expectedLastUserImages,
+      expectedLastUserTs, previousUserText, previousUserImages,
+      sessionsRoot: inPlace && !t.real_config_dir ? codexNativeRoot(config) : codexExternalRoot(config),
     });
   },
 };

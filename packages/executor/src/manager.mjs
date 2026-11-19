@@ -8,6 +8,7 @@ import { readAutomations, firstRruleMatchIn } from './codex-automations.mjs';
 import { withRoster, CONTINUE_TOOL_NAME, SPAWN_TOOL_NAMES } from './multiagent.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 // Below the ~200k window most Sonnet/Opus-family models share, leaving
 // headroom before the hard "prompt too long" wall — see _maybeAutoCompact.
@@ -202,6 +203,7 @@ export class SessionManager {
     // opts.backend names the adapter (see backends.mjs) — resolving the class
     // here rather than at the call site keeps _spawn identical for both.
     this.sessionFactory = sessionFactory ?? ((opts) => new (backendByName(opts.backend).Session)(opts));
+    this._editing = new Set();
     this.sessions = new Map();       // taskId -> live session
     this.pendingDecisions = new Map(); // requestId -> {resolve, timer, taskId}
     this.startQueue = [];            // fresh taskIds waiting for a slot
@@ -267,8 +269,10 @@ export class SessionManager {
   // ---- commands from cloud ----
 
   handleCommand(cmd) {
+    if (cmd.taskId && this._editing.has(cmd.taskId) && cmd.t !== 'edit_message') return;
     switch (cmd.t) {
       case 'start_task': return this.startTask(cmd.task);
+      case 'edit_message': return this.editMessage(cmd);
       case 'user_message': return this.userMessage(cmd.taskId, cmd.text, cmd.images, cmd.clientMessageId);
       case 'decision': return this.decide(cmd.taskId, cmd.requestId, cmd.behavior, cmd.message, cmd.updatedInput);
       case 'cancel': return this.cancel(cmd.taskId);
@@ -307,7 +311,7 @@ export class SessionManager {
   // fresh with the new session id via the normal userMessage() path.
   switchSession(taskId, sessionId) {
     const session = this.sessions.get(taskId);
-    if (session) { session.kill(); this.sessions.delete(taskId); }
+    if (session) { this.sessions.delete(taskId); session.kill(); }
     // `claude --resume` only finds a session from the exact cwd it was
     // created in (verified directly — a cwd mismatch fails with "No
     // conversation found" even though the .jsonl file itself is perfectly
@@ -552,10 +556,10 @@ export class SessionManager {
       permissionMode: t.permission_mode || 'acceptEdits',
       allowRootBypass: !!t.allow_root_bypass,
       agentMode: t.agent_mode || null,
-      onMessage: (msg) => this._onSdkMessage(taskId, msg),
-      onPermission: (req) => this._onPermission(taskId, req),
-      onWithdrawPermission: (requestId) => this._withdrawPermission(taskId, requestId),
-      onExit: (err) => this._onSessionExit(taskId, err),
+      onMessage: (msg) => { if (this.sessions.get(taskId) === session) this._onSdkMessage(taskId, msg); },
+      onPermission: (req) => this.sessions.get(taskId) === session ? this._onPermission(taskId, req) : Promise.resolve({ behavior: 'deny', message: 'Session retired' }),
+      onWithdrawPermission: (requestId) => { if (this.sessions.get(taskId) === session) this._withdrawPermission(taskId, requestId); },
+      onExit: (err) => { if (this.sessions.get(taskId) === session) this._onSessionExit(taskId, err); },
     });
     this.sessions.set(taskId, session);
     session.start();
@@ -1066,6 +1070,7 @@ export class SessionManager {
   }
 
   userMessage(taskId, text, images = [], clientMessageId = null) {
+    if (this._editing.has(taskId)) return;
     const t = this.db.getTask(taskId);
     if (!t) return console.warn('[manager] user_message for unknown task', taskId);
     // The cloud keeps redelivering a send until this node echoes it back as a
@@ -1238,9 +1243,100 @@ export class SessionManager {
     });
   }
 
+  async editMessage(cmd) {
+    const { taskId, seq, text, images = [], clientMessageId, expectedText } = cmd;
+    const request = JSON.stringify({ seq, text, images });
+    const previous = this.db.messageEdit(taskId, clientMessageId);
+    if (previous) {
+      if (previous.request !== request) throw new Error('clientMessageId 已用于另一条编辑');
+      return JSON.parse(previous.result);
+    }
+    if (this._editing.has(taskId)) throw new Error('这个任务正在编辑,请稍后重试');
+    const t = this.db.getTask(taskId);
+    if (!t || t.lease !== 'daemon' || t.session_id !== cmd.sessionId) throw new Error('会话或接管状态已变,请刷新');
+    if (t.agent_mode === 'multi') throw new Error('多代理路由会改写原生输入,暂不支持安全编辑');
+    if (t.status === 'starting' || t.status === 'queued') throw new Error('任务仍在启动,请稍后重试');
+    const users = this.db.projectedMessages(taskId).filter(m => m.role === 'user' && !m.content?.parentToolUseId);
+    const last = users.at(-1), prevUser = users.at(-2);
+    if (!last || last.seq !== seq || (last.content?.text ?? '') !== expectedText || (cmd.expectedImages !== undefined && JSON.stringify(last.content?.images ?? []) !== JSON.stringify(cmd.expectedImages))) throw new Error('只能编辑最新的用户消息,请刷新');
+    if (this.db.findClientMessage(taskId, clientMessageId)) throw new Error('clientMessageId 已用于普通消息');
+    this._editing.add(taskId);
+    try {
+      // Detach first: stdout, result, permission and exit callbacks from the
+      // old process must never mutate the replacement task/session.
+      const old = this.sessions.get(taskId);
+      this.sessions.delete(taskId);
+      if (old) await this._killAndWait(old);
+      for (const [rid, p] of this.pendingDecisions) {
+        if (p.taskId === taskId) { clearTimeout(p.timer); this.pendingDecisions.delete(rid); }
+      }
+      const timer = this._autoRetryTimers.get(taskId);
+      if (timer) clearTimeout(timer);
+      this._autoRetryTimers.delete(taskId);
+      this.startQueue = this.startQueue.filter(id => id !== taskId);
+      this.resumeQueue = this.resumeQueue.filter(id => id !== taskId);
+      const fork = backendFor(t).forkSession(this.config, t, {
+        newSessionId: randomUUID(), dropTrailingTurns: 1,
+        allowEmptyPrefix: true, expectedLastUserText: expectedText, expectedLastUserImages: last.content?.images ?? [],
+        // Lets the fork recognise a send that never reached the transcript
+        // (stopped before the CLI persisted it) — see fork.mjs.
+        expectedLastUserTs: last.ts, previousUserText: prevUser ? (prevUser.content?.text ?? '') : undefined,
+        previousUserImages: prevUser?.content?.images ?? [],
+        inPlace: true,
+      });
+      const reset = { k: 'messages_reset', targetSeq: seq, sessionId: fork.sessionId,
+        cwd: t.dir, clientMessageId, editPayload: { seq, text, images }, ts: Date.now() };
+      const message = { k: 'msg', role: 'user', content: { text, ...(images.length ? { images } : {}),
+        clientMessageId, ...(cmd.senderUserId ? { senderUserId: cmd.senderUserId } : {}) }, ts: Date.now() };
+      const result = this.db.commitMessageEdit(taskId, clientMessageId, request, {
+        sessionId: fork.sessionId, realConfigDir: t.real_config_dir,
+        syncedLines: fork.file ? backendFor(t).countLines(fork.file) : 0,
+        contextTokens: null, pendingRequest: null, lastError: null, spec: '',
+        status: 'review', retryAttempt: 0, retryFirstFailedAt: null,
+        retryLastInput: encodeInput(text, images),
+      }, reset, message);
+      this.onEvent(taskId, result.resetSeq, reset);
+      this.onEvent(taskId, result.messageSeq, message);
+      // The user bubble is already durable in the same transaction as the
+      // reset. Resume the prefix (or a fresh first turn), with no duplicate.
+      this._spawn(taskId, encodeInput(text, images), { fresh: !!fork.fresh, silent: true });
+      return result;
+    } catch (e) {
+      // A failed anchor/kill/fork never deletes history, but a detached old
+      // process must not leave a permanently "running" cloud task behind.
+      this.db.patchTask(taskId, { pendingRequest: null });
+      this.setStatus(taskId, 'cancelled', { clearPending: true, error: e.message });
+      throw e;
+    } finally { this._editing.delete(taskId); }
+  }
+
+  async _killAndWait(session) {
+    const child = session.child;
+    if (!child || child.exitCode !== null || child.signalCode != null) { session.kill(); return; }
+    await new Promise((resolve, reject) => {
+      let forceTimer, deadline;
+      const done = (error) => {
+        clearTimeout(forceTimer); clearTimeout(deadline); child.off('close', closed);
+        error ? reject(error) : resolve();
+      };
+      const closed = () => done();
+      child.once('close', closed);
+      forceTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 3000);
+      deadline = setTimeout(() => done(new Error('旧会话没有退出,未改写历史')), 8000);
+      session.kill();
+    });
+  }
+
   cancel(taskId) {
+    if (this._editing.has(taskId)) return;
+    const timer = this._autoRetryTimers.get(taskId);
+    if (timer) clearTimeout(timer);
+    this._autoRetryTimers.delete(taskId);
+    this.db.patchTask(taskId, { retryAttempt: 0, retryFirstFailedAt: null });
+    this.startQueue = this.startQueue.filter(id => id !== taskId);
+    this.resumeQueue = this.resumeQueue.filter(id => id !== taskId);
     const session = this.sessions.get(taskId);
-    if (session) { session.kill(); this.sessions.delete(taskId); }
+    if (session) { this.sessions.delete(taskId); session.kill(); }
     for (const [rid, p] of this.pendingDecisions) {
       if (p.taskId === taskId) { clearTimeout(p.timer); this.pendingDecisions.delete(rid); }
     }
@@ -1266,7 +1362,7 @@ export class SessionManager {
     // about to overwrite this.sessions' entry for taskId regardless, which
     // would otherwise orphan that process instead of actually killing it.
     const session = this.sessions.get(taskId);
-    if (session) { session.kill(); this.sessions.delete(taskId); }
+    if (session) { this.sessions.delete(taskId); session.kill(); }
     const patch = { status: 'queued', lastError: null };
     // Two explicit, user-chosen recovery paths for the "bypassPermissions
     // refused as root" failure (see hub-core.mjs's retry route) — never
@@ -1491,6 +1587,7 @@ export class SessionManager {
     const now = Date.now();
     const all = this.db.allTasks();
     for (const t of all) {
+      if (this._editing.has(t.task_id)) continue;
       if (!t.dir || t.lease !== 'daemon') continue;
       if (!['review', 'idle'].includes(t.status)) continue;
       if (backendFor(t).name === 'codex') this._sweepCodexAutomations(t, now);
@@ -1655,6 +1752,7 @@ export class SessionManager {
   // remembers isn't a useful thing to keep showing.
   _sweepExternalGrowth() {
     for (const t of this.db.allTasks()) {
+      if (this._editing.has(t.task_id)) continue;
       if (!t.real_config_dir || !t.session_id) continue;
       if (this.sessions.has(t.task_id)) continue; // mid-turn — leave it alone
       if (!['failed', 'review', 'idle'].includes(t.status)) continue;

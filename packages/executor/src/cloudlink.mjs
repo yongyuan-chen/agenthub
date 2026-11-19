@@ -241,7 +241,7 @@ export class CloudLink {
     this._send({ t: 'cli_versions', versions, upgrades });
   }
 
-  _onCloudMessage(msg) {
+  async _onCloudMessage(msg) {
     switch (msg.t) {
       case 'hello_ok': {
         // The cloud speaks a newer protocol than this daemon and has refused to
@@ -348,6 +348,15 @@ export class CloudLink {
       // creates the actual task only after this succeeds, so a failure here
       // must be reported rather than swallowed — otherwise it would create a
       // conversation pointing at a session file that doesn't exist.
+      case 'edit_message': {
+        try {
+          const result = await this.onCommand(msg);
+          this._send({ t: 'edit_message_result', requestId: msg.requestId, ...result });
+        } catch (e) {
+          this._send({ t: 'edit_message_result', requestId: msg.requestId, ok: false, error: e.message });
+        }
+        break;
+      }
       case 'fork_session': {
         const task = this.db.getTask(msg.taskId);
         try {

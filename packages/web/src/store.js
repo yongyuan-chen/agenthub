@@ -29,6 +29,8 @@ export const state = {
   // user message arrives with the same id. This is what stops a message from
   // looking like it vanished while it's actually queued for an offline node.
   pendingMsgs: new Map(),
+  messageEpochs: {},     // taskId -> history generation; rejects loads predating a reset
+  messageResetSeqs: {},  // taskId -> server reset watermark, survives missed WS events
   wsConnected: false,
   loaded: false,
   teams: [],             // [{id, name, role}] — this user's own memberships
@@ -97,6 +99,8 @@ export function resetUserState() {
   state.userGeneration = nextGeneration;
   state.msgs = new Map();
   state.pendingMsgs = new Map();
+  state.messageEpochs = {};
+  state.messageResetSeqs = {};
   state.wsConnected = false;
   state.loaded = false;
   state.teams = [];
@@ -182,6 +186,34 @@ export function upsertNode(node) {
   if (!node?.id) return;
   state.nodes.set(node.id, node);
   currentScopeCache().nodes.set(node.id, node);
+}
+
+export function resetMessages(taskId) {
+  state.msgs.delete(taskId);
+  state.pendingMsgs.delete(taskId);
+  state.messageEpochs[taskId] = (state.messageEpochs[taskId] || 0) + 1;
+}
+
+// A reconnect can miss messages_reset entirely. Even a forward/older page must
+// reject its partial window when the server says the history was rewritten.
+export function acceptMessageResetSeq(taskId, resetSeq) {
+  if (!Number.isSafeInteger(resetSeq) || resetSeq < 0) return true;
+  const known = state.messageResetSeqs[taskId] || 0;
+  if (resetSeq < known) return false;
+  if (resetSeq > known) {
+    state.messageResetSeqs[taskId] = resetSeq;
+    resetMessages(taskId);
+    bump();
+    return false; // epoch change requests a new tail, never apply this partial page
+  }
+  return true;
+}
+
+// Check at response time, not just effect cleanup: WS can reset before React renders.
+export function messageLoadGuard(taskId) {
+  const epoch = state.messageEpochs[taskId] || 0;
+  const userGeneration = state.userGeneration;
+  return () => state.userGeneration === userGeneration && (state.messageEpochs[taskId] || 0) === epoch;
 }
 
 export function addMessage(taskId, msg) {
@@ -285,6 +317,13 @@ export function applyWsMessage(msg) {
       break;
     case 'node': upsertNode(msg.node); break;
     case 'msg': addMessage(msg.taskId, { seq: msg.seq, role: msg.role, content: msg.content, created_at: msg.ts }); break;
+    case 'messages_reset':
+      if (Number.isSafeInteger(msg.resetSeq)) {
+        if (msg.resetSeq <= (state.messageResetSeqs[msg.taskId] || 0)) return;
+        state.messageResetSeqs[msg.taskId] = msg.resetSeq;
+      }
+      resetMessages(msg.taskId);
+      break;
     case 'pending_msg': upsertPendingMessage(msg.taskId, msg.pending); break;
     case 'pending_settled':
       if (msg.state === 'failed') markPendingMessageFailed(msg.taskId, msg.clientMessageId);

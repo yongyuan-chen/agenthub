@@ -557,17 +557,33 @@ export function findExternalSessionFile(sessionId, projectsRoot = DEFAULT_PROJEC
 // The uuid/parentUuid chain needs no rewriting: cutting on a turn boundary
 // keeps a contiguous ancestor chain rooted at the same first entry.
 export function forkSession({
-  sourceFile, cwd, newSessionId, dropTrailingTurns = 0, projectsRoot = DEFAULT_PROJECTS_ROOT(),
+  sourceFile, cwd, newSessionId, dropTrailingTurns = 0, allowEmptyPrefix = false, expectedLastUserText, expectedLastUserImages,
+  expectedLastUserTs, previousUserText, previousUserImages, projectsRoot = DEFAULT_PROJECTS_ROOT(),
 }) {
   if (!sourceFile || !fs.existsSync(sourceFile)) throw new Error('找不到源会话的记录文件');
   if (!cwd) throw new Error('分支需要知道源会话的工作目录');
 
   const lines = fs.readFileSync(sourceFile, 'utf8').split('\n').filter(Boolean);
-  const { kept, keptTurns, anchorText } = truncateAtTurnBoundary(
+  const { kept, keptTurns, anchorText, unpersisted } = truncateAtTurnBoundary(
     lines,
     entry => transcriptLineToEvents(entry).find(event => event.role === 'user')?.content.text ?? null,
-    dropTrailingTurns,
+    dropTrailingTurns, { allowEmptyPrefix, expectedLastUserText, expectedLastUserTs, previousUserText },
   );
+  // Checked against whichever board message the native last turn was just
+  // aligned to (see truncateAtTurnBoundary's unpersisted case).
+  if (expectedLastUserImages !== undefined) {
+    const users = lines.flatMap(line => {
+      try { return transcriptLineToEvents(JSON.parse(line)).filter(ev => ev.role === 'user'); } catch { return []; }
+    });
+    const expectedImages = unpersisted ? (previousUserImages ?? []) : expectedLastUserImages;
+    if (JSON.stringify(users.at(-1)?.content?.images ?? []) !== JSON.stringify(expectedImages)) {
+      throw new Error('原生会话图片与看板不一致,无法安全回退');
+    }
+  }
+
+  // Before the first turn, start a genuinely fresh native context instead
+  // of asking a CLI to resume an empty/metadata-only transcript.
+  if (keptTurns === 0) return { file: null, sessionId: null, cwd: cwd, keptTurns, anchorText, fresh: true };
 
   const rewritten = kept.map(line => {
     let entry;

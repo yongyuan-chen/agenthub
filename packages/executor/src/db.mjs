@@ -42,6 +42,11 @@ export class LocalDb {
       -- same message instead of running a second, duplicate turn. Points at
       -- the outbox row that already carries it, which is what gets re-sent to
       -- satisfy the cloud's still-open delivery.
+      CREATE TABLE IF NOT EXISTS message_edits (
+        task_id TEXT NOT NULL, client_message_id TEXT NOT NULL,
+        request TEXT NOT NULL, result TEXT NOT NULL,
+        PRIMARY KEY(task_id, client_message_id)
+      );
       CREATE TABLE IF NOT EXISTS client_messages (
         task_id           TEXT NOT NULL,
         client_message_id TEXT NOT NULL,
@@ -231,6 +236,36 @@ export class LocalDb {
        WHERE c.task_id = ? AND c.client_message_id = ?`
     ).get(taskId, clientMessageId);
     return row ?? null;
+  }
+
+  // Materialized conversation view over the immutable outbox. Reset events
+  // erase only the visible suffix; transport/dedupe history stays intact.
+  projectedMessages(taskId) {
+    let messages = [];
+    for (const row of this.db.prepare('SELECT seq,payload FROM outbox WHERE task_id = ? ORDER BY seq').all(taskId)) {
+      const ev = JSON.parse(row.payload);
+      if (ev.k === 'messages_reset') messages = messages.filter(m => m.seq < ev.targetSeq);
+      else if (ev.k === 'msg') messages.push({ seq: row.seq, ...ev });
+    }
+    return messages;
+  }
+
+  messageEdit(taskId, id) {
+    return this.db.prepare('SELECT request,result FROM message_edits WHERE task_id = ? AND client_message_id = ?').get(taskId, id);
+  }
+
+  commitMessageEdit(taskId, id, request, patch, reset, message) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.patchTask(taskId, patch);
+      this.db.prepare('DELETE FROM local_subagents WHERE task_id = ?').run(taskId);
+      const resetSeq = this.pushEvent(taskId, reset);
+      const messageSeq = this.pushEvent(taskId, message);
+      const result = { ok: true, resetSeq, messageSeq, sessionId: patch.sessionId };
+      this.db.prepare('INSERT INTO message_edits VALUES (?,?,?,?)').run(taskId, id, request, JSON.stringify(result));
+      this.db.exec('COMMIT');
+      return result;
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
 
   unacked(limit = 500) {

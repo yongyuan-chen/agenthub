@@ -339,16 +339,31 @@ export function findExternalSessionFile(sessionId, sessionsRoot = DEFAULT_SESSIO
 // version-dependent and undocumented (same caveat as the rest of this file),
 // so anything we don't understand is safer left alone than dropped.
 export function forkSession({
-  sourceFile, newSessionId, dropTrailingTurns = 0, sessionsRoot = DEFAULT_SESSIONS_ROOT(), now = new Date(),
+  sourceFile, newSessionId, dropTrailingTurns = 0, allowEmptyPrefix = false, expectedLastUserText, expectedLastUserImages,
+  expectedLastUserTs, previousUserText, previousUserImages, sessionsRoot = DEFAULT_SESSIONS_ROOT(), now = new Date(),
 }) {
   if (!sourceFile || !fs.existsSync(sourceFile)) throw new Error('找不到源会话的记录文件');
 
   const lines = fs.readFileSync(sourceFile, 'utf8').split('\n').filter(Boolean);
-  const { kept, keptTurns, anchorText } = truncateAtTurnBoundary(
+  const { kept, keptTurns, anchorText, unpersisted } = truncateAtTurnBoundary(
     lines,
     entry => rolloutLineToEvents(entry).find(event => event.role === 'user')?.content.text ?? null,
-    dropTrailingTurns,
+    dropTrailingTurns, { allowEmptyPrefix, expectedLastUserText, expectedLastUserTs, previousUserText },
   );
+  // Same alignment rule as sessions.mjs's forkSession.
+  if (expectedLastUserImages !== undefined) {
+    const users = lines.flatMap(line => {
+      try { return rolloutLineToEvents(JSON.parse(line)).filter(ev => ev.role === 'user'); } catch { return []; }
+    });
+    const expectedImages = unpersisted ? (previousUserImages ?? []) : expectedLastUserImages;
+    if (JSON.stringify(users.at(-1)?.content?.images ?? []) !== JSON.stringify(expectedImages)) {
+      throw new Error('原生会话图片与看板不一致,无法安全回退');
+    }
+  }
+
+  // Before the first turn, start a genuinely fresh native context instead
+  // of asking a CLI to resume an empty/metadata-only transcript.
+  if (keptTurns === 0) return { file: null, sessionId: null, cwd: cwdOf(sourceFile), keptTurns, anchorText, fresh: true };
 
   let metaRewritten = false;
   const rewritten = kept.map(line => {

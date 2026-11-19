@@ -12,7 +12,7 @@
 //   listSessions(nodeId, path)    -> Promise<{sessions}|null> (same shape, lists existing claude sessions for a path)
 //   push(payload, ownerUserId)    -> void    (web push fan-out, fire and forget)
 //   now()                         -> epoch ms
-import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_CLI_UPGRADE, FEATURE_MULTI_AGENT, PROJECT_KINDS, DEFAULT_PROJECT_KIND, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
+import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_MESSAGE_REWIND, FEATURE_CLI_UPGRADE, FEATURE_MULTI_AGENT, PROJECT_KINDS, DEFAULT_PROJECT_KIND, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
 import * as accounts from './accounts.mjs';
 import { hashPassword } from './auth.mjs';
 import { cachedCliVersions } from './cli-releases.mjs';
@@ -463,7 +463,39 @@ export async function absorbEvent(ctx, nodeId, { taskId, seq, ev }) {
   // forward (message inserts are idempotent by (task_id, seq) regardless).
   const fresh = seq > (task.last_seq ?? 0);
 
-  if (ev.k === 'msg') {
+  const resetWatermark = ['msg','messages_reset'].includes(ev.k) ? await q(ctx.db, 'SELECT reset_seq FROM task_message_resets WHERE task_id = ?', taskId).first() : null;
+  // An old message can legitimately fill a gap below last_seq, but never
+  // cross a durable reset fence. Ack it without inserting/settling anything.
+  if (seq <= (resetWatermark?.reset_seq ?? 0)) {
+    ctx.sendToNode(nodeId, { t: 'ack', taskId, seq });
+    return;
+  }
+
+  if (ev.k === 'messages_reset') {
+    if (!Number.isSafeInteger(ev.targetSeq) || ev.targetSeq < 1 || ev.targetSeq >= seq) return;
+    const payload = JSON.stringify(ev.editPayload ?? {});
+    const statements = [
+      q(ctx.db, 'DELETE FROM messages WHERE task_id = ? AND seq >= ? AND seq < ?', taskId, ev.targetSeq, seq),
+      q(ctx.db, `INSERT INTO task_message_resets VALUES (?,?) ON CONFLICT(task_id) DO UPDATE SET reset_seq = MAX(reset_seq,excluded.reset_seq)`, taskId, seq),
+      q(ctx.db, 'INSERT OR IGNORE INTO task_message_edits VALUES (?,?,?,?,?)', taskId, ev.clientMessageId, ev.targetSeq, payload, seq),
+      q(ctx.db, 'UPDATE tasks SET session_id = ?, context_tokens = NULL, pending_request = NULL, last_error = NULL, last_seq = MAX(last_seq,?), updated_at = ? WHERE id = ?', ev.sessionId, seq, now, taskId),
+      q(ctx.db, "UPDATE outbound_messages SET state = 'cancelled', updated_at = ? WHERE task_id = ? AND state IN ('pending','queued')", now, taskId),
+      q(ctx.db, 'DELETE FROM conversation_claims_v2 WHERE task_id = ?', taskId),
+    ];
+    if (ev.sessionId) statements.push(q(ctx.db,
+      'INSERT INTO conversation_claims_v2 (node_id,session_id,source_id,task_id,source_cwd,immutable,claimed_at) VALUES (?,?,?,?,?,0,?)',
+      nodeId, ev.sessionId, `rewind:${taskId}:${seq}`, taskId, ev.cwd || task.repo_url || '', now));
+    await ctx.db.batch(statements);
+    fanOutToTeamsOrOwner(ctx, { t: 'messages_reset', taskId, resetSeq: seq }, task.owner_user_id, await taskTeamIds(ctx, taskId));
+    await broadcastTask(ctx, taskId);
+  } else if (ev.k === 'msg') {
+    // Attribute browser sends from the durable cloud record, not from a
+    // caller-controlled event field. Native/imported historical turns remain
+    // unattributed; they can only be edited by the task creator.
+    if (ev.role === 'user' && ev.content?.clientMessageId) {
+      const sent = await q(ctx.db, 'SELECT sender_user_id FROM outbound_messages WHERE task_id = ? AND client_message_id = ?', taskId, ev.content.clientMessageId).first();
+      if (sent?.sender_user_id) ev = { ...ev, content: { ...ev.content, senderUserId: sent.sender_user_id } };
+    }
     const res = await q(ctx.db,
       'INSERT OR IGNORE INTO messages (id, task_id, seq, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)',
       `${taskId}:${seq}`, taskId, seq, ev.role, JSON.stringify(ev.content ?? {}), ev.ts ?? now,
@@ -514,11 +546,23 @@ export async function absorbEvent(ctx, nodeId, { taskId, seq, ev }) {
     // repeated 'running' heartbeat can't release anything mid-turn. Pausing
     // for a human decision is not an ending either (see cannotTakeMessage),
     // which is why this compares the pending request before and after, not
-    // just the status.
+    // just the status. A stop counts as an ending too: 停止 means "drop this
+    // turn", not "drop what I queued after it" — and a message sent between
+    // the click and the node's 'cancelled' was held, so skipping the release
+    // here would strand it as 排队中 forever.
     if (cannotTakeMessage(prev, task.pending_request) && !cannotTakeMessage(ev.status, pending)) {
       await releaseNextQueuedMessage(ctx, { ...task, status: ev.status });
     }
   } else if (ev.k === 'session' && fresh) {
+    // A first-turn edit intentionally starts without a resumable session.
+    // Claim the actual CLI-generated id when its init event arrives (and
+    // likewise track any backend-issued replacement id after a rewind).
+    const rewound = await q(ctx.db, 'SELECT reset_seq FROM task_message_resets WHERE task_id = ?', taskId).first();
+    if (rewound && ev.sessionId) await ctx.db.batch([
+      q(ctx.db, 'DELETE FROM conversation_claims_v2 WHERE task_id = ?', taskId),
+      q(ctx.db, 'INSERT INTO conversation_claims_v2 (node_id,session_id,source_id,task_id,source_cwd,immutable,claimed_at) VALUES (?,?,?,?,?,0,?)',
+        nodeId, ev.sessionId, `rewind:${taskId}:${rewound.reset_seq}`, taskId, task.repo_url || '', now),
+    ]);
     await q(ctx.db, 'UPDATE tasks SET session_id = ?, updated_at = ? WHERE id = ?', ev.sessionId, now, taskId).run();
     await broadcastTask(ctx, taskId);
   } else if (ev.k === 'cost' && fresh) {
@@ -1582,7 +1626,12 @@ export async function api(ctx, method, pathname, body) {
       // this member's own read state (task_reads is keyed by user), touches
       // nothing about the task itself, and a member who can see a project
       // conversation is exactly who needs to clear their own unread dot on it.
-      const messageAllowed = method === 'POST' && ['message', 'retry-message', 'seen'].includes(action);
+      // 停止 is part of talking to it too: a member can already interrupt a
+      // running turn with 关闭排队, and one who can't stop it can't take back
+      // what they just set going. Their own held messages are theirs to edit,
+      // cancel or send now — the queued-message route checks the sender.
+      const messageAllowed = (method === 'POST' && ['message', 'retry-message', 'seen', 'cancel', 'queued-message'].includes(action))
+        || (method === 'DELETE' && action === 'queued-message');
       if (method !== 'GET' && !messageAllowed) return err(403, 'only the task creator can do this');
     }
 
@@ -1633,6 +1682,8 @@ export async function api(ctx, method, pathname, body) {
       });
     }
     if (method === 'GET' && action === 'messages') {
+      const reset = await q(ctx.db, 'SELECT reset_seq FROM task_message_resets WHERE task_id = ?', taskId).first();
+      const resetSeq = reset?.reset_seq ?? 0;
       const limit = Math.min(Number(body?.limit ?? 300), 1000);
       const decode = rows => (rows.results ?? rows).map(r => ({ ...r, content: JSON.parse(r.content) }));
       // Both directions answer with `pending` — sends the cloud has accepted
@@ -1646,14 +1697,25 @@ export async function api(ctx, method, pathname, body) {
         // read purely to answer hasMore, so the client knows whether scrolling
         // up has anything left to reach without a probe request.
         const before = Number(body.before_seq) || Number.MAX_SAFE_INTEGER;
+        // chat=1: the chat pane never renders agent_event rows (the 子代理 tab
+        // has its own subagent-messages history), and a multiagent run can be
+        // ~90% of them — paging through those made "加载更早消息" look dead.
+        // Same for subagent internals of a multiagent conversation (see
+        // ConversationMessages' filter, which this mirrors).
+        let skipEvents = '';
+        if (body.chat === '1') {
+          skipEvents = " AND role != 'agent_event'";
+          const multi = await q(ctx.db, "SELECT 1 FROM task_agent_modes WHERE task_id = ? AND mode = 'multi'", taskId).first();
+          if (multi) skipEvents += " AND json_extract(content, '$.parentToolUseId') IS NULL";
+        }
         const rows = decode(await q(ctx.db,
-          'SELECT seq, role, content, created_at FROM messages WHERE task_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?',
+          `SELECT seq, role, content, created_at FROM messages WHERE task_id = ? AND seq < ?${skipEvents} ORDER BY seq DESC LIMIT ?`,
           taskId, before, limit + 1).all());
         const hasMore = rows.length > limit;
         return ok({
           messages: (hasMore ? rows.slice(0, limit) : rows).reverse(), // always oldest-first for the client
           hasMore,
-          pending: await pendingMessagesFor(ctx, taskId),
+          resetSeq, pending: await pendingMessagesFor(ctx, taskId),
         });
       }
       const after = Number(body?.after_seq ?? 0);
@@ -1662,8 +1724,35 @@ export async function api(ctx, method, pathname, body) {
         taskId, after, limit).all();
       return ok({
         messages: decode(rows),
-        pending: await pendingMessagesFor(ctx, taskId),
+        resetSeq, pending: await pendingMessagesFor(ctx, taskId),
       });
+    }
+    if (method === 'POST' && action === 'edit-message') {
+      if (!isCreator) return err(403, 'only the task creator can edit messages');
+      if (task.lease !== 'daemon') return err(409, 'task is leased to IDE');
+      const { seq, text, clientMessageId } = body ?? {};
+      const images = body?.images ?? [];
+      if (!Number.isSafeInteger(seq) || seq < 1) return err(400, 'invalid message seq');
+      if (typeof text !== 'string' || (!text.trim() && !images.length)) return err(400, 'text or images required');
+      if (!Array.isArray(images)) return err(400, 'invalid images');
+      const imageError = imageBatchError(images);
+      if (imageError) return err(400, imageError);
+      if (!isValidClientMessageId(clientMessageId)) return err(400, 'invalid clientMessageId');
+      if (!(await nodeSupports(ctx.db, task.node_id, FEATURE_MESSAGE_REWIND))) return err(409, '节点尚不支持安全编辑消息,请先升级 executor');
+      const payload = JSON.stringify({ seq, text, images });
+      const edited = await q(ctx.db, 'SELECT payload,reset_seq FROM task_message_edits WHERE task_id = ? AND client_message_id = ?', taskId, clientMessageId).first();
+      if (edited) return edited.payload === payload ? ok({ edited: true, clientMessageId, resetSeq: edited.reset_seq }) : err(409, 'clientMessageId already used for another edit');
+      const latest = await q(ctx.db, `SELECT seq,content FROM messages WHERE task_id = ? AND role = 'user' AND json_extract(content,'$.parentToolUseId') IS NULL ORDER BY seq DESC LIMIT 1`, taskId).first();
+      if (!latest || latest.seq !== seq) return err(409, '只能编辑最新的用户消息,请刷新');
+      const content = JSON.parse(latest.content);
+      if (content.senderUserId && content.senderUserId !== userId) return err(403, 'cannot edit another member’s message');
+      const pending = await q(ctx.db, "SELECT 1 FROM outbound_messages WHERE task_id = ? AND state = 'pending' LIMIT 1", taskId).first();
+      if (pending) return err(409, '消息仍在发送,请等待节点确认后再编辑');
+      const result = await ctx.editMessage?.(task.node_id, { taskId, sessionId: task.session_id,
+        seq, expectedText: content.text ?? '', expectedImages: content.images ?? [], text, images, clientMessageId, senderUserId: userId });
+      if (!result) return err(503, '节点离线或未确认编辑;历史未由云端删除,请刷新后用相同请求重试');
+      if (!result.ok) return err(409, result.error || '无法安全回退原生会话');
+      return ok({ edited: true, clientMessageId, resetSeq: result.resetSeq });
     }
     if (method === 'POST' && action === 'message') {
       const images = Array.isArray(body?.images) ? body.images : [];
@@ -1722,13 +1811,13 @@ export async function api(ctx, method, pathname, body) {
     // read. Racing the release simply loses — the row is no longer 'queued',
     // so both routes 404 rather than silently doing nothing.
     if ((method === 'POST' || method === 'DELETE') && action === 'queued-message') {
-      if (!isCreator) return err(403, 'only the creator can change queued messages');
       const clientMessageId = body?.clientMessageId ?? route[3];
       if (!isValidClientMessageId(clientMessageId)) return err(400, 'invalid clientMessageId');
       const row = await q(ctx.db,
         "SELECT * FROM outbound_messages WHERE task_id = ? AND client_message_id = ? AND state = 'queued'",
         taskId, clientMessageId).first();
       if (!row) return err(404, 'no queued message with that id');
+      if (!isCreator && row.sender_user_id !== userId) return err(403, 'only the sender or creator can change a queued message');
       const teamIds = await taskTeamIds(ctx, taskId);
       if (method === 'DELETE') {
         await q(ctx.db, 'DELETE FROM outbound_messages WHERE task_id = ? AND client_message_id = ?',
@@ -1826,7 +1915,17 @@ export async function api(ctx, method, pathname, body) {
       return ok({});
     }
     if (method === 'POST' && action === 'cancel') {
-      if (!userCanTransition(task.status, 'cancelled')) return err(409, `cannot cancel from ${task.status}`);
+      const pendingSend = await q(ctx.db, "SELECT 1 FROM outbound_messages WHERE task_id = ? AND state = 'pending' LIMIT 1", taskId).first();
+      if (!userCanTransition(task.status, 'cancelled') && !pendingSend && !['idle','review'].includes(task.status)) return err(409, `cannot cancel from ${task.status}`);
+      // A just-sent turn can still look idle/review before its status event
+      // lands. Cancel pending redelivery too, or the next sweep restarts it.
+      // Held ('queued') messages are left alone: they're the human's next
+      // instruction, released once the node reports the turn cancelled.
+      const cancelledRows = await q(ctx.db, "SELECT client_message_id FROM outbound_messages WHERE task_id = ? AND state = 'pending'", taskId).all();
+      await q(ctx.db, "UPDATE outbound_messages SET state = 'cancelled', updated_at = ? WHERE task_id = ? AND state = 'pending'", ctx.now(), taskId).run();
+      const teams = await taskTeamIds(ctx, taskId);
+      for (const row of cancelledRows.results ?? cancelledRows) fanOutToTeamsOrOwner(ctx,
+        { t: 'pending_settled', taskId, clientMessageId: row.client_message_id, state: 'cancelled' }, task.owner_user_id, teams);
       await dispatch(ctx, task.node_id, { t: 'cancel', taskId });
       return ok({});
     }
