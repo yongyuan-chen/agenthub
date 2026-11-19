@@ -451,3 +451,22 @@ CREATE TABLE IF NOT EXISTS node_auth_requests (
   approved_at INTEGER,
   node_id TEXT                     -- the id actually registered, once approved
 );
+
+-- 'relay' (base URL + key, the original kind) | 'native' — 「本机账号」: run the
+-- node's own claude/codex login or config, nothing injected. No row = relay.
+-- Side table for the same idempotent-redeploy reason as model_profile_backends.
+-- A profile's kind never changes after creation: relay and native sessions
+-- live in different homes on the node, so flipping it would strand them.
+CREATE TABLE IF NOT EXISTS model_profile_kinds (
+  profile_id TEXT PRIMARY KEY,
+  kind       TEXT NOT NULL
+);
+
+-- What each node's CLIs are logged in / configured with on their own, as the
+-- node reported it (see executor native-auth.mjs) — method names only, never
+-- a credential. {"claude":{"loggedIn":true,"method":"claude.ai",...},"codex":null}
+CREATE TABLE IF NOT EXISTS node_native_auth (
+  node_id    TEXT PRIMARY KEY,
+  info       TEXT NOT NULL DEFAULT '{}',
+  updated_at INTEGER
+);

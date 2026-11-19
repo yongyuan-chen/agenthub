@@ -165,6 +165,7 @@ export const api = {
   renameNode: (id, name) => req('POST', `/api/nodes/${id}/rename`, { name }),
   // backend omitted = every installed CLI on that machine.
   upgradeNodeCli: (id, backend) => req('POST', `/api/nodes/${id}/cli-upgrade`, { backend: backend ?? null }),
+  probeNodeNativeAuth: (id) => req('POST', `/api/nodes/${id}/probe-native-auth`, {}),
   setNodeAutoUpgrade: (id, enabled) => req('POST', `/api/nodes/${id}/auto-upgrade`, { enabled }),
   vapid: () => req('GET', '/api/vapid'),
   subscribePush: (subscription) => req('POST', '/api/push/subscribe', { subscription }),

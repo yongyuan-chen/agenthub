@@ -238,6 +238,7 @@ export class Hub {
         }
         else if (msg.t === 'ev') await core.absorbEvent(ctx, att.nodeId, msg);
         else if (msg.t === 'cli_versions') await core.handleCliVersions(ctx, att.nodeId, msg);
+        else if (msg.t === 'native_auth') await core.handleNativeAuth(ctx, att.nodeId, msg);
       } catch (e) {
         console.error('hub message error:', e.stack || e.message);
       }

@@ -7,6 +7,7 @@ import readline from 'node:readline';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ORCHESTRATOR_AGENT, writeAgentsFile } from './multiagent.mjs';
+import { nativeEnv } from './native-auth.mjs';
 
 // agentsFile: set only for multiagent conversations — the path written by
 // multiagent.mjs's writeAgentsFile, and the main thread runs as its
@@ -68,21 +69,30 @@ export class ClaudeSession {
     const agentsFile = agentMode === 'multi' ? writeAgentsFile(config.workRoot) : null;
     const args = buildClaudeArgs({ permissionMode, resumeSessionId, agentsFile });
 
-    const env = { ...process.env };
-    // Never inherit host login/session state; force the relay.
-    delete env.CLAUDECODE;
-    delete env.CLAUDE_CODE_ENTRYPOINT;
-    delete env.CLAUDE_CODE_SSE_PORT;
-    delete env.ANTHROPIC_AUTH_TOKEN;
-    // Sessions adopted from outside AgentHub resume directly against the
-    // real ~/.claude (the CLI's own default) instead of an isolated copy, so
-    // VS Code/terminal use of the same session id never silently diverges
-    // from what AgentHub shows — see db.mjs's real_config_dir column.
-    if (realConfigDir) delete env.CLAUDE_CONFIG_DIR;
-    else env.CLAUDE_CONFIG_DIR = path.join(config.workRoot, 'claude-config');
-    env.ANTHROPIC_BASE_URL = config.provider.baseUrl;
-    env.ANTHROPIC_API_KEY = config.provider.apiKey;
-    if (config.provider.model) env.ANTHROPIC_MODEL = config.provider.model;
+    let env;
+    if (config.provider?.native) {
+      // 本机账号: exactly what `claude` in this user's terminal would use —
+      // see native-auth.mjs. Always the real ~/.claude (native tasks are
+      // real_config_dir tasks), and nothing injected but an optional model.
+      env = nativeEnv();
+      if (config.provider.model) env.ANTHROPIC_MODEL = config.provider.model;
+    } else {
+      env = { ...process.env };
+      // Never inherit host login/session state; force the relay.
+      delete env.CLAUDECODE;
+      delete env.CLAUDE_CODE_ENTRYPOINT;
+      delete env.CLAUDE_CODE_SSE_PORT;
+      delete env.ANTHROPIC_AUTH_TOKEN;
+      // Sessions adopted from outside AgentHub resume directly against the
+      // real ~/.claude (the CLI's own default) instead of an isolated copy, so
+      // VS Code/terminal use of the same session id never silently diverges
+      // from what AgentHub shows — see db.mjs's real_config_dir column.
+      if (realConfigDir) delete env.CLAUDE_CONFIG_DIR;
+      else env.CLAUDE_CONFIG_DIR = path.join(config.workRoot, 'claude-config');
+      env.ANTHROPIC_BASE_URL = config.provider.baseUrl;
+      env.ANTHROPIC_API_KEY = config.provider.apiKey;
+      if (config.provider.model) env.ANTHROPIC_MODEL = config.provider.model;
+    }
     env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
     // claude CLI refuses --permission-mode bypassPermissions outright when
     // running as root/sudo — an unattended agent with full root and no

@@ -17,6 +17,7 @@ import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 import os from 'node:os';
 import path from 'node:path';
+import { nativeEnv } from './native-auth.mjs';
 
 // The provider block injected inline via thread/start's `config` param. Doing
 // it this way (rather than writing a per-task config.toml) is what lets every
@@ -130,13 +131,21 @@ export class CodexSession {
     const home = codexHomeFor(config, realConfigDir);
     this._codexHome = home;
 
-    const env = { ...process.env };
-    // Never inherit host credentials or a host CODEX_HOME — the relay is the
-    // only path out, and the home is chosen explicitly above.
-    delete env.OPENAI_API_KEY;
-    delete env.CODEX_API_KEY;
+    let env;
+    if (provider.native) {
+      // 本机账号: ~/.codex's own auth.json / config.toml and the user's
+      // shell-exported keys (see native-auth.mjs). home is the real ~/.codex
+      // here, since native tasks are real_config_dir tasks.
+      env = nativeEnv();
+    } else {
+      env = { ...process.env };
+      // Never inherit host credentials or a host CODEX_HOME — the relay is the
+      // only path out, and the home is chosen explicitly above.
+      delete env.OPENAI_API_KEY;
+      delete env.CODEX_API_KEY;
+      env[RELAY_KEY_ENV] = provider.apiKey ?? '';
+    }
     env.CODEX_HOME = home;
-    env[RELAY_KEY_ENV] = provider.apiKey ?? '';
 
     // Same Windows .cmd/.ps1 shim reasoning as session.mjs — every argv
     // element here is a fixed literal, and no conversation text ever goes
@@ -246,8 +255,9 @@ export class CodexSession {
       cwd,
       approvalPolicy: policy.approvalPolicy,
       sandbox: policy.sandbox,
-      config: relayProviderConfig(provider),
-      modelProvider: RELAY_PROVIDER_ID,
+      // Native mode leaves provider selection to the user's own config.toml
+      // (or the built-in OpenAI provider behind a ChatGPT/API-key login).
+      ...(provider.native ? {} : { config: relayProviderConfig(provider), modelProvider: RELAY_PROVIDER_ID }),
       ...(provider.model ? { model: provider.model } : {}),
     };
     const res = resumeSessionId

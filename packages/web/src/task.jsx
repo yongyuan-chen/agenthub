@@ -499,6 +499,10 @@ function ModelChip({ task, isCreator }) {
   // Codex) — the server 409s the switch, so it isn't offered either.
   const multiAgent = task.agent_mode === 'multi';
   const compatible = (b) => (!multiAgent || (b || 'claude') === 'claude') && (!locked || (b || 'claude') === backend);
+  // A session that ran against a relay lives in AgentHub's isolated home and
+  // can't move into ~/.claude for 「本机账号」 (the server 409s it too).
+  const nativeLocked = locked && profile?.kind !== 'native';
+  const offered = (p) => compatible(p.backend) && !(nativeLocked && p.kind === 'native');
 
   const pick = async (profileId) => {
     setBusy(true);
@@ -512,13 +516,13 @@ function ModelChip({ task, isCreator }) {
         className={`chip model-chip${isCreator ? ' clickable' : ''}`}
         title={isCreator ? '当前模型 — 点击切换(下一轮生效)' : '当前模型'}
         onClick={isCreator ? () => setOpen(o => !o) : undefined}
-      >🧠 {label}{backend === 'codex' ? ' · Codex' : ''}</span>
+      >🧠 {label}{backend === 'codex' ? ' · Codex' : ''}{profile?.kind === 'native' ? ' · 本机账号' : ''}</span>
       {open && (
         <div className="model-picker">
           {compatible('claude') && <button type="button" disabled={busy} className={!pid ? 'selected' : ''} onClick={() => pick(null)}>默认配置</button>}
-          {(profiles || []).filter(p => compatible(p.backend)).map(p => (
+          {(profiles || []).filter(offered).map(p => (
             <button type="button" key={p.id} disabled={busy} className={p.id === pid ? 'selected' : ''} onClick={() => pick(p.id)}>
-              {p.name}<span className="muted"> · {p.model || p.baseUrl}</span>
+              {p.name}<span className="muted"> · {p.model || (p.kind === 'native' ? '本机账号' : p.baseUrl)}</span>
             </button>
           ))}
           <div className="muted model-picker-note">

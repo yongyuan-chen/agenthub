@@ -76,6 +76,10 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
       // multiAgentRefusal), so a sticky Codex default doesn't carry into one.
       if (r.lastModelProfileId && usableIn(profiles).some(p => p.id === r.lastModelProfileId)) {
         setModelProfileId(r.lastModelProfileId);
+      } else if (!profiles.some(p => p.isDefault) && usableIn(profiles).length) {
+        // No account default (e.g. only 「本机账号」 profiles): 默认配置 would
+        // start a task with no relay at all, so pick a real profile instead.
+        setModelProfileId(usableIn(profiles)[0].id);
       }
     }).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -86,6 +90,10 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
   const autoNode = nodes.find(n => n.status === 'online') || nodes[0];
   const selectedNode = (nodeId && nodes.find(n => n.id === nodeId)) || autoNode;
   const selectedProfile = modelProfileId ? profiles.find(p => p.id === modelProfileId) : null;
+  // 默认配置 = the relay mirrored to every node; without a default profile
+  // there's nothing behind it, so don't offer it.
+  const hasDefault = profiles.some(p => p.isDefault);
+  const profileSuffix = (p) => `${p.backend === 'codex' ? ' · Codex' : ''}${p.kind === 'native' ? ' · 本机账号' : ''}`;
 
   // Autocomplete subdirectories on the selected node as the custom path is typed.
   useEffect(() => {
@@ -250,30 +258,32 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
           )}
 
           {/* ---- model profile picker: inline chips when few, dropdown when many ---- */}
-          {(1 + usable.length) <= INLINE_THRESHOLD ? (
+          {((hasDefault ? 1 : 0) + usable.length) <= INLINE_THRESHOLD ? (
             <div className="inline-chip-group">
-              <button type="button" className={`path-chip ${!modelProfileId ? 'selected' : ''}`} onClick={() => pickProfile(null)}>
-                🧠 默认配置
-              </button>
+              {hasDefault && (
+                <button type="button" className={`path-chip ${!modelProfileId ? 'selected' : ''}`} onClick={() => pickProfile(null)}>
+                  🧠 默认配置
+                </button>
+              )}
               {usable.map(p => (
                 <button
                   type="button" key={p.id} className={`path-chip ${modelProfileId === p.id ? 'selected' : ''}`}
                   onClick={() => pickProfile(p.id)}
                 >
-                  🧠 {p.name}{p.backend === 'codex' ? ' · Codex' : ''}
+                  🧠 {p.name}{profileSuffix(p)}
                 </button>
               ))}
             </div>
           ) : (
             <div className="chip-with-picker">
               <button type="button" className="path-chip" onClick={() => { setModelPickerOpen(!modelPickerOpen); closeOtherPickers('model'); }}>
-                🧠 {selectedProfile ? selectedProfile.name : '默认配置'}{selectedProfile?.backend === 'codex' ? ' · Codex' : ''}
+                🧠 {selectedProfile ? selectedProfile.name : '默认配置'}{selectedProfile ? profileSuffix(selectedProfile) : ''}
               </button>
               {modelPickerOpen && (
                 <div className="path-picker">
-                  <button type="button" className="path-picker-item" onClick={() => pickProfile(null)}>默认配置</button>
+                  {hasDefault && <button type="button" className="path-picker-item" onClick={() => pickProfile(null)}>默认配置</button>}
                   {usable.map(p => (
-                    <button type="button" key={p.id} className="path-picker-item" onClick={() => pickProfile(p.id)}>{p.name}{p.backend === 'codex' ? ' · Codex' : ''}</button>
+                    <button type="button" key={p.id} className="path-picker-item" onClick={() => pickProfile(p.id)}>{p.name}{profileSuffix(p)}</button>
                   ))}
                 </div>
               )}

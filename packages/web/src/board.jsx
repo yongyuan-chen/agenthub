@@ -9,6 +9,7 @@ import { state, bump, taskInScope } from './store.js';
 import { ModalBackdrop } from './modal.jsx';
 import { fmtAge } from './format.js';
 import { isOutdated } from '../../shared/protocol.mjs';
+import { BACKEND_LABELS, nativeAuthLabel } from './native-auth.js';
 
 // The install command plus the AI-assist fallback. Shared by the "add node"
 // modal and the first-run wizard so both stay in step — onboarding is exactly
@@ -111,6 +112,35 @@ function NodeRepairGuide({ node }) {
         <li>或只重启守护进程:<code>{repair.restart}</code></li>
         <li>执行后约 1 分钟内,这里的圆点应变绿;仍离线时查看日志:<code>{repair.logs}</code>,把最后几行发给管理员。</li>
       </ol>
+    </div>
+  );
+}
+
+// Whether this machine's claude / codex can already run on their own login
+// or config — what a 「本机账号」 model profile would use here.
+function NodeNativeAuthPanel({ node, isMine }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const auth = node.nativeAuth;
+  const probe = async () => {
+    setBusy(true); setErr('');
+    try { await api.probeNodeNativeAuth(node.id); } catch (e) { setErr(e.message); }
+    // The answer comes back as a 'node' broadcast; give the probe a moment.
+    setTimeout(() => setBusy(false), 4000);
+  };
+  return (
+    <div className="node-cli-panel">
+      <span className="muted">本机账号:</span>
+      {!auth ? <span className="muted">等待节点上报(节点自更新到新版后自动出现)</span>
+        : Object.keys(BACKEND_LABELS).filter(b => auth[b] !== undefined).map(b => (
+          <span key={b} className={`chip ${auth[b]?.loggedIn ? 'st-done' : ''}`}>
+            {BACKEND_LABELS[b]}:{auth[b] ? nativeAuthLabel(b, auth[b]) : '未安装'}
+          </span>
+        ))}
+      {isMine && node.status === 'online' && (
+        <button type="button" className="ghost link" disabled={busy} onClick={probe}>{busy ? '检测中…' : '重新检测'}</button>
+      )}
+      {err && <span className="err">{err}</span>}
     </div>
   );
 }
@@ -392,6 +422,7 @@ export function NodeManageModal({ user, onClose }) {
                 </div>
                 {isMine && n.status !== 'online' && repairId === n.id && <NodeRepairGuide node={n} />}
                 <NodeCliPanel node={n} isMine={isMine} />
+                <NodeNativeAuthPanel node={n} isMine={isMine} />
                 </React.Fragment>
               );
             })}

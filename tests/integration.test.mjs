@@ -14,6 +14,9 @@ import * as core from '../packages/worker/src/hub-core.mjs';
 import { LocalDb } from '../packages/executor/src/db.mjs';
 import { SessionManager } from '../packages/executor/src/manager.mjs';
 import { CloudLink } from '../packages/executor/src/cloudlink.mjs';
+
+// Never spawn the real CLIs / a login shell from tests.
+CloudLink.nativeAuthProbe = async () => ({ claude: null, codex: null, checkedAt: 0 });
 import { sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, PROTOCOL_VERSION, OUTBOUND_MESSAGE_TTL_MS, FEATURE_CLI_UPGRADE } from '../packages/shared/protocol.mjs';
 import * as accounts from '../packages/worker/src/accounts.mjs';
 import * as nodeAuth from '../packages/worker/src/node-auth.mjs';
@@ -3886,6 +3889,92 @@ test('node connect flow: expiry, and re-running the installer re-enrolls in plac
   const r2 = await core.api({ ...cloud.ctx, userId: 'user-bob' }, 'POST', `/api/node-auth/${foreign.body.code}/approve`, {});
   assert.deepEqual([r2.body.id, r2.body.reused], ['box-me-2', false]);
   assert.equal((await cloud.db.prepare('SELECT owner_user_id, token_hash FROM nodes WHERE id = ?').bind('box-me').first()).token_hash, await h('new'));
+});
+
+// 「本机账号」: a model profile with no relay at all — the node runs its own
+// claude/codex login or config. Covers the cloud's profile rules and that the
+// node actually gets {native:true} and runs it from the real home.
+test('native profile: created without credentials, never default, runs against the real home', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)')
+    .bind('user-test', 'tester', 'x', 0, now).run();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-native', await sha256Hex('tok-mac-native'), 'user-test', now).run();
+
+  const created = await cloud.api('POST', '/api/model-profiles', { kind: 'native', name: '本机 Claude Code' });
+  assert.equal(created.status, 200);
+  const nativeId = created.body.profile.id;
+  assert.deepEqual([created.body.profile.kind, created.body.profile.isDefault, created.body.profile.baseUrl], ['native', false, null]);
+  const listed = (await cloud.api('GET', '/api/model-profiles', {})).body.profiles;
+  assert.equal(listed.find(p => p.id === nativeId).kind, 'native');
+  assert.equal((await cloud.api('POST', `/api/model-profiles/${nativeId}/set-default`, {})).status, 409);
+  assert.equal((await cloud.api('GET', '/api/setup-status', {})).body.hasModel, true, 'a native profile is a model');
+
+  // Editing keeps it native: no relay fields required, none stored.
+  const edited = await cloud.api('PUT', `/api/model-profiles/${nativeId}`, { name: '订阅', model: 'opus', baseUrl: 'https://sneaky', apiKey: 'k' });
+  assert.equal(edited.status, 200);
+  assert.deepEqual([edited.body.profile.kind, edited.body.profile.baseUrl, edited.body.profile.model], ['native', null, 'opus']);
+
+  // No relay on the node at all — and none needed.
+  const spawned = [];
+  const exec = makeExecutor(cloud, 'mac-native', async (session) => {
+    session.busy = false;
+    session.opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0, session_id: session.sessionId });
+  }, { provider: { baseUrl: '', apiKey: '' } }, (session, opts) => { session.opts = opts; spawned.push(opts); });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  await until(async () => (await cloud.db.prepare('SELECT features FROM node_features WHERE node_id = ?').bind('mac-native').first())?.features?.includes('native-auth'), 2000, 'features recorded');
+
+  const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: '你好', nodeId: 'mac-native', modelProfileId: nativeId });
+  assert.equal(res.status, 200);
+  await until(() => spawned.length === 1, 2000, 'native session spawned');
+  assert.deepEqual(spawned[0].config.provider, { native: true, model: 'opus' });
+  assert.equal(spawned[0].realConfigDir, true, 'native credentials only work from the real ~/.claude');
+  const local = exec.db.getTask(res.body.task.id);
+  assert.equal(local.real_config_dir, 1);
+  assert.notEqual(local.status, 'failed');
+
+  // A conversation that already ran on a relay can't move into ~/.claude.
+  const relay = await cloud.api('POST', '/api/model-profiles', { name: 'relay', baseUrl: 'https://r', apiKey: 'k' });
+  const relayTask = await cloud.api('POST', '/api/tasks', { title: 'r', spec: 'hi', nodeId: 'mac-native', modelProfileId: relay.body.profile.id });
+  await until(async () => (await cloud.db.prepare('SELECT session_id FROM tasks WHERE id = ?').bind(relayTask.body.task.id).first())?.session_id, 2000, 'relay session id');
+  const blocked = await cloud.api('POST', `/api/tasks/${relayTask.body.task.id}/switch-model`, { modelProfileId: nativeId });
+  assert.equal(blocked.status, 409);
+  // ...but native -> relay is fine: a relay runs against the real home too.
+  const back = await cloud.api('POST', `/api/tasks/${res.body.task.id}/switch-model`, { modelProfileId: relay.body.profile.id });
+  assert.equal(back.status, 200);
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
+test('native profile: refused on a node whose executor predates it', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'mac-old');
+  await core.handleHello(cloud.ctx, 'mac-old', { t: 'hello', nodeId: 'mac-old', protocolVersion: PROTOCOL_VERSION, backends: ['claude'], features: [], tasks: [] });
+  const created = await cloud.api('POST', '/api/model-profiles', { kind: 'native', name: 'n' });
+  const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-old', modelProfileId: created.body.profile.id });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /本机账号/);
+});
+
+test('native auth report: sanitized, shown on the node, and offered by setup-status', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'mac-login');
+  await core.handleNativeAuth(cloud.ctx, 'mac-login', { t: 'native_auth', info: {
+    claude: { loggedIn: true, method: 'claude.ai', email: 'leak@example.com', token: 'sk-ant-secret' },
+    codex: { loggedIn: false, method: null },
+    evil: { loggedIn: true },
+  } });
+  const node = (await cloud.api('GET', '/api/nodes', {})).body.nodes.find(n => n.id === 'mac-login');
+  assert.deepEqual(node.nativeAuth, { claude: { loggedIn: true, method: 'claude.ai' }, codex: { loggedIn: false } });
+  assert.ok(cloud.broadcasts.some(m => m.t === 'node' && m.node.id === 'mac-login' && m.node.nativeAuth));
+  const status = (await cloud.api('GET', '/api/setup-status', {})).body;
+  assert.deepEqual(status.nativeLogins, [{ nodeId: 'mac-login', nodeName: 'mac-login', backend: 'claude', loggedIn: true, method: 'claude.ai' }]);
+  // Re-detect: owner only, online only.
+  assert.equal((await cloud.api('POST', '/api/nodes/mac-login/probe-native-auth', {})).status, 409);
+  assert.equal((await core.api({ ...cloud.ctx, userId: 'user-bob' }, 'POST', '/api/nodes/mac-login/probe-native-auth', {})).status, 404);
 });
 
 // ---- Phase 3: admin user management + global overview ----

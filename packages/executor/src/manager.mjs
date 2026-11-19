@@ -382,8 +382,10 @@ export class SessionManager {
       agentMode: task.agentMode === 'multi' ? 'multi' : null,
       // Adopted from an existing external session -> resume it directly
       // against the real ~/.claude location going forward, not an isolated
-      // copy — see the real_config_dir column comment in db.mjs.
-      realConfigDir: isNewAdoption, sourceCwd: task.sourceCwd ?? null,
+      // copy — see the real_config_dir column comment in db.mjs. A 本机账号
+      // task lives there too: its credentials only work from the real home
+      // (see native-auth.mjs).
+      realConfigDir: isNewAdoption || !!(task.provider ?? task.anthropic)?.native, sourceCwd: task.sourceCwd ?? null,
     });
     if (isNewAdoption) this._importHistory(task.id, task.sessionId);
     this._maybeStart(task.id);
@@ -531,7 +533,7 @@ export class SessionManager {
     // back to the node's shared config exactly as before.
     const override = t.provider_override ? JSON.parse(t.provider_override) : null;
     const effectiveConfig = override ? { ...this.config, provider: override } : this.config;
-    if (!effectiveConfig.provider?.baseUrl || !effectiveConfig.provider?.apiKey) {
+    if (!effectiveConfig.provider?.native && (!effectiveConfig.provider?.baseUrl || !effectiveConfig.provider?.apiKey)) {
       this.setStatus(taskId, 'failed', {
         error: '节点尚未收到模型中转站配置 — 请在网页端「设置」里保存 Base URL / API Key 后重试',
       });
@@ -1210,6 +1212,25 @@ export class SessionManager {
       });
       return;
     }
+    // 本机账号 needs the real ~/.claude / ~/.codex (see native-auth.mjs). A
+    // task already there (adopted, or native before) can switch freely — a
+    // relay runs fine against the real home too, that's what adoption does.
+    // A task whose session sits in the isolated home can't follow it there;
+    // the cloud refuses this as well. Before the first spawn it just moves.
+    const nowNative = !!provider?.native;
+    let realConfigDir = t.real_config_dir ? 1 : 0;
+    if (nowNative && !realConfigDir) {
+      if (t.session_id) {
+        this.emit(taskId, {
+          k: 'msg', role: 'system',
+          content: { text: '无法把这个对话切换到「本机账号」:它的会话记录在 AgentHub 的隔离目录里,本机账号只能在 ~/.claude / ~/.codex 下运行。请新建一张卡。' },
+        });
+        return;
+      }
+      realConfigDir = 1;
+    } else if (!nowNative && realConfigDir && !t.session_id && !t.source_cwd) {
+      realConfigDir = 0;   // a never-started native task going back to a relay
+    }
     const next = provider ? JSON.stringify(provider) : null;
     // Normalise the backend the same way the guard above does: start_task
     // omits `backend` when it's the default, so a claude task is stored as
@@ -1219,7 +1240,9 @@ export class SessionManager {
     // nobody touched, plus a needlessly killed idle session.
     if ((t.provider_override ?? null) === next
       && (t.backend ?? DEFAULT_BACKEND) === (nextBackend ?? DEFAULT_BACKEND)) return;
-    this.db.patchTask(taskId, { providerOverride: next, backend: nextBackend });
+    this.db.patchTask(taskId, {
+      providerOverride: next, backend: nextBackend, realConfigDir,
+    });
     // real_config_dir tasks kill their session after every turn anyway; for
     // the isolated-copy model a warm idle session would otherwise keep the
     // old env alive indefinitely — kill it now (between turns only; an
@@ -1239,7 +1262,7 @@ export class SessionManager {
     }
     this.emit(taskId, {
       k: 'msg', role: 'system',
-      content: { text: provider ? `已切换模型:${provider.model || provider.baseUrl}(下一轮生效)` : '已切换回默认模型配置(下一轮生效)' },
+      content: { text: provider ? `已切换模型:${provider.model || (provider.native ? '本机账号' : provider.baseUrl)}(下一轮生效)` : '已切换回默认模型配置(下一轮生效)' },
     });
   }
 

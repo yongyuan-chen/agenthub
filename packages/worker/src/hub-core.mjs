@@ -12,7 +12,7 @@
 //   listSessions(nodeId, path)    -> Promise<{sessions}|null> (same shape, lists existing claude sessions for a path)
 //   push(payload, ownerUserId)    -> void    (web push fan-out, fire and forget)
 //   now()                         -> epoch ms
-import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_MESSAGE_REWIND, FEATURE_CLI_UPGRADE, FEATURE_MULTI_AGENT, PROJECT_KINDS, DEFAULT_PROJECT_KIND, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
+import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_MESSAGE_REWIND, FEATURE_CLI_UPGRADE, FEATURE_MULTI_AGENT, FEATURE_NATIVE_AUTH, PROJECT_KINDS, DEFAULT_PROJECT_KIND, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
 import * as accounts from './accounts.mjs';
 import { hashPassword } from './auth.mjs';
 import { cachedCliVersions } from './cli-releases.mjs';
@@ -87,6 +87,38 @@ async function setProfileBackend(db, profileId, backend) {
     `INSERT INTO model_profile_backends (profile_id, backend) VALUES (?, ?)
      ON CONFLICT(profile_id) DO UPDATE SET backend = excluded.backend`,
     profileId, value).run();
+}
+
+// 'relay' | 'native' — see model_profile_kinds. No row = relay.
+async function profileKind(db, profileId) {
+  if (!profileId) return 'relay';
+  const row = await q(db, 'SELECT kind FROM model_profile_kinds WHERE profile_id = ?', profileId).first();
+  return row?.kind === 'native' ? 'native' : 'relay';
+}
+
+async function profileKinds(db, userId) {
+  const rows = await q(db,
+    `SELECT k.profile_id, k.kind FROM model_profile_kinds k
+     JOIN model_profiles p ON p.id = k.profile_id
+     WHERE p.owner_user_id = ?`, userId).all();
+  return new Map((rows.results ?? rows).map(r => [r.profile_id, r.kind]));
+}
+
+// Everything a node needs to run a profile, in one place — every route that
+// hands a profile to a node (start, switch, the hello re-assertion, the
+// push after an edit) goes through here so a 本机账号 profile can't be
+// half-understood by one of them. A native provider carries no credentials
+// at all, just the flag and an optional model; the node's own CLI config
+// does the rest (executor native-auth.mjs). null = not this user's profile.
+async function resolveProfile(db, profileId, userId) {
+  const profile = await q(db,
+    'SELECT base_url, api_key, model FROM model_profiles WHERE id = ? AND owner_user_id = ?', profileId, userId).first();
+  if (!profile) return null;
+  const [backend, kind] = await Promise.all([profileBackend(db, profileId), profileKind(db, profileId)]);
+  const provider = kind === 'native'
+    ? { native: true, ...(profile.model ? { model: profile.model } : {}) }
+    : { baseUrl: profile.base_url, apiKey: profile.api_key, model: profile.model };
+  return { provider, backend, kind };
 }
 
 // What a node last told us it can do. `known` is the important part: handleHello
@@ -407,10 +439,12 @@ function sanitizeCliUpgrades(raw) {
 async function attachNodeCliInfo(ctx, nodes) {
   if (!nodes.length) return;
   const ids = nodes.map(n => n.id);
-  const [verRows, setRows] = await Promise.all([
+  const [verRows, setRows, authRows] = await Promise.all([
     q(ctx.db, `SELECT node_id, versions, upgrades FROM node_cli_versions WHERE node_id IN (${inClause(ids)})`, ...ids).all(),
     q(ctx.db, `SELECT node_id, auto_upgrade_cli FROM node_settings WHERE node_id IN (${inClause(ids)})`, ...ids).all(),
+    q(ctx.db, `SELECT node_id, info FROM node_native_auth WHERE node_id IN (${inClause(ids)})`, ...ids).all(),
   ]);
+  const authByNode = new Map((authRows.results ?? authRows).map(r => [r.node_id, parseJsonObject(r.info)]));
   const byNode = new Map();
   for (const r of (verRows.results ?? verRows)) byNode.set(r.node_id, r);
   const autoOff = new Set();
@@ -420,6 +454,8 @@ async function attachNodeCliInfo(ctx, nodes) {
     n.cliVersions = parseJsonObject(row?.versions);
     n.cliUpgrades = parseJsonObject(row?.upgrades);
     n.autoUpgradeCli = !autoOff.has(n.id);
+    // null = this node never reported (older executor, or not yet probed).
+    n.nativeAuth = authByNode.get(n.id) ?? null;
   }
 }
 
@@ -714,13 +750,12 @@ export async function handleHello(ctx, nodeId, msg) {
     // '' = explicitly reverted to 默认配置 via switch-model — assert null.
     // Non-empty = pinned to that profile — resolve and assert it.
     if (cloud.model_profile_id && ownerId) {
-      const profile = await q(ctx.db,
-        'SELECT base_url, api_key, model FROM model_profiles WHERE id = ? AND owner_user_id = ?', cloud.model_profile_id, ownerId).first();
+      const resolved = await resolveProfile(ctx.db, cloud.model_profile_id, ownerId);
       // Profile deleted since -> nothing to re-assert; the executor keeps
       // whatever override it already has (same as before this existed).
-      if (profile) {
-        entry.providerOverride = { baseUrl: profile.base_url, apiKey: profile.api_key, model: profile.model };
-        entry.backend = await profileBackend(ctx.db, cloud.model_profile_id);
+      if (resolved) {
+        entry.providerOverride = resolved.provider;
+        entry.backend = resolved.backend;
       }
     } else if (cloud.model_profile_id === '') {
       entry.providerOverride = null;
@@ -788,6 +823,35 @@ export async function handleCliVersions(ctx, nodeId, msg) {
     JSON.stringify(sanitizeCliVersions(msg.versions)),
     JSON.stringify(sanitizeCliUpgrades(msg.upgrades)),
     ctx.now()).run();
+  await broadcastNode(ctx, nodeId, node.owner_user_id);
+}
+
+// Only whitelisted, short, non-secret fields survive — the node already
+// strips anything sensitive (native-auth.mjs), this is the cloud refusing to
+// store whatever a buggy or hostile executor might send anyway.
+function sanitizeNativeAuth(info) {
+  const out = {};
+  for (const backend of BACKENDS) {
+    const v = info?.[backend];
+    if (!v || typeof v !== 'object') { out[backend] = null; continue; }
+    const clean = { loggedIn: v.loggedIn === true, ...(v.customEndpoint === true ? { customEndpoint: true } : {}) };
+    for (const key of ['method', 'provider', 'source', 'customProvider']) {
+      if (typeof v[key] === 'string' && v[key]) clean[key] = v[key].slice(0, 64);
+    }
+    out[backend] = clean;
+  }
+  return out;
+}
+
+// {t:'native_auth', info} — what this node's CLIs are logged in with on
+// their own. Drives the 「本机账号」 hints on the board.
+export async function handleNativeAuth(ctx, nodeId, msg) {
+  const node = await q(ctx.db, 'SELECT owner_user_id FROM nodes WHERE id = ?', nodeId).first();
+  if (!node) return;
+  await q(ctx.db,
+    `INSERT INTO node_native_auth (node_id, info, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET info = excluded.info, updated_at = excluded.updated_at`,
+    nodeId, JSON.stringify(sanitizeNativeAuth(msg.info)), ctx.now()).run();
   await broadcastNode(ctx, nodeId, node.owner_user_id);
 }
 
@@ -1099,11 +1163,9 @@ export async function pushConfigToUser(ctx, userId) {
 // been switched away days earlier. Offline nodes still get it for free on
 // their next hello, exactly like pushConfigToUser.
 export async function pushProfileToPinnedTasks(ctx, userId, profileId) {
-  const profile = await q(ctx.db,
-    'SELECT base_url, api_key, model FROM model_profiles WHERE id = ? AND owner_user_id = ?', profileId, userId).first();
-  if (!profile) return;
-  const provider = { baseUrl: profile.base_url, apiKey: profile.api_key, model: profile.model };
-  const backend = await profileBackend(ctx.db, profileId);
+  const resolved = await resolveProfile(ctx.db, profileId, userId);
+  if (!resolved) return;
+  const { provider, backend } = resolved;
   const rows = await q(ctx.db,
     'SELECT id, node_id FROM tasks WHERE model_profile_id = ? AND owner_user_id = ?', profileId, userId).all();
   for (const t of rows.results ?? rows) {
@@ -1235,12 +1297,16 @@ async function createTask(ctx, body, userId, { adopting = true } = {}) {
   }
   let provider;
   let backend = DEFAULT_BACKEND;
+  let kind = 'relay';
   if (modelProfileId) {
-    const profile = await q(ctx.db,
-      'SELECT base_url, api_key, model FROM model_profiles WHERE id = ? AND owner_user_id = ?', modelProfileId, userId).first();
-    if (!profile) return err(404, `unknown model profile: ${modelProfileId}`);
-    provider = { baseUrl: profile.base_url, apiKey: profile.api_key, model: profile.model };
-    backend = await profileBackend(ctx.db, modelProfileId);
+    const resolved = await resolveProfile(ctx.db, modelProfileId, userId);
+    if (!resolved) return err(404, `unknown model profile: ${modelProfileId}`);
+    ({ provider, backend, kind } = resolved);
+  }
+  // An older executor reads a native provider as "no relay configured" and
+  // fails the task with advice about Settings that doesn't apply.
+  if (kind === 'native' && !(await nodeSupports(ctx.db, nodeId, FEATURE_NATIVE_AUTH))) {
+    return err(409, `节点 ${nodeId} 的 executor 还不支持「本机账号」,请等它自动升级(约 2-3 分钟)后重试`);
   }
   // Refuse up-front rather than dispatching work the node can't do — the
   // spawn would go wrong in some backend-specific way and the resulting
@@ -2070,12 +2136,21 @@ export async function api(ctx, method, pathname, body) {
       const profileId = body?.modelProfileId || null;
       let provider = null;
       let backend = DEFAULT_BACKEND;
+      let kind = 'relay';
       if (profileId) {
-        const profile = await q(ctx.db,
-          'SELECT base_url, api_key, model FROM model_profiles WHERE id = ? AND owner_user_id = ?', profileId, userId).first();
-        if (!profile) return err(404, `unknown model profile: ${profileId}`);
-        provider = { baseUrl: profile.base_url, apiKey: profile.api_key, model: profile.model };
-        backend = await profileBackend(ctx.db, profileId);
+        const resolved = await resolveProfile(ctx.db, profileId, userId);
+        if (!resolved) return err(404, `unknown model profile: ${profileId}`);
+        ({ provider, backend, kind } = resolved);
+      }
+      // 本机账号 runs in the node's real ~/.claude / ~/.codex; a session that
+      // was started against a relay lives in AgentHub's isolated home and
+      // can't follow it there (the node refuses too — see setProviderOverride).
+      // The other direction is fine: a relay runs against the real home as well.
+      if (kind === 'native' && task.session_id && (await profileKind(ctx.db, task.model_profile_id)) !== 'native') {
+        return err(409, '这个对话已经用中转站跑过,不能中途改用「本机账号」(会话记录不在同一个位置)。请新建一张卡。');
+      }
+      if (kind === 'native' && !(await nodeSupports(ctx.db, task.node_id, FEATURE_NATIVE_AUTH))) {
+        return err(409, `节点 ${task.node_id} 的 executor 还不支持「本机账号」,请等它自动升级(约 2-3 分钟)后重试`);
       }
       // Switching model profile now also switches agent CLI, and a session id
       // is not portable between them — `codex resume <claude-uuid>` can only
@@ -2244,6 +2319,15 @@ export async function api(ctx, method, pathname, body) {
   // setup-node.sh), which is often ugly or ambiguous (several VMs named
   // "vm-xxxx") — name is a purely cosmetic owner-only override, id itself
   // never changes (it's the WS/token identity).
+  // 「重新检测」: ask a node to re-probe its CLIs' own login state now
+  // (someone just ran `claude login` there). The answer arrives as a normal
+  // native_auth message and a 'node' broadcast.
+  if (method === 'POST' && route[0] === 'nodes' && route.length === 3 && route[2] === 'probe-native-auth') {
+    const node = await q(ctx.db, 'SELECT owner_user_id FROM nodes WHERE id = ?', route[1]).first();
+    if (!node || node.owner_user_id !== userId) return err(404, 'node not found');
+    if (!ctx.sendToNode(route[1], { t: 'probe_native_auth' })) return err(409, '节点不在线');
+    return ok({});
+  }
   if (method === 'POST' && route[0] === 'nodes' && route.length === 3 && route[2] === 'rename') {
     const nodeId = route[1];
     const name = (body?.name || '').trim().slice(0, 200);
@@ -2464,9 +2548,22 @@ export async function api(ctx, method, pathname, body) {
                       WHERE team_id IN (SELECT team_id FROM team_members WHERE user_id = ?))`,
         userId, userId).first(),
     ]);
+    // Machines whose CLI is already logged in / configured on its own — the
+    // wizard offers 「本机账号」 for these instead of asking for a relay.
+    const authRows = await q(ctx.db,
+      `SELECT nodes.id, nodes.name, a.info FROM node_native_auth a JOIN nodes ON nodes.id = a.node_id
+       WHERE nodes.owner_user_id = ?`, userId).all();
+    const nativeLogins = [];
+    for (const r of (authRows.results ?? authRows)) {
+      const info = parseJsonObject(r.info);
+      for (const backend of BACKENDS) {
+        if (info[backend]?.loggedIn) nativeLogins.push({ nodeId: r.id, nodeName: r.name || r.id, backend, ...info[backend] });
+      }
+    }
     return ok({
       hasModel: (profiles?.n ?? 0) > 0 || !!(legacy?.api_base_url && legacy?.api_key),
       nodeCount: nodes?.n ?? 0,
+      nativeLogins,
     });
   }
 
@@ -2488,19 +2585,34 @@ export async function api(ctx, method, pathname, body) {
       const rows = await q(ctx.db,
         'SELECT id, name, base_url, api_key, model, is_default FROM model_profiles WHERE owner_user_id = ? ORDER BY created_at', userId).all();
       const u = await q(ctx.db, 'SELECT last_model_profile_id FROM users WHERE id = ?', userId).first();
-      const backends = await profileBackends(ctx.db, userId);
+      const [backends, kinds] = await Promise.all([profileBackends(ctx.db, userId), profileKinds(ctx.db, userId)]);
       return ok({
         profiles: (rows.results ?? rows).map(r => ({
           id: r.id, name: r.name, baseUrl: r.base_url, apiKey: r.api_key, model: r.model,
           isDefault: !!r.is_default, backend: backends.get(r.id) || DEFAULT_BACKEND,
+          kind: kinds.get(r.id) === 'native' ? 'native' : 'relay',
         })),
         lastModelProfileId: u?.last_model_profile_id || null,
       });
     }
     if (method === 'POST') {
-      const { name, baseUrl, apiKey, model, backend } = body || {};
-      if (!name || !baseUrl || !apiKey) return err(400, 'name, baseUrl, apiKey required');
+      const { name, baseUrl, apiKey, model, backend, kind } = body || {};
       if (backend && !BACKENDS.includes(backend)) return err(400, `unknown backend: ${backend}`);
+      if (kind === 'native') {
+        // 本机账号: nothing to store but a label, the CLI and an optional
+        // model — the credentials are whatever that CLI is set up with on
+        // whichever node runs the task. Never the account default: the
+        // default is a relay mirrored to every node for unpinned tasks.
+        if (!name) return err(400, 'name required');
+        const id = ulid();
+        await q(ctx.db,
+          'INSERT INTO model_profiles (id, owner_user_id, name, base_url, api_key, model, is_default, created_at) VALUES (?, ?, ?, NULL, NULL, ?, 0, ?)',
+          id, userId, name, model || null, ctx.now()).run();
+        await q(ctx.db, 'INSERT INTO model_profile_kinds (profile_id, kind) VALUES (?, ?)', id, 'native').run();
+        if (backend && backend !== DEFAULT_BACKEND) await setProfileBackend(ctx.db, id, backend);
+        return ok({ profile: { id, name, baseUrl: null, apiKey: null, model: model || null, isDefault: false, backend: backend || DEFAULT_BACKEND, kind: 'native' } });
+      }
+      if (!name || !baseUrl || !apiKey) return err(400, 'name, baseUrl, apiKey required');
       const id = ulid();
       // A fresh account's very first profile becomes the default automatically
       // — otherwise every new user would sit in a "nothing pushed to nodes
@@ -2523,15 +2635,16 @@ export async function api(ctx, method, pathname, body) {
         await q(ctx.db, 'UPDATE users SET api_base_url = ?, api_key = ?, api_model = ? WHERE id = ?', baseUrl, apiKey, model || 'gpt-5.6', userId).run();
         await pushConfigToUser(ctx, userId);
       }
-      return ok({ profile: { id, name, baseUrl, apiKey, model: model || null, isDefault: isFirst, backend: backend || DEFAULT_BACKEND } });
+      return ok({ profile: { id, name, baseUrl, apiKey, model: model || null, isDefault: isFirst, backend: backend || DEFAULT_BACKEND, kind: 'relay' } });
     }
   }
   if (method === 'PUT' && route[0] === 'model-profiles' && route.length === 2) {
     const { name, baseUrl, apiKey, model, backend } = body || {};
-    if (!name || !baseUrl || !apiKey) return err(400, 'name, baseUrl, apiKey required');
     if (backend && !BACKENDS.includes(backend)) return err(400, `unknown backend: ${backend}`);
     const profile = await q(ctx.db, 'SELECT id, is_default FROM model_profiles WHERE id = ? AND owner_user_id = ?', route[1], userId).first();
     if (!profile) return err(404, 'profile not found');
+    const native = (await profileKind(ctx.db, route[1])) === 'native';
+    if (!name || (!native && (!baseUrl || !apiKey))) return err(400, native ? 'name required' : 'name, baseUrl, apiKey required');
     // Editing a profile that live tasks are pinned to would silently change
     // which agent CLI they resume under, and their session ids don't survive
     // that. Refuse; the user can make a second profile instead.
@@ -2550,7 +2663,7 @@ export async function api(ctx, method, pathname, body) {
       await setProfileBackend(ctx.db, route[1], backend);
     }
     await q(ctx.db, 'UPDATE model_profiles SET name = ?, base_url = ?, api_key = ?, model = ? WHERE id = ?',
-      name, baseUrl, apiKey, model || null, route[1]).run();
+      name, native ? null : baseUrl, native ? null : apiKey, model || null, route[1]).run();
     // Independent of is_default: cards pinned to this profile hold their own
     // copy of its credentials and would otherwise keep the old relay until
     // their node next reconnects.
@@ -2563,7 +2676,10 @@ export async function api(ctx, method, pathname, body) {
         baseUrl, apiKey, model || 'gpt-5.6', userId).run();
       await pushConfigToUser(ctx, userId);
     }
-    return ok({ profile: { id: route[1], name, baseUrl, apiKey, model: model || null, isDefault: !!profile.is_default, backend: backend || await profileBackend(ctx.db, route[1]) } });
+    return ok({ profile: {
+      id: route[1], name, baseUrl: native ? null : baseUrl, apiKey: native ? null : apiKey, model: model || null,
+      isDefault: !!profile.is_default, backend: backend || await profileBackend(ctx.db, route[1]), kind: native ? 'native' : 'relay',
+    } });
   }
   if (method === 'POST' && route[0] === 'model-profiles' && route.length === 3 && route[2] === 'set-default') {
     const profile = await q(ctx.db, 'SELECT base_url, api_key, model FROM model_profiles WHERE id = ? AND owner_user_id = ?', route[1], userId).first();
@@ -2574,6 +2690,9 @@ export async function api(ctx, method, pathname, body) {
     // backend). Making a Codex profile the default would therefore point the
     // claude CLI at a /v1/responses-only relay: every unpinned task on every
     // node breaks at once, with an error that looks like a broken relay.
+    if (await profileKind(ctx.db, route[1]) === 'native') {
+      return err(409, '「本机账号」档案不能设为账户默认:默认配置会同步到所有节点给「没有选档案」的对话用。请在建卡时直接选这个档案。');
+    }
     if (await profileBackend(ctx.db, route[1]) !== DEFAULT_BACKEND) {
       return err(409, 'Codex 档案不能设为账户默认:默认配置是给「没有选档案」的对话用的,而那些对话跑的是 Claude Code。请在建卡时直接选这个档案。');
     }
@@ -2600,6 +2719,7 @@ export async function api(ctx, method, pathname, body) {
     // backend row has to go explicitly — left behind, a future profile that
     // happened to reuse this id would silently inherit someone else's backend.
     await q(ctx.db, 'DELETE FROM model_profile_backends WHERE profile_id = ?', route[1]).run();
+    await q(ctx.db, 'DELETE FROM model_profile_kinds WHERE profile_id = ?', route[1]).run();
     if (profile.is_default) {
       // Clear the mirrored copy too — otherwise the lazy migration at the
       // top of GET would see api_base_url/api_key still set with 0 profile

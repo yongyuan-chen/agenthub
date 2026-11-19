@@ -8,6 +8,7 @@ import { backendFor } from './backends.mjs';
 import { cliState, cliVersions } from './cli-upgrade.mjs';
 import { listDir, readFile, writeFile } from './files.mjs';
 import { PROTOCOL_VERSION, EXECUTOR_FEATURES } from '../../shared/protocol.mjs';
+import { detectNativeAuth, resetShellEnvCache } from './native-auth.mjs';
 
 // Which agent CLIs this machine can actually run. The probe itself (and its
 // process-level cache) lives in cli-upgrade.mjs, since the same single
@@ -73,6 +74,28 @@ export class CloudLink {
     this.reconnectTimer = null;   // pending backoff timer, if any
     this.handshakeTimer = null;   // per-attempt open-or-die watchdog
     this._attemptFailLogged = 0;
+    this._nativeAuthJson = null;  // last 本机账号 report the cloud accepted
+    this.nativeAuthTimer = null;
+  }
+
+  // Which CLIs on this machine are already logged in / configured on their
+  // own, so the board can offer 「本机账号」 without anyone typing a key.
+  // Async and after hello, never inside it: the probe spawns both CLIs and a
+  // login shell, which can take seconds. Re-sent only when it changes, and
+  // re-checked on a timer because people run `claude login` long after the
+  // node was installed.
+  async _reportNativeAuth({ force = false } = {}) {
+    let info;
+    try {
+      const state = cliState(this.config);
+      info = await CloudLink.nativeAuthProbe(this.config, {
+        installed: { claude: !!state.claude?.installed, codex: !!state.codex?.installed },
+      });
+    } catch { return; }
+    const { checkedAt, ...comparable } = info;
+    const json = JSON.stringify(comparable);
+    if (!force && json === this._nativeAuthJson) return;
+    if (this._send({ t: 'native_auth', info })) this._nativeAuthJson = json;
   }
 
   wsUrl() {
@@ -103,10 +126,13 @@ export class CloudLink {
     // pending retry (the exact stall this heals), this interval may be the
     // only live handle — unref'ing it would let the event loop exit instead.
     this._connect();
+    this.nativeAuthTimer = setInterval(() => { if (this.connected) this._reportNativeAuth(); }, 5 * 60_000);
+    this.nativeAuthTimer.unref?.();
   }
 
   stop() {
     this.stopped = true;
+    clearInterval(this.nativeAuthTimer);
     clearInterval(this.hbTimer);
     clearInterval(this.supervisorTimer);
     clearTimeout(this.reconnectTimer);
@@ -141,6 +167,8 @@ export class CloudLink {
       console.log('[link] connected to', this.config.cloudUrl);
       this.lastServerContactAt = Date.now();
       this._sendHello();
+      // A fresh connection may be a fresh Hub instance: always resend.
+      this._reportNativeAuth({ force: true });
       clearInterval(this.hbTimer);
       // Sending a heartbeat only proves *this side* still thinks the socket
       // is open — a half-open TCP connection (a middlebox/NAT silently
@@ -296,6 +324,13 @@ export class CloudLink {
         break;
       case 'resync':
         this._sendHello();
+        this._reportNativeAuth({ force: true });
+        break;
+      // 「重新检测」 on the board — someone just ran `claude login` (or edited
+      // their shell profile) and doesn't want to wait for the timer.
+      case 'probe_native_auth':
+        resetShellEnvCache();
+        this._reportNativeAuth({ force: true });
         break;
       case 'browse':
         this._send({ t: 'browse_result', requestId: msg.requestId, entries: listDirs(msg.path) });
@@ -386,3 +421,6 @@ export class CloudLink {
     this._send({ t: 'ev', taskId, seq, ev });
   }
 }
+
+// Overridable so tests never spawn the real CLIs or a login shell.
+CloudLink.nativeAuthProbe = detectNativeAuth;

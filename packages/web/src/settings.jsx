@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { api } from './api.js';
 import { ModalBackdrop } from './modal.jsx';
+import { BACKEND_LABELS, nativeAuthLabel } from './native-auth.js';
 
 function FetchModelsButton({ baseUrl, apiKey, onPick }) {
   const [models, setModels] = useState(null);
@@ -125,6 +126,29 @@ function GeneralSection() {
 // track "does this account have a relay yet" without duplicating the fetch —
 // the first-run wizard uses it to advance to the next step the moment one is
 // saved.
+// "gpu31 上的 Claude Code 已经登录了(官方账号)" plus a one-click way to use
+// it — the whole point is that someone whose machine is already set up never
+// has to go find a key. Exported for the first-run wizard.
+export function NativeLoginHints({ logins, profiles, busy, onAdd }) {
+  if (!logins.length) return null;
+  const hasNative = (backend) => profiles.some(p => p.kind === 'native' && (p.backend || 'claude') === backend);
+  const backends = [...new Set(logins.map(l => l.backend))];
+  return (
+    <div className="native-login-hints">
+      {logins.map(l => (
+        <div className="ok-note" key={`${l.nodeId}:${l.backend}`}>
+          检测到 <b>{l.nodeName}</b> 上的 {BACKEND_LABELS[l.backend]} 已可用:{nativeAuthLabel(l.backend, l)}
+        </div>
+      ))}
+      <div className="row-inline">
+        {backends.filter(b => !hasNative(b)).map(b => (
+          <button type="button" key={b} disabled={busy} onClick={() => onAdd(b)}>使用本机 {BACKEND_LABELS[b]} 账号</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function ModelProfilesSection({ onChange }) {
   const [profiles, setProfiles] = useState(null);
   const [editingId, setEditingId] = useState(null); // null = the form adds a new profile
@@ -137,27 +161,52 @@ export function ModelProfilesSection({ onChange }) {
   // same decision in practice — a Codex relay can't serve Claude and vice
   // versa. One consequence: 「切换模型」on a card is also 「切换后端」.
   const [backend, setBackend] = useState('claude');
+  // 'relay' = an API relay entered here; 'native' = 「本机账号」, whatever the
+  // CLI on the node is already logged in / configured with. Fixed once a
+  // profile exists (the server keeps it immutable too).
+  const [kind, setKind] = useState('relay');
+  // Account-wide: which of your machines already have a CLI logged in.
+  const [nativeLogins, setNativeLogins] = useState([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
   const load = () => api.modelProfiles()
     .then(r => { const list = r.profiles || []; setProfiles(list); onChange?.(list); })
     .catch(() => setProfiles([]));
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    api.setupStatus().then(r => setNativeLogins(r.nativeLogins || [])).catch(() => {});
+  }, []);
 
-  const resetForm = () => { setEditingId(null); setName(''); setBaseUrl(''); setApiKey(''); setModel(''); setBackend('claude'); };
+  const resetForm = () => { setEditingId(null); setName(''); setBaseUrl(''); setApiKey(''); setModel(''); setBackend('claude'); setKind('relay'); };
 
   const startEdit = (p) => {
     setEditingId(p.id); setName(p.name); setBaseUrl(p.baseUrl || ''); setApiKey(p.apiKey || ''); setModel(p.model || '');
-    setBackend(p.backend || 'claude');
+    setBackend(p.backend || 'claude'); setKind(p.kind === 'native' ? 'native' : 'relay');
     setErr('');
+  };
+
+  // One click from a detection hint: no form to fill, there's nothing secret
+  // to enter for a native profile.
+  const addNative = async (nativeBackend) => {
+    setBusy(true); setErr('');
+    try {
+      await api.createModelProfile({ kind: 'native', name: `本机 ${BACKEND_LABELS[nativeBackend]}`, backend: nativeBackend });
+      await load();
+    } catch (e) { setErr(e.message); }
+    setBusy(false);
   };
 
   const save = async (e) => {
     e.preventDefault();
-    if (!name.trim() || !baseUrl.trim() || !apiKey.trim()) { setErr('名称、Base URL、API Key 都要填'); return; }
+    const native = kind === 'native';
+    if (!name.trim() || (!native && (!baseUrl.trim() || !apiKey.trim()))) {
+      setErr(native ? '名称要填' : '名称、Base URL、API Key 都要填'); return;
+    }
     setBusy(true); setErr('');
-    const payload = { name: name.trim(), baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim() || null, backend };
+    const payload = native
+      ? { kind, name: name.trim(), model: model.trim() || null, backend }
+      : { name: name.trim(), baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim() || null, backend };
     try {
       if (editingId) await api.updateModelProfile(editingId, payload);
       else await api.createModelProfile(payload);
@@ -186,20 +235,27 @@ export function ModelProfilesSection({ onChange }) {
   return (
     <fieldset className="admin-section">
       <legend>模型配置</legend>
-      <p className="muted">保存一个或多个中转站/API Key,每一条都能自动拉取它支持的模型列表。标为「默认」的那一条会自动同步到你名下所有节点。</p>
+      <p className="muted">
+        两种方式:填中转站 / API Key(标为「默认」的那一条会自动同步到你名下所有节点);或者用「本机账号」——
+        直接用机器上 claude / codex 自己已经登录或配置好的账号(官方订阅、ChatGPT 登录、settings.json、shell 里 export 的 key 都算),什么都不用填。
+      </p>
+      <NativeLoginHints logins={nativeLogins} profiles={profiles || []} busy={busy} onAdd={addNative} />
       {profiles === null ? <div className="muted">加载中…</div> : (
         <>
           {profiles.map(p => (
             <div className="row-inline profile-row" key={p.id}>
               <span>{p.name}</span>
               <span className="chip">{p.backend === 'codex' ? 'Codex' : 'Claude Code'}</span>
-              <span className="muted">{p.baseUrl}{p.model ? ` · ${p.model}` : ''}</span>
+              {p.kind === 'native' && <span className="chip">本机账号</span>}
+              <span className="muted">{p.kind === 'native' ? '用节点上 CLI 自己的登录/配置' : p.baseUrl}{p.model ? ` · ${p.model}` : ''}</span>
               {/* 「默认」is the relay that tasks which picked *no* profile use,
                   and those always run Claude Code — so a Codex profile can't
                   hold it (the server refuses too). */}
               {p.isDefault
                 ? <span className="chip">默认</span>
-                : p.backend === 'codex'
+                : p.kind === 'native'
+                  ? <span className="muted" title="默认配置会同步到所有节点,给「没有选档案」的对话用;本机账号请在建卡时直接选">不可设为默认</span>
+                  : p.backend === 'codex'
                   ? <span className="muted" title="默认配置是给「没有选档案」的对话用的,那些对话跑的是 Claude Code">不可设为默认</span>
                   : <button type="button" className="ghost link" disabled={busy} onClick={() => setDefault(p.id)}>设为默认</button>}
               <button type="button" className="ghost link" disabled={busy} onClick={() => startEdit(p)}>编辑</button>
@@ -210,20 +266,39 @@ export function ModelProfilesSection({ onChange }) {
         </>
       )}
       {editingId && <div className="ok-note">正在编辑「{profiles?.find(p => p.id === editingId)?.name || name}」— 保存后立即生效{profiles?.find(p => p.id === editingId)?.isDefault ? ',并自动推送到你名下所有节点' : ''}</div>}
-      <div className="row2">
-        <input value={name} onChange={e => setName(e.target.value)} placeholder="名称,比如 Claude 官方" />
-        <input value={baseUrl} onChange={e => setBaseUrl(e.target.value)} placeholder="Base URL" />
+      <div className="row-inline">
+        <label><input type="radio" name="profile-kind" disabled={!!editingId} checked={kind === 'relay'} onChange={() => setKind('relay')} /> API 中转站</label>
+        <label><input type="radio" name="profile-kind" disabled={!!editingId} checked={kind === 'native'} onChange={() => setKind('native')} /> 本机账号</label>
       </div>
-      <div className="row2">
-        <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="API Key" />
-        <input value={model} onChange={e => setModel(e.target.value)} placeholder="Model(可选)" />
-      </div>
+      {kind === 'native' ? (
+        <>
+          <p className="muted">
+            任务会像你在那台机器终端里直接敲 <code>claude</code> / <code>codex</code> 一样运行,用它自己的登录和配置,AgentHub 不注入任何 key。
+            还没登录的话,先在那台机器上执行 <code>claude</code>(按提示 /login)或 <code>codex login</code>。
+          </p>
+          <div className="row2">
+            <input value={name} onChange={e => setName(e.target.value)} placeholder="名称,比如 本机 Claude Code" />
+            <input value={model} onChange={e => setModel(e.target.value)} placeholder="Model(可选,留空用 CLI 自己的默认)" />
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="row2">
+            <input value={name} onChange={e => setName(e.target.value)} placeholder="名称,比如 Claude 官方" />
+            <input value={baseUrl} onChange={e => setBaseUrl(e.target.value)} placeholder="Base URL" />
+          </div>
+          <div className="row2">
+            <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="API Key" />
+            <input value={model} onChange={e => setModel(e.target.value)} placeholder="Model(可选)" />
+          </div>
+        </>
+      )}
       <div className="row-inline">
         <label><input type="radio" name="profile-backend" checked={backend === 'claude'} onChange={() => setBackend('claude')} /> Claude Code</label>
         <label><input type="radio" name="profile-backend" checked={backend === 'codex'} onChange={() => setBackend('codex')} /> Codex</label>
       </div>
-      {backend === 'codex' && <p className="muted">Codex 只支持 <code>/v1/responses</code>(旧的 <code>/v1/chat/completions</code> 已被移除),中转站必须支持它。用这个档案的节点上要装好 <code>codex</code> CLI。</p>}
-      <FetchModelsButton baseUrl={baseUrl} apiKey={apiKey} onPick={setModel} />
+      {backend === 'codex' && kind === 'relay' && <p className="muted">Codex 只支持 <code>/v1/responses</code>(旧的 <code>/v1/chat/completions</code> 已被移除),中转站必须支持它。用这个档案的节点上要装好 <code>codex</code> CLI。</p>}
+      {kind === 'relay' && <FetchModelsButton baseUrl={baseUrl} apiKey={apiKey} onPick={setModel} />}
       {err && <div className="err">{err}</div>}
       <div className="row-inline">
         <button type="button" disabled={busy} onClick={save}>{editingId ? '保存修改' : '添加模型配置'}</button>

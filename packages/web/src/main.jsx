@@ -41,7 +41,7 @@ function App() {
   // conversation, so re-offering the wizard on the next visit is help, not
   // nagging. Dismissing it stays dismissed for as long as the tab is open,
   // and the sidebar keeps a way back in.
-  const { hasModel, nodeCount, refresh: refreshSetup } = useSetupStatus(authed);
+  const { hasModel, nodeCount, nativeLogins, refresh: refreshSetup } = useSetupStatus(authed);
   const [setupDismissed, setSetupDismissed] = useState(false);
   // Once the wizard is up it stays up until dismissed, even after both steps
   // go green. Unmounting it the instant setup completes made it vanish
@@ -307,7 +307,7 @@ function App() {
       )}
       {showOnboarding && (
         <OnboardingModal
-          hasModel={!!hasModel} nodeCount={nodeCount ?? 0}
+          hasModel={!!hasModel} nodeCount={nodeCount ?? 0} nativeLogins={nativeLogins}
           onClose={() => { setSetupDismissed(true); setSetupOpened(false); }}
           onDone={refreshSetup}
           // Refreshes both the account-wide status the wizard renders and the

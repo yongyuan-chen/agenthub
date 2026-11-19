@@ -214,9 +214,13 @@ export const FEATURE_SESSION_FORK = 'session-fork';
 export const FEATURE_MESSAGE_REWIND = 'message-rewind-2';
 export const FEATURE_CLI_UPGRADE = 'cli-upgrade';
 export const FEATURE_MULTI_AGENT = 'multi-agent';
+// Runs a provider of {native:true} against the CLI's own login/config on the
+// node (official account, settings.json env, shell-exported keys) instead of
+// an AgentHub relay. An older node would read it as "no relay configured".
+export const FEATURE_NATIVE_AUTH = 'native-auth';
 export const EXECUTOR_FEATURES = [
   FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_CLI_UPGRADE,
-  FEATURE_MULTI_AGENT, FEATURE_MESSAGE_REWIND,
+  FEATURE_MULTI_AGENT, FEATURE_MESSAGE_REWIND, FEATURE_NATIVE_AUTH,
 ];
 
 // Caps for the file browser, shared so the executor and the cloud agree.

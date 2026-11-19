@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { api } from './api.js';
 import { ModalBackdrop } from './modal.jsx';
-import { ModelProfilesSection } from './settings.jsx';
+import { ModelProfilesSection, NativeLoginHints } from './settings.jsx';
 import { NodeInstallPanel } from './board.jsx';
 
 // A fresh account can't do anything until two things exist: somewhere to send
@@ -11,7 +11,7 @@ import { NodeInstallPanel } from './board.jsx';
 // button — so a new user lands on an empty board with no indication that the
 // "+ 新对话" button they're drawn to will fail. This walks them through both,
 // and gets out of the way permanently once they're done.
-export function OnboardingModal({ hasModel, nodeCount, onClose, onDone, onPollNodes }) {
+export function OnboardingModal({ hasModel, nodeCount, nativeLogins = [], onClose, onDone, onPollNodes }) {
   // Start on whichever step is actually outstanding, so someone who already
   // has a relay configured isn't made to click past it.
   const [step, setStep] = useState(hasModel ? 2 : 1);
@@ -21,12 +21,22 @@ export function OnboardingModal({ hasModel, nodeCount, onClose, onDone, onPollNo
   // succeeded on its own instead of asking the user whether it worked — and
   // so a dropped WS doesn't leave it stuck on "waiting" forever.
   useEffect(() => {
-    if (hasNode || step !== 2 || !onPollNodes) return undefined;
+    if ((hasNode && hasModel) || step !== 2 || !onPollNodes) return undefined;
     const timer = setInterval(onPollNodes, 5000);
     return () => clearInterval(timer);
   }, [hasNode, step, onPollNodes]);
 
   const done = hasModel && hasNode;
+  const [nativeBusy, setNativeBusy] = useState(false);
+  const [nativeErr, setNativeErr] = useState('');
+  const addNative = async (backend) => {
+    setNativeBusy(true); setNativeErr('');
+    try {
+      await api.createModelProfile({ kind: 'native', name: `本机 ${backend === 'codex' ? 'Codex' : 'Claude Code'}`, backend });
+      onDone?.();
+    } catch (e) { setNativeErr(e.message); }
+    setNativeBusy(false);
+  };
 
   return createPortal(
     <ModalBackdrop onClose={onClose}>
@@ -52,8 +62,14 @@ export function OnboardingModal({ hasModel, nodeCount, onClose, onDone, onPollNo
                   // whole form open under a green ✓ reads as "still to do".
                   setStep(s => (s === 1 ? 2 : s));
                 }} />
-                {hasModel && (
+                {hasModel ? (
                   <button type="button" onClick={() => setStep(2)}>下一步:添加机器 →</button>
+                ) : (
+                  <p className="muted">
+                    机器上的 claude / codex 已经登录了官方账号或配好了 key?这步可以先跳过,
+                    <button type="button" className="ghost link" onClick={() => setStep(2)}>先添加机器 →</button>
+                    接入后会自动检测,一键用「本机账号」。
+                  </p>
                 )}
               </div>
             )}
@@ -68,7 +84,18 @@ export function OnboardingModal({ hasModel, nodeCount, onClose, onDone, onPollNo
             {step === 2 && (
               <div className="onboarding-step-body">
                 {hasNode ? (
-                  <p className="ok-note">已经有 {nodeCount} 台机器接入,可以开始建对话了。</p>
+                  <>
+                    <p className="ok-note">已经有 {nodeCount} 台机器接入{hasModel ? ',可以开始建对话了。' : '。'}</p>
+                    {!hasModel && (nativeLogins.length ? (
+                      <NativeLoginHints logins={nativeLogins} profiles={[]} busy={nativeBusy} onAdd={addNative} />
+                    ) : (
+                      <p className="muted">
+                        没检测到已登录的 claude / codex。可以在那台机器上执行 <code>claude</code>(按提示 /login)或 <code>codex login</code> 登录官方账号,
+                        几分钟内这里会自动出现;或者回到第 1 步填一个中转站。
+                      </p>
+                    ))}
+                    {nativeErr && <div className="err">{nativeErr}</div>}
+                  </>
                 ) : (
                   <>
                     <p className="muted">
@@ -109,18 +136,18 @@ export function OnboardingModal({ hasModel, nodeCount, onClose, onDone, onPollNo
 // Both disappear when the question is asked of the account, once, atomically.
 export function useSetupStatus(authed) {
   // null = still unknown; nothing may conclude "not set up" from this yet.
-  const [status, setStatus] = useState({ hasModel: null, nodeCount: null });
+  const [status, setStatus] = useState({ hasModel: null, nodeCount: null, nativeLogins: [] });
   const load = () => api.setupStatus()
-    .then(r => setStatus({ hasModel: !!r.hasModel, nodeCount: r.nodeCount ?? 0 }))
+    .then(r => setStatus({ hasModel: !!r.hasModel, nodeCount: r.nodeCount ?? 0, nativeLogins: r.nativeLogins || [] }))
     // A failed check must not pop a setup wizard at someone whose account is
     // fine — treat unknown as "configured" and stay quiet.
-    .catch(() => setStatus({ hasModel: true, nodeCount: 1 }));
+    .catch(() => setStatus({ hasModel: true, nodeCount: 1, nativeLogins: [] }));
   useEffect(() => {
-    if (!authed) { setStatus({ hasModel: null, nodeCount: null }); return undefined; }
+    if (!authed) { setStatus({ hasModel: null, nodeCount: null, nativeLogins: [] }); return undefined; }
     let cancelled = false;
     api.setupStatus()
-      .then(r => { if (!cancelled) setStatus({ hasModel: !!r.hasModel, nodeCount: r.nodeCount ?? 0 }); })
-      .catch(() => { if (!cancelled) setStatus({ hasModel: true, nodeCount: 1 }); });
+      .then(r => { if (!cancelled) setStatus({ hasModel: !!r.hasModel, nodeCount: r.nodeCount ?? 0, nativeLogins: r.nativeLogins || [] }); })
+      .catch(() => { if (!cancelled) setStatus({ hasModel: true, nodeCount: 1, nativeLogins: [] }); });
     return () => { cancelled = true; };
   }, [authed]);
   return { ...status, refresh: load };
