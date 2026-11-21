@@ -47,3 +47,12 @@ export function nativeBackendsFor(node, userId) {
   if (!node || !userId || node.owner_user_id !== userId || !node.nativeAuth) return [];
   return Object.keys(BACKEND_LABELS).filter(b => node.nativeAuth[b]?.loggedIn);
 }
+
+// The "API vs 账号直连" badge's words and hover text, shared by the new-chat
+// pane and the conversation header so the two can't describe it differently.
+export function authModeOf(native, baseUrl = '') {
+  if (native) return { cls: 'auth-native', text: '账号直连', title: '用这台机器上已登录的官方账号直连(订阅 / 官方登录 / 机器自己的配置),不经过中转站' };
+  let host = '';
+  try { host = baseUrl ? new URL(baseUrl).host : ''; } catch { host = baseUrl; }
+  return { cls: 'auth-api', text: 'API', title: `通过 API Key 调用${host ? `(${host})` : '(账户默认中转站)'}` };
+}

@@ -130,7 +130,7 @@ function NodeNativeAuthPanel({ node, isMine }) {
   };
   return (
     <div className="node-cli-panel">
-      <span className="muted">本机账号:</span>
+      <span className="muted">账号直连:</span>
       {!auth ? <span className="muted">等待节点上报(节点自更新到新版后自动出现)</span>
         : Object.keys(BACKEND_LABELS).filter(b => auth[b] !== undefined).map(b => (
           <span key={b} className={`chip ${auth[b]?.loggedIn ? 'st-done' : ''}`}>

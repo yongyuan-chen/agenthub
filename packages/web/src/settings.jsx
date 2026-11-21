@@ -236,7 +236,7 @@ export function ModelProfilesSection({ onChange }) {
     <fieldset className="admin-section">
       <legend>模型配置</legend>
       <p className="muted">
-        两种方式:填中转站 / API Key(标为「默认」的那一条会自动同步到你名下所有节点);或者用「本机账号」——
+        两种方式:填中转站 / API Key(标为「默认」的那一条会自动同步到你名下所有节点);或者用「账号直连」——
         直接用机器上 claude / codex 自己已经登录或配置好的账号(官方订阅、ChatGPT 登录、settings.json、shell 里 export 的 key 都算),什么都不用填。
       </p>
       <NativeLoginHints logins={nativeLogins} profiles={profiles || []} busy={busy} onAdd={addNative} />
@@ -246,7 +246,7 @@ export function ModelProfilesSection({ onChange }) {
             <div className="row-inline profile-row" key={p.id}>
               <span>{p.name}</span>
               <span className="chip">{p.backend === 'codex' ? 'Codex' : 'Claude Code'}</span>
-              {p.kind === 'native' && <span className="chip">本机账号</span>}
+              {p.kind === 'native' && <span className="chip auth-badge auth-native">账号直连</span>}
               <span className="muted">{p.kind === 'native' ? '用节点上 CLI 自己的登录/配置' : p.baseUrl}{p.model ? ` · ${p.model}` : ''}</span>
               {/* 「默认」is the relay that tasks which picked *no* profile use,
                   and those always run Claude Code — so a Codex profile can't
@@ -254,7 +254,7 @@ export function ModelProfilesSection({ onChange }) {
               {p.isDefault
                 ? <span className="chip">默认</span>
                 : p.kind === 'native'
-                  ? <span className="muted" title="默认配置会同步到所有节点,给「没有选档案」的对话用;本机账号请在建卡时直接选">不可设为默认</span>
+                  ? <span className="muted" title="默认配置会同步到所有节点,给「没有选档案」的对话用;账号直连请在建卡时直接选">不可设为默认</span>
                   : p.backend === 'codex'
                   ? <span className="muted" title="默认配置是给「没有选档案」的对话用的,那些对话跑的是 Claude Code">不可设为默认</span>
                   : <button type="button" className="ghost link" disabled={busy} onClick={() => setDefault(p.id)}>设为默认</button>}
@@ -268,7 +268,7 @@ export function ModelProfilesSection({ onChange }) {
       {editingId && <div className="ok-note">正在编辑「{profiles?.find(p => p.id === editingId)?.name || name}」— 保存后立即生效{profiles?.find(p => p.id === editingId)?.isDefault ? ',并自动推送到你名下所有节点' : ''}</div>}
       <div className="row-inline">
         <label><input type="radio" name="profile-kind" disabled={!!editingId} checked={kind === 'relay'} onChange={() => setKind('relay')} /> API 中转站</label>
-        <label><input type="radio" name="profile-kind" disabled={!!editingId} checked={kind === 'native'} onChange={() => setKind('native')} /> 本机账号</label>
+        <label><input type="radio" name="profile-kind" disabled={!!editingId} checked={kind === 'native'} onChange={() => setKind('native')} /> 账号直连(机器上已登录的官方账号)</label>
       </div>
       {kind === 'native' ? (
         <>

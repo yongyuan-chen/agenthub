@@ -3,7 +3,7 @@ import { api } from './api.js';
 import { state, upsertTask, bump } from './store.js';
 import { SessionPicker } from './sessionpicker.jsx';
 import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
-import { BACKEND_LABELS, NATIVE_MODELS, nativeBackendsFor } from './native-auth.js';
+import { BACKEND_LABELS, NATIVE_MODELS, nativeBackendsFor, authModeOf } from './native-auth.js';
 
 // Below this many options, show them as inline selectable chips instead of
 // making the user open a dropdown — most accounts have a handful of nodes
@@ -38,7 +38,10 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
   const [modelProfileId, setModelProfileId] = useState(null); // null = 默认配置
   // Conversations take their agent mode from the project they're created in.
   const multiAgent = state.teams.find(t => t.id === state.activeTeamId)?.kind === 'multi';
-  const usableIn = (list) => (multiAgent ? list.filter(p => p.backend !== 'codex') : list);
+  // Relay profiles only: 账号直连 has its own picker (the official models,
+  // shown when the selected node is logged in), and listing the native
+  // profile among the API ones read as one more relay.
+  const usableIn = (list) => list.filter(p => p.kind !== 'native' && (!multiAgent || p.backend !== 'codex'));
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [baseBranch, setBaseBranch] = useState(''); // empty = auto-detect the repo's actual default branch
@@ -121,7 +124,7 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
   // 默认配置 = the relay mirrored to every node; without a default profile
   // there's nothing behind it, so don't offer it.
   const hasDefault = profiles.some(p => p.isDefault);
-  const profileSuffix = (p) => `${p.backend === 'codex' ? ' · Codex' : ''}${p.kind === 'native' ? ' · 本机账号' : ''}`;
+  const profileSuffix = (p) => (p.backend === 'codex' ? ' · Codex' : '');
 
   // Autocomplete subdirectories on the selected node as the custom path is typed.
   useEffect(() => {
@@ -286,6 +289,11 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
           )}
 
           {/* ---- model picker: the node's official login, or relay profiles ---- */}
+          {(() => {
+            const native = nativeMode || selectedProfile?.kind === 'native';
+            const mode = authModeOf(native, selectedProfile ? selectedProfile.baseUrl : profiles.find(p => p.isDefault)?.baseUrl);
+            return <span className={`chip auth-badge ${mode.cls}`} title={mode.title}>{mode.text}</span>;
+          })()}
           {nativeMode ? (
             <div className="inline-chip-group">
               {nativeBackends.flatMap(b => NATIVE_MODELS[b].map(m => (

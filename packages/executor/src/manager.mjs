@@ -1223,7 +1223,7 @@ export class SessionManager {
       if (t.session_id) {
         this.emit(taskId, {
           k: 'msg', role: 'system',
-          content: { text: '无法把这个对话切换到「本机账号」:它的会话记录在 AgentHub 的隔离目录里,本机账号只能在 ~/.claude / ~/.codex 下运行。请新建一张卡。' },
+          content: { text: '无法把这个对话切换到「账号直连」:它的会话记录在 AgentHub 的隔离目录里,本机账号只能在 ~/.claude / ~/.codex 下运行。请新建一张卡。' },
         });
         return;
       }

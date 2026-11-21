@@ -4045,6 +4045,23 @@ test('native model pick: per-conversation official model, owner only, survives r
   exec.link.stop();
 });
 
+// The socket snapshot replaces the client's task map wholesale, so it must
+// carry everything the REST list does — found by looking at the page: the
+// 账号直连 conversation's model reverted to 「默认」 once the WS connected.
+test('ws snapshot: tasks carry backend and the per-conversation model like the REST list', async () => {
+  const cloud = makeCloud();
+  await enrollNode(cloud, 'mac-snap');
+  await cloud.db.prepare('INSERT INTO model_profiles (id, owner_user_id, name, is_default, created_at) VALUES (?, ?, ?, 0, ?)').bind('p-cx', 'user-test', 'cx', Date.now()).run();
+  await cloud.db.prepare('INSERT INTO model_profile_backends (profile_id, backend) VALUES (?, ?)').bind('p-cx', 'codex').run();
+  await cloud.db.prepare('INSERT INTO tasks (id, title, spec, node_id, owner_user_id, status, model_profile_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind('T1', 't', 's', 'mac-snap', 'user-test', 'review', 'p-cx', Date.now(), Date.now()).run();
+  await cloud.db.prepare('INSERT INTO task_model_overrides (task_id, model) VALUES (?, ?)').bind('T1', 'claude-opus-5-5').run();
+  const snap = await core.snapshot(cloud.ctx);
+  const t = snap.tasks.find(x => x.id === 'T1');
+  assert.equal(t.backend, 'codex');
+  assert.equal(t.model_override, 'claude-opus-5-5');
+});
+
 test('native profile: refused on a node whose executor predates it', async () => {
   const cloud = makeCloud();
   await enrollNode(cloud, 'mac-old');
@@ -4052,7 +4069,7 @@ test('native profile: refused on a node whose executor predates it', async () =>
   const created = await cloud.api('POST', '/api/model-profiles', { kind: 'native', name: 'n' });
   const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: 'x', nodeId: 'mac-old', modelProfileId: created.body.profile.id });
   assert.equal(res.status, 409);
-  assert.match(res.body.error, /本机账号/);
+  assert.match(res.body.error, /账号直连/);
 });
 
 test('native auth report: sanitized, shown on the node, and offered by setup-status', async () => {

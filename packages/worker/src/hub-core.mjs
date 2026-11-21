@@ -121,7 +121,7 @@ async function resolveProfile(db, profileId, userId) {
   return { provider, backend, kind };
 }
 
-// 「本机账号」 picked straight from the new-chat pane: the account's native
+// 「账号直连」 picked straight from the new-chat pane: the account's native
 // profile for that CLI, created on first use — there's nothing to configure
 // in one, so making someone visit Settings first would be pure friction.
 async function ensureNativeProfile(db, userId, backend, now) {
@@ -163,8 +163,8 @@ function withTaskModel(provider, model) {
 // key. A teammate the node is shared with must not be able to run on it.
 async function nativeRefusal(db, nodeId, userId) {
   const node = await q(db, 'SELECT owner_user_id FROM nodes WHERE id = ?', nodeId).first();
-  if (node?.owner_user_id !== userId) return '「本机账号」只能在你自己的节点上用:它用的是这台机器主人登录的账号。请选一个中转站档案。';
-  if (!(await nodeSupports(db, nodeId, FEATURE_NATIVE_AUTH))) return `节点 ${nodeId} 的 executor 还不支持「本机账号」,请等它自动升级(约 2-3 分钟)后重试`;
+  if (node?.owner_user_id !== userId) return '「账号直连」只能在你自己的节点上用:它用的是这台机器主人登录的账号。请选一个中转站档案。';
+  if (!(await nodeSupports(db, nodeId, FEATURE_NATIVE_AUTH))) return `节点 ${nodeId} 的 executor 还不支持「账号直连」,请等它自动升级(约 2-3 分钟)后重试`;
   return null;
 }
 
@@ -905,7 +905,7 @@ function sanitizeNativeAuth(info) {
 }
 
 // {t:'native_auth', info} — what this node's CLIs are logged in with on
-// their own. Drives the 「本机账号」 hints on the board.
+// their own. Drives the 「账号直连」 hints on the board.
 export async function handleNativeAuth(ctx, nodeId, msg) {
   const node = await q(ctx.db, 'SELECT owner_user_id FROM nodes WHERE id = ?', nodeId).first();
   if (!node) return;
@@ -2238,7 +2238,7 @@ export async function api(ctx, method, pathname, body) {
       // can't follow it there (the node refuses too — see setProviderOverride).
       // The other direction is fine: a relay runs against the real home as well.
       if (kind === 'native' && task.session_id && (await profileKind(ctx.db, task.model_profile_id)) !== 'native') {
-        return err(409, '这个对话已经用中转站跑过,不能中途改用「本机账号」(会话记录不在同一个位置)。请新建一张卡。');
+        return err(409, '这个对话已经用中转站跑过,不能中途改用「账号直连」(会话记录不在同一个位置)。请新建一张卡。');
       }
       if (kind === 'native') {
         const refusal = await nativeRefusal(ctx.db, task.node_id, userId);
@@ -2663,7 +2663,7 @@ export async function api(ctx, method, pathname, body) {
         userId, userId).first(),
     ]);
     // Machines whose CLI is already logged in / configured on its own — the
-    // wizard offers 「本机账号」 for these instead of asking for a relay.
+    // wizard offers 「账号直连」 for these instead of asking for a relay.
     const authRows = await q(ctx.db,
       `SELECT nodes.id, nodes.name, a.info FROM node_native_auth a JOIN nodes ON nodes.id = a.node_id
        WHERE nodes.owner_user_id = ?`, userId).all();
@@ -2805,7 +2805,7 @@ export async function api(ctx, method, pathname, body) {
     // claude CLI at a /v1/responses-only relay: every unpinned task on every
     // node breaks at once, with an error that looks like a broken relay.
     if (await profileKind(ctx.db, route[1]) === 'native') {
-      return err(409, '「本机账号」档案不能设为账户默认:默认配置会同步到所有节点给「没有选档案」的对话用。请在建卡时直接选这个档案。');
+      return err(409, '「账号直连」档案不能设为账户默认:默认配置会同步到所有节点给「没有选档案」的对话用。请在建卡时直接选这个档案。');
     }
     if (await profileBackend(ctx.db, route[1]) !== DEFAULT_BACKEND) {
       return err(409, 'Codex 档案不能设为账户默认:默认配置是给「没有选档案」的对话用的,而那些对话跑的是 Claude Code。请在建卡时直接选这个档案。');
@@ -3201,6 +3201,10 @@ export async function snapshot(ctx) {
   const tasks = taskRows.results ?? taskRows;
   await attachTeamIds(ctx, tasks);
   await attachAgentModes(ctx.db, tasks);
+  // backend + the per-conversation model: without them the socket's snapshot
+  // turned every Codex card back into Claude and every 账号直连 conversation's
+  // model into 「默认」 the moment it connected.
+  await attachTaskBackends(ctx.db, tasks);
   // Same enrichment the REST list does — the snapshot *replaces* the client's
   // task map wholesale on every (re)connect, so anything missing here silently
   // erases it: found live, the run timer and unread dots showed up from the

@@ -68,7 +68,7 @@ export function OnboardingModal({ hasModel, nodeCount, nativeLogins = [], onClos
                   <p className="muted">
                     机器上的 claude / codex 已经登录了官方账号或配好了 key?这步可以先跳过,
                     <button type="button" className="ghost link" onClick={() => setStep(2)}>先添加机器 →</button>
-                    接入后会自动检测,一键用「本机账号」。
+                    接入后会自动检测,一键用「账号直连」。
                   </p>
                 )}
               </div>

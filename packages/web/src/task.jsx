@@ -12,7 +12,7 @@ import { SessionPicker } from './sessionpicker.jsx';
 import { SubagentPanel } from './subagents.jsx';
 import { SPAWN_TOOL_NAMES, CONTINUE_TOOL_NAME, isSubagentInternal } from './subagent-tree.js';
 import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
-import { NATIVE_MODELS, nativeModelLabel } from './native-auth.js';
+import { NATIVE_MODELS, nativeModelLabel, authModeOf } from './native-auth.js';
 
 export function Md({ text }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
@@ -490,7 +490,7 @@ function ModelChip({ task, isCreator }) {
   // models rather than between relay profiles.
   const native = profile?.kind === 'native';
   const label = !pid ? '默认模型'
-    : native ? `本机账号 · ${nativeModelLabel(task.backend || profile.backend || 'claude', task.model_override || profile.model || '')}`
+    : native ? (nativeModelLabel(task.backend || profile.backend || 'claude', task.model_override || profile.model || '') || '默认').replace(/^默认$/, '默认模型')
     : profile ? profile.name
     : profiles ? '自定义模型' : '…';
 
@@ -521,8 +521,14 @@ function ModelChip({ task, isCreator }) {
   };
   const currentNativeModel = task.model_override || profile?.model || '';
 
+  // Which way this conversation reaches the model, at a glance. Unknown until
+  // the profile list lands for a pinned task — no badge rather than a wrong one.
+  const defaultProfile = profiles?.find(p => p.isDefault);
+  const mode = (!pid || profile) ? authModeOf(native, profile ? profile.baseUrl : defaultProfile?.baseUrl) : null;
+
   return (
     <span className="model-chip-wrap">
+      {mode && <span className={`chip auth-badge ${mode.cls}`} title={mode.title}>{mode.text}</span>}
       <span
         className={`chip model-chip${isCreator ? ' clickable' : ''}`}
         title={isCreator ? '当前模型 — 点击切换(下一轮生效)' : '当前模型'}
@@ -543,7 +549,7 @@ function ModelChip({ task, isCreator }) {
           {compatible('claude') && <button type="button" disabled={busy} className={!pid ? 'selected' : ''} onClick={() => pick(null)}>默认配置</button>}
           {(profiles || []).filter(offered).map(p => (
             <button type="button" key={p.id} disabled={busy} className={p.id === pid ? 'selected' : ''} onClick={() => pick(p.id)}>
-              {p.name}<span className="muted"> · {p.model || (p.kind === 'native' ? '本机账号' : p.baseUrl)}</span>
+              {p.name}<span className="muted"> · {p.model || (p.kind === 'native' ? '账号直连' : p.baseUrl)}</span>
             </button>
           ))}
           <div className="muted model-picker-note">
