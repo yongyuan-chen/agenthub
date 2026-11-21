@@ -167,6 +167,19 @@ chmod 600 "$HOME/.agenthub/executor.config.json"
 
 # ---------- 8. install + start daemon ----------
 NODE_BIN="$(command -v node)"
+# The daemon's supervisor (systemd/cron) starts it with a bare system PATH,
+# but an npm-installed claude/codex is a `#!/usr/bin/env node` script: if
+# node (or the CLI itself) lives anywhere off that PATH — the installer's
+# portable ~/.agenthub/node-runtime, a per-user npm prefix, an admin's
+# /opt/node — every spawn dies with "env: 'node': No such file". Bake the
+# directories this run actually resolved, same as the Windows wrapper does.
+RUNTIME_PATH="$(dirname "$NODE_BIN")"
+for b in claude codex git; do
+  command -v "$b" >/dev/null 2>&1 || continue
+  d="$(dirname "$(command -v "$b")")"
+  case ":$RUNTIME_PATH:" in *":$d:"*) ;; *) RUNTIME_PATH="$RUNTIME_PATH:$d" ;; esac
+done
+RUNTIME_PATH="$RUNTIME_PATH:/usr/local/bin:/usr/bin:/bin"
 if [ "$(uname -s)" = "Darwin" ]; then
   log "installing launchd agent..."
   PLIST="$HOME/Library/LaunchAgents/com.agenthub.executor.plist"
@@ -179,6 +192,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
 else
   log "installing systemd service..."
   sed -e "s|__NODE__|$NODE_BIN|g" -e "s|__ROOT__|$ROOT|g" -e "s|__USER__|$USER|g" \
+    -e "s|__HOME__|$HOME|g" -e "s|__PATH__|$RUNTIME_PATH|g" \
     deploy/agenthub-executor.service | sudo tee /etc/systemd/system/agenthub-executor.service >/dev/null
   sudo systemctl daemon-reload
   sudo systemctl enable agenthub-executor

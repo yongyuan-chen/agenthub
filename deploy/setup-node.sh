@@ -150,6 +150,19 @@ EOF
 chmod 600 "$HOME/.agenthub/executor.config.json"
 
 NODE_BIN="$(command -v node)"
+# The daemon's supervisor (systemd/cron) starts it with a bare system PATH,
+# but an npm-installed claude/codex is a `#!/usr/bin/env node` script: if
+# node (or the CLI itself) lives anywhere off that PATH — the installer's
+# portable ~/.agenthub/node-runtime, a per-user npm prefix, an admin's
+# /opt/node — every spawn dies with "env: 'node': No such file". Bake the
+# directories this run actually resolved, same as the Windows wrapper does.
+RUNTIME_PATH="$(dirname "$NODE_BIN")"
+for b in claude codex git; do
+  command -v "$b" >/dev/null 2>&1 || continue
+  d="$(dirname "$(command -v "$b")")"
+  case ":$RUNTIME_PATH:" in *":$d:"*) ;; *) RUNTIME_PATH="$RUNTIME_PATH:$d" ;; esac
+done
+RUNTIME_PATH="$RUNTIME_PATH:/usr/local/bin:/usr/bin:/bin"
 if [ "$(uname -s)" = "Darwin" ]; then
   PLIST="$HOME/Library/LaunchAgents/com.agenthub.executor.plist"
   mkdir -p "$HOME/Library/LaunchAgents" "$HOME/agenthub/logs"
@@ -164,7 +177,7 @@ else
   # forever because systemd's env pointed at a HOME that didn't match where
   # the config file above was actually written).
   render_unit() {
-    sed -e "s|__NODE__|$NODE_BIN|g" -e "s|__ROOT__|$ROOT|g" -e "s|__USER__|$USER|g" -e "s|__HOME__|$HOME|g" \
+    sed -e "s|__NODE__|$NODE_BIN|g" -e "s|__ROOT__|$ROOT|g" -e "s|__USER__|$USER|g" -e "s|__HOME__|$HOME|g" -e "s|__PATH__|$RUNTIME_PATH|g" \
       deploy/agenthub-executor.service
   }
   install_cron_keepalive() {
@@ -179,6 +192,7 @@ if command -v flock >/dev/null 2>&1 && [ "\${AGENTHUB_LOCKED:-}" != 1 ]; then
   AGENTHUB_LOCKED=1 exec flock -n "$HOME/.agenthub/executor.lock" "\$0"
 fi
 pgrep -u "\$(id -un)" -f "$ROOT/packages/executor/src/index.mjs" >/dev/null && exit 0
+export PATH="$RUNTIME_PATH:\$PATH"
 exec "$NODE_BIN" "$ROOT/packages/executor/src/index.mjs" >> "$HOME/.agenthub/executor.log" 2>&1
 RUNEOF
     chmod +x "$HOME/.agenthub/run-executor.sh"

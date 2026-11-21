@@ -74,12 +74,50 @@ install_portable_node() {
 # registers and runs fine, it just can't start real sessions until it's
 # there (see executor/src/config.mjs's own non-fatal handling of this same
 # gap) — so this never aborts the rest of setup via set -e.
+#
+# A plain (non-root) user on a box whose node came from apt/NodeSource/an
+# admin's tarball can't write npm's global prefix (/usr, /opt/...): `npm i -g`
+# dies with EACCES. Found live: such a user got only the vague WARN below and
+# then setup-node.sh's hard "install at least one agent CLI" stop, while the
+# same one-liner under sudo worked. So when the prefix isn't ours, install
+# into a per-user prefix instead — passed as --prefix rather than written to
+# ~/.npmrc, so the user's own npm config is left exactly as it was.
+#
+# `npm i -g` writes into <prefix>/lib/node_modules and <prefix>/bin; each must
+# either be writable or not exist yet under a writable parent.
+npm_prefix_writable() {
+  local p="$1" d
+  [ -n "$p" ] || return 1
+  for d in "$p/lib/node_modules" "$p/bin"; do
+    if [ -e "$d" ]; then [ -w "$d" ] || return 1
+    elif [ -e "$(dirname "$d")" ]; then [ -w "$(dirname "$d")" ] || return 1
+    else [ -w "$p" ] || return 1
+    fi
+  done
+}
 install_claude_cli() {
-  log "claude CLI not found — installing via npm (npm i -g @anthropic-ai/claude-code)..."
-  if npm install -g @anthropic-ai/claude-code >/dev/null 2>&1; then
+  local PREFIX_ARGS=() GLOBAL_PREFIX USER_PREFIX="$HOME/.agenthub/npm-global" OUT
+  GLOBAL_PREFIX="$(npm config get prefix 2>/dev/null || true)"
+  if ! npm_prefix_writable "$GLOBAL_PREFIX"; then
+    mkdir -p "$USER_PREFIX"
+    PREFIX_ARGS=(--prefix "$USER_PREFIX")
+    log "npm's global prefix (${GLOBAL_PREFIX:-unknown}) isn't writable by $(whoami) — installing claude CLI into $USER_PREFIX instead (no root needed)..."
+  else
+    log "claude CLI not found — installing via npm (npm i -g @anthropic-ai/claude-code)..."
+  fi
+  if OUT="$(npm install -g "${PREFIX_ARGS[@]}" @anthropic-ai/claude-code 2>&1)"; then
+    if [ ${#PREFIX_ARGS[@]} -gt 0 ]; then
+      export PATH="$USER_PREFIX/bin:$PATH"
+      local MARK="# agenthub: per-user npm global bin"
+      if ! grep -qF "$MARK" "$HOME/.bashrc" 2>/dev/null; then
+        { echo "$MARK"; echo "export PATH=\"$USER_PREFIX/bin:\$PATH\""; } >> "$HOME/.bashrc"
+      fi
+    fi
     log "installed claude CLI: $(claude --version 2>/dev/null || echo ok)"
   else
-    log "WARN: automatic claude CLI install failed (no writable global npm prefix?) — install manually: npm i -g @anthropic-ai/claude-code"
+    log "WARN: automatic claude CLI install failed — npm said:"
+    printf '%s\n' "$OUT" | tail -n 15 | sed 's/^/    /' >&2
+    log "install it manually (e.g. curl -fsSL https://claude.ai/install.sh | bash), then re-run this installer"
   fi
 }
 
