@@ -12,6 +12,7 @@ import { SessionPicker } from './sessionpicker.jsx';
 import { SubagentPanel } from './subagents.jsx';
 import { SPAWN_TOOL_NAMES, CONTINUE_TOOL_NAME, isSubagentInternal } from './subagent-tree.js';
 import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
+import { NATIVE_MODELS, nativeModelLabel } from './native-auth.js';
 
 export function Md({ text }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
@@ -485,7 +486,11 @@ function ModelChip({ task, isCreator }) {
 
   const pid = task.model_profile_id || null; // '' (explicit default) -> null, same label
   const profile = pid && profiles?.find(p => p.id === pid);
+  // 本机账号: the node's own official login, switched between official
+  // models rather than between relay profiles.
+  const native = profile?.kind === 'native';
   const label = !pid ? '默认模型'
+    : native ? `本机账号 · ${nativeModelLabel(task.backend || profile.backend || 'claude', task.model_override || profile.model || '')}`
     : profile ? profile.name
     : profiles ? '自定义模型' : '…';
 
@@ -509,6 +514,12 @@ function ModelChip({ task, isCreator }) {
     try { await api.switchModel(task.id, profileId); setOpen(false); } catch (e) { alert(e.message); }
     setBusy(false);
   };
+  const pickNative = async (model) => {
+    setBusy(true);
+    try { await api.switchModel(task.id, null, { backend, model }); setOpen(false); } catch (e) { alert(e.message); }
+    setBusy(false);
+  };
+  const currentNativeModel = task.model_override || profile?.model || '';
 
   return (
     <span className="model-chip-wrap">
@@ -516,8 +527,18 @@ function ModelChip({ task, isCreator }) {
         className={`chip model-chip${isCreator ? ' clickable' : ''}`}
         title={isCreator ? '当前模型 — 点击切换(下一轮生效)' : '当前模型'}
         onClick={isCreator ? () => setOpen(o => !o) : undefined}
-      >🧠 {label}{backend === 'codex' ? ' · Codex' : ''}{profile?.kind === 'native' ? ' · 本机账号' : ''}</span>
-      {open && (
+      >🧠 {label}{backend === 'codex' ? ' · Codex' : ''}</span>
+      {open && native && (
+        <div className="model-picker">
+          {(NATIVE_MODELS[backend] || []).map(m => (
+            <button type="button" key={m.id} disabled={busy} className={m.id === currentNativeModel ? 'selected' : ''} onClick={() => pickNative(m.id)}>
+              {m.label}<span className="muted"> · 官方账号</span>
+            </button>
+          ))}
+          <div className="muted model-picker-note">用这台机器上已登录的官方账号,切换在下一轮对话生效。套餐里没有的模型,CLI 会在对话里报错。</div>
+        </div>
+      )}
+      {open && !native && (
         <div className="model-picker">
           {compatible('claude') && <button type="button" disabled={busy} className={!pid ? 'selected' : ''} onClick={() => pick(null)}>默认配置</button>}
           {(profiles || []).filter(offered).map(p => (

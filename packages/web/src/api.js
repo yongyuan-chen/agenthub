@@ -61,7 +61,9 @@ export const api = {
     req('POST', `/api/nodes/${nodeId}/file`, { path, content, expectedMtime }),
   listNodeSessions: (nodeId, path) => req('GET', `/api/nodes/${nodeId}/sessions?path=${encodeURIComponent(path)}`),
   switchSession: (taskId, sessionId) => req('POST', `/api/tasks/${taskId}/switch-session`, { sessionId }),
-  switchModel: (taskId, modelProfileId) => req('POST', `/api/tasks/${taskId}/switch-model`, { modelProfileId }),
+  // native = {backend, model}: the node's own official login with that model.
+  switchModel: (taskId, modelProfileId, native = null) =>
+    req('POST', `/api/tasks/${taskId}/switch-model`, native ? { native } : { modelProfileId }),
   getLayout: () => req('GET', '/api/layout'),
   saveLayout: (panes, teamId = state.activeTeamId) => req('POST', '/api/layout', { panes }, { teamId }),
   modelProfiles: () => req('GET', '/api/model-profiles'),

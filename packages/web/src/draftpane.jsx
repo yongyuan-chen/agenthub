@@ -3,6 +3,7 @@ import { api } from './api.js';
 import { state, upsertTask, bump } from './store.js';
 import { SessionPicker } from './sessionpicker.jsx';
 import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
+import { BACKEND_LABELS, NATIVE_MODELS, nativeBackendsFor } from './native-auth.js';
 
 // Below this many options, show them as inline selectable chips instead of
 // making the user open a dropdown — most accounts have a handful of nodes
@@ -17,7 +18,7 @@ function deriveTitle(text) {
 // A pane slot with no task yet: pick a project path (or take the account
 // default), type the first message, and sending it is what actually creates
 // the task — no upfront title/spec form to get through first.
-export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onOpenSettings }) {
+export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onOpenSettings, userId }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
@@ -87,6 +88,24 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
   // the new node to a directory it doesn't have. Switching node also drops a
   // hand-picked path for the same reason.
   const nodeKey = selectedNode?.id || null;
+
+  // A node whose own claude/codex is logged in (an official subscription, a
+  // ChatGPT login, keys set up on the box) runs on that, with the official
+  // models to pick from — the relay profiles mean nothing there. Only for the
+  // node's owner: it's their account. 「改用中转站档案」 is the way back.
+  const nativeBackends = nativeBackendsFor(selectedNode, userId).filter(b => !multiAgent || b === 'claude');
+  const [useRelay, setUseRelay] = useState(false);
+  const [nativeChoice, setNativeChoice] = useState({ backend: 'claude', model: '' });
+  const nativeMode = nativeBackends.length > 0 && !useRelay;
+  const nativeKey = nativeBackends.join(',');
+  useEffect(() => {
+    setUseRelay(false);
+    setNativeChoice(c => (nativeBackends.includes(c.backend) ? c : { backend: nativeBackends[0] || 'claude', model: '' }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeKey, nativeKey]);
+  // The CLI the new conversation will drive, whichever way it's picked.
+  const draftBackend = nativeMode ? nativeChoice.backend : (selectedProfile?.backend || 'claude');
+
   useEffect(() => {
     if (!nodeKey) return undefined;
     let stale = false;
@@ -147,7 +166,7 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
         spec: t || undefined, images: images.length ? images : undefined,
         nodeId: selectedNode.id,
         repoUrl: path.trim() || null, baseBranch: baseBranch.trim() || null, permissionMode,
-        modelProfileId: modelProfileId || undefined,
+        ...(nativeMode ? { native: nativeChoice } : { modelProfileId: modelProfileId || undefined }),
         resumeSessionId: resumeSessionId || undefined,
       });
       // Seed the store from the HTTP response *before* handing the pane
@@ -261,13 +280,27 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
               to exactly one agent CLI — so with a Codex profile picked there is
               nothing here to adopt. Say why instead of offering a button whose
               every outcome is a 409. */}
-          {selectedNode && path.trim() && (selectedProfile?.backend === 'codex'
+          {selectedNode && path.trim() && (draftBackend === 'codex'
             ? <span className="muted">Codex 档案暂不支持接管已有会话(会话 ID 不通用)</span>
             : <button type="button" className="ghost link" onClick={() => setShowSessionPicker(true)}>查看已有会话…</button>
           )}
 
-          {/* ---- model profile picker: inline chips when few, dropdown when many ---- */}
-          {((hasDefault ? 1 : 0) + usable.length) <= INLINE_THRESHOLD ? (
+          {/* ---- model picker: the node's official login, or relay profiles ---- */}
+          {nativeMode ? (
+            <div className="inline-chip-group">
+              {nativeBackends.flatMap(b => NATIVE_MODELS[b].map(m => (
+                <button
+                  type="button" key={`${b}:${m.id}`}
+                  className={`path-chip ${nativeChoice.backend === b && nativeChoice.model === m.id ? 'selected' : ''}`}
+                  title={`用这台机器上已登录的 ${BACKEND_LABELS[b]} 账号`}
+                  onClick={() => setNativeChoice({ backend: b, model: m.id })}
+                >
+                  🧠 {nativeBackends.length > 1 || b !== 'claude' ? `${BACKEND_LABELS[b]} · ` : ''}{m.label}
+                </button>
+              )))}
+              <button type="button" className="ghost link" onClick={() => setUseRelay(true)}>改用中转站档案…</button>
+            </div>
+          ) : ((hasDefault ? 1 : 0) + usable.length) <= INLINE_THRESHOLD ? (
             <div className="inline-chip-group">
               {hasDefault && (
                 <button type="button" className={`path-chip ${!modelProfileId ? 'selected' : ''}`} onClick={() => pickProfile(null)}>
@@ -309,7 +342,13 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
           {multiAgent && (
             <div className="muted">多 agent 编排项目:和你对话的 agent 会把需求拆开派给 subagent,只能使用 Claude Code 档案。</div>
           )}
-          {!multiAgent && !profiles.some(p => p.backend === 'codex') && (
+          {nativeMode && (
+            <div className="muted">这台机器上的 {nativeBackends.map(b => BACKEND_LABELS[b]).join(' / ')} 已登录官方账号,直接用它的账号和额度。</div>
+          )}
+          {!nativeMode && nativeBackends.length > 0 && (
+            <div className="muted"><button type="button" className="ghost link" onClick={() => setUseRelay(false)}>← 改用这台机器的官方账号</button></div>
+          )}
+          {!nativeMode && !multiAgent && !profiles.some(p => p.backend === 'codex') && (
             <div className="muted">
               想用 Codex 对话?先到「<button type="button" className="ghost link" onClick={() => onOpenSettings?.()}>设置 → 模型档案</button>」
               新建一个后端选 Codex 的档案(中转站需支持 <code>/v1/responses</code>),再回这里选它。跑它的节点上也要装好 <code>codex</code> CLI。

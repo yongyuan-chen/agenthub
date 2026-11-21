@@ -21,3 +21,29 @@ export function nativeAuthLabel(backend, info) {
   if (info.method === 'api_key' || info.source) return `API Key${info.source ? `(${info.source})` : ''}`;
   return info.method || '已登录';
 }
+
+// What a 「本机账号」 conversation can switch between: the official models,
+// by the exact IDs the CLI accepts in ANTHROPIC_MODEL. '' = whatever the CLI
+// itself defaults to for that login. Not every plan includes every model —
+// the CLI says so in the conversation if one isn't available.
+export const NATIVE_MODELS = {
+  claude: [
+    { id: '', label: '默认' },
+    { id: 'claude-fable-5-2', label: 'Fable 5.2' },
+    { id: 'claude-opus-5-5', label: 'Opus 5.5' },
+    { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },
+    { id: 'claude-haiku-5-5', label: 'Haiku 5.5' },
+  ],
+  codex: [{ id: '', label: '默认' }],
+};
+
+export function nativeModelLabel(backend, model) {
+  return (NATIVE_MODELS[backend] || []).find(m => m.id === (model || ''))?.label || model;
+}
+
+// Which of a node's CLIs can run on its own login for this user: only the
+// node's owner (it's their account), and only what's actually logged in.
+export function nativeBackendsFor(node, userId) {
+  if (!node || !userId || node.owner_user_id !== userId || !node.nativeAuth) return [];
+  return Object.keys(BACKEND_LABELS).filter(b => node.nativeAuth[b]?.loggedIn);
+}

@@ -470,3 +470,12 @@ CREATE TABLE IF NOT EXISTS node_native_auth (
   info       TEXT NOT NULL DEFAULT '{}',
   updated_at INTEGER
 );
+
+-- The official model picked for one 「本机账号」 conversation ("Opus 5.5"),
+-- chosen right in the new-chat pane or the conversation's model chip rather
+-- than by making a profile per model. Only consulted for native profiles;
+-- no row = the profile's own model, or the CLI's default if it has none.
+CREATE TABLE IF NOT EXISTS task_model_overrides (
+  task_id TEXT PRIMARY KEY,
+  model   TEXT NOT NULL
+);

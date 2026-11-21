@@ -3985,6 +3985,66 @@ test('native profile: created without credentials, never default, runs against t
   exec.link.stop();
 });
 
+// Picking an official model straight from the new-chat pane on a node whose
+// claude is logged in: no profile to set up first, a model per conversation,
+// switchable later — and only on your own node.
+test('native model pick: per-conversation official model, owner only, survives reconnect', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  for (const [id, name] of [['user-test', 'tester'], ['user-bob', 'bob']]) {
+    await cloud.db.prepare('INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)').bind(id, name, 'x', 0, now).run();
+  }
+  await cloud.db.prepare('INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)').bind('team-x', 'P', now).run();
+  for (const u of ['user-test', 'user-bob']) {
+    await cloud.db.prepare('INSERT INTO team_members (team_id, user_id) VALUES (?, ?)').bind('team-x', u).run();
+  }
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-pick', await sha256Hex('tok-mac-pick'), 'user-test', now).run();
+  await cloud.db.prepare('INSERT INTO node_teams (node_id, team_id) VALUES (?, ?)').bind('mac-pick', 'team-x').run();
+
+  const spawned = [];
+  const exec = makeExecutor(cloud, 'mac-pick', async (session) => {
+    session.busy = false;
+    session.opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0, session_id: session.sessionId });
+  }, { provider: { baseUrl: '', apiKey: '' } }, (session, opts) => { session.opts = opts; spawned.push(opts); });
+  exec.link.start();
+  await until(() => exec.link.connected, 2000, 'link connect');
+  await until(async () => (await cloud.db.prepare('SELECT features FROM node_features WHERE node_id = ?').bind('mac-pick').first())?.features?.includes('native-auth'), 2000, 'features recorded');
+
+  const res = await cloud.api('POST', '/api/tasks', { title: 't', spec: 'hi', nodeId: 'mac-pick', native: { backend: 'claude', model: 'claude-opus-5-5' } });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.task.model_override, 'claude-opus-5-5');
+  const profiles = (await cloud.api('GET', '/api/model-profiles', {})).body.profiles;
+  assert.deepEqual(profiles.map(p => [p.kind, p.backend]), [['native', 'claude']], 'native profile created on first use');
+  await until(() => spawned.length === 1, 2000, 'spawned');
+  assert.deepEqual(spawned[0].config.provider, { native: true, model: 'claude-opus-5-5' });
+
+  // Second pick reuses that profile; a junk model name is dropped, not passed into the env.
+  const res2 = await cloud.api('POST', '/api/tasks', { title: 't2', spec: 'hi', nodeId: 'mac-pick', native: { backend: 'claude', model: 'opus; rm -rf /' } });
+  assert.equal(res2.body.task.model_override, null);
+  assert.equal((await cloud.api('GET', '/api/model-profiles', {})).body.profiles.length, 1);
+
+  // Switch model mid-conversation: stored, and re-asserted on reconnect.
+  const taskId = res.body.task.id;
+  const sw = await cloud.api('POST', `/api/tasks/${taskId}/switch-model`, { native: { backend: 'claude', model: 'claude-sonnet-5-5' } });
+  assert.equal(sw.status, 200);
+  assert.equal((await cloud.db.prepare('SELECT model FROM task_model_overrides WHERE task_id = ?').bind(taskId).first()).model, 'claude-sonnet-5-5');
+  await until(() => JSON.parse(exec.db.getTask(taskId).provider_override).model === 'claude-sonnet-5-5', 2000, 'switch reached node');
+  exec.db.patchTask(taskId, { providerOverride: JSON.stringify({ native: true }) });   // simulate a missed push
+  exec.link.stop();
+  exec.link.start();
+  await until(() => JSON.parse(exec.db.getTask(taskId).provider_override).model === 'claude-sonnet-5-5', 3000, 'hello re-asserts the per-task model');
+
+  // A teammate the node is shared with can't spend the owner's account.
+  const bob = await core.api({ ...cloud.ctx, userId: 'user-bob', teamId: 'team-x' }, 'POST', '/api/tasks',
+    { title: 'b', spec: 'hi', nodeId: 'mac-pick', native: { backend: 'claude' } });
+  assert.equal(bob.status, 409);
+  assert.match(bob.body.error, /自己的节点/);
+
+  exec.manager.shutdown();
+  exec.link.stop();
+});
+
 test('native profile: refused on a node whose executor predates it', async () => {
   const cloud = makeCloud();
   await enrollNode(cloud, 'mac-old');

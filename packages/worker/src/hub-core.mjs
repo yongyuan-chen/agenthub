@@ -121,6 +121,53 @@ async function resolveProfile(db, profileId, userId) {
   return { provider, backend, kind };
 }
 
+// 「本机账号」 picked straight from the new-chat pane: the account's native
+// profile for that CLI, created on first use — there's nothing to configure
+// in one, so making someone visit Settings first would be pure friction.
+async function ensureNativeProfile(db, userId, backend, now) {
+  const row = await q(db,
+    `SELECT p.id FROM model_profiles p
+     JOIN model_profile_kinds k ON k.profile_id = p.id AND k.kind = 'native'
+     LEFT JOIN model_profile_backends b ON b.profile_id = p.id
+     WHERE p.owner_user_id = ? AND COALESCE(b.backend, ?) = ?
+     ORDER BY p.created_at LIMIT 1`, userId, DEFAULT_BACKEND, backend).first();
+  if (row) return row.id;
+  const id = ulid(now);
+  await q(db,
+    'INSERT INTO model_profiles (id, owner_user_id, name, base_url, api_key, model, is_default, created_at) VALUES (?, ?, ?, NULL, NULL, NULL, 0, ?)',
+    id, userId, `本机 ${backend === 'codex' ? 'Codex' : 'Claude Code'}`, now).run();
+  await q(db, 'INSERT INTO model_profile_kinds (profile_id, kind) VALUES (?, ?)', id, 'native').run();
+  if (backend !== DEFAULT_BACKEND) await setProfileBackend(db, id, backend);
+  return id;
+}
+
+// A model name as the CLI would accept it ("claude-opus-5-5", "opus",
+// "claude-sonnet-5-5[1m]"); anything else is dropped rather than passed on
+// into an env var.
+function cleanModelName(model) {
+  const m = String(model ?? '').trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}$/.test(m) ? m : null;
+}
+
+async function taskModelOverride(db, taskId) {
+  const row = await q(db, 'SELECT model FROM task_model_overrides WHERE task_id = ?', taskId).first();
+  return row?.model || null;
+}
+
+// A native provider with this conversation's own model choice applied.
+function withTaskModel(provider, model) {
+  return provider?.native && model ? { ...provider, model } : provider;
+}
+
+// 本机账号 spends the node owner's own login — their subscription, their
+// key. A teammate the node is shared with must not be able to run on it.
+async function nativeRefusal(db, nodeId, userId) {
+  const node = await q(db, 'SELECT owner_user_id FROM nodes WHERE id = ?', nodeId).first();
+  if (node?.owner_user_id !== userId) return '「本机账号」只能在你自己的节点上用:它用的是这台机器主人登录的账号。请选一个中转站档案。';
+  if (!(await nodeSupports(db, nodeId, FEATURE_NATIVE_AUTH))) return `节点 ${nodeId} 的 executor 还不支持「本机账号」,请等它自动升级(约 2-3 分钟)后重试`;
+  return null;
+}
+
 // What a node last told us it can do. `known` is the important part: handleHello
 // writes this row on every connect, so a node with no row has simply never been
 // seen by this version of the cloud — which is *not* the same as a node that
@@ -189,6 +236,17 @@ async function attachTaskBackends(db, tasks) {
     for (const row of (rows.results ?? rows)) byProfile.set(row.profile_id, row.backend);
   }
   for (const task of tasks) task.backend = byProfile.get(task.model_profile_id) || DEFAULT_BACKEND;
+  await attachModelOverrides(db, tasks);
+}
+
+async function attachModelOverrides(db, tasks) {
+  const ids = tasks.map(t => t.id);
+  const byTask = new Map();
+  if (ids.length) {
+    const rows = await q(db, `SELECT task_id, model FROM task_model_overrides WHERE task_id IN (${inClause(ids)})`, ...ids).all();
+    for (const r of (rows.results ?? rows)) byTask.set(r.task_id, r.model);
+  }
+  for (const task of tasks) task.model_override = byTask.get(task.id) || null;
 }
 
 // profileId -> backend for a whole list, in one query (the settings page lists
@@ -366,6 +424,7 @@ async function broadcastTask(ctx, taskId) {
     const teamIds = await taskTeamIds(ctx, taskId);
     task.teamIds = teamIds;
     task.backend = await taskBackend(ctx.db, task);
+    await attachModelOverrides(ctx.db, [task]);
     await attachAgentModes(ctx.db, [task]);
     // No seen_at here on purpose: this payload goes to every member of every
     // project the task is in, and read state is per-user. The client keeps
@@ -754,7 +813,9 @@ export async function handleHello(ctx, nodeId, msg) {
       // Profile deleted since -> nothing to re-assert; the executor keeps
       // whatever override it already has (same as before this existed).
       if (resolved) {
-        entry.providerOverride = resolved.provider;
+        entry.providerOverride = resolved.kind === 'native'
+          ? withTaskModel(resolved.provider, await taskModelOverride(ctx.db, lt.taskId))
+          : resolved.provider;
         entry.backend = resolved.backend;
       }
     } else if (cloud.model_profile_id === '') {
@@ -1165,11 +1226,12 @@ export async function pushConfigToUser(ctx, userId) {
 export async function pushProfileToPinnedTasks(ctx, userId, profileId) {
   const resolved = await resolveProfile(ctx.db, profileId, userId);
   if (!resolved) return;
-  const { provider, backend } = resolved;
+  const { provider, backend, kind } = resolved;
   const rows = await q(ctx.db,
     'SELECT id, node_id FROM tasks WHERE model_profile_id = ? AND owner_user_id = ?', profileId, userId).all();
   for (const t of rows.results ?? rows) {
-    ctx.sendToNode(t.node_id, { t: 'set_provider_override', taskId: t.id, provider, backend });
+    const taskProvider = kind === 'native' ? withTaskModel(provider, await taskModelOverride(ctx.db, t.id)) : provider;
+    ctx.sendToNode(t.node_id, { t: 'set_provider_override', taskId: t.id, provider: taskProvider, backend });
   }
 }
 
@@ -1263,7 +1325,8 @@ async function invalidateConversationSource(ctx, nodeId, sessionId, sourceId, ta
 // branching *creates* the session first and then hands it here, so it can be
 // either backend and must not be refused for not being claude.
 async function createTask(ctx, body, userId, { adopting = true } = {}) {
-  const { title, spec, repoUrl, baseBranch, nodeId, permissionMode, modelProfileId, resumeSessionId } = body || {};
+  const { title, spec, repoUrl, baseBranch, nodeId, permissionMode, resumeSessionId } = body || {};
+  let { modelProfileId } = body || {};
   // The first message of a new conversation can carry attachments exactly
   // like any later one (draftpane.jsx's composer is the same composer) —
   // they ride along with spec rather than as a separate follow-up send, so
@@ -1295,6 +1358,18 @@ async function createTask(ctx, body, userId, { adopting = true } = {}) {
     const occupiedClaim = await q(ctx.db, 'SELECT task_id FROM conversation_claims_v2 WHERE node_id = ? AND session_id = ? AND source_cwd = ?', nodeId, resumeSessionId, repoUrl || '').first();
     if (occupiedTask || occupiedClaim) return err(409, 'this Claude session is already connected to an AgentHub conversation');
   }
+  // {native:{backend, model}}: the official login on that node with a model
+  // picked in the pane — resolves to the account's native profile for that
+  // CLI (created on first use) plus a per-conversation model.
+  let nativeModel = null;
+  if (body?.native) {
+    const nativeBackend = body.native.backend || DEFAULT_BACKEND;
+    if (!BACKENDS.includes(nativeBackend)) return err(400, `unknown backend: ${nativeBackend}`);
+    const refusal = await nativeRefusal(ctx.db, nodeId, userId);
+    if (refusal) return err(409, refusal);
+    modelProfileId = await ensureNativeProfile(ctx.db, userId, nativeBackend, ctx.now());
+    nativeModel = cleanModelName(body.native.model);
+  }
   let provider;
   let backend = DEFAULT_BACKEND;
   let kind = 'relay';
@@ -1304,9 +1379,12 @@ async function createTask(ctx, body, userId, { adopting = true } = {}) {
     ({ provider, backend, kind } = resolved);
   }
   // An older executor reads a native provider as "no relay configured" and
-  // fails the task with advice about Settings that doesn't apply.
-  if (kind === 'native' && !(await nodeSupports(ctx.db, nodeId, FEATURE_NATIVE_AUTH))) {
-    return err(409, `节点 ${nodeId} 的 executor 还不支持「本机账号」,请等它自动升级(约 2-3 分钟)后重试`);
+  // fails the task with advice about Settings that doesn't apply; and a
+  // native profile is the node owner's own account, not a teammate's.
+  if (kind === 'native') {
+    const refusal = await nativeRefusal(ctx.db, nodeId, userId);
+    if (refusal) return err(409, refusal);
+    provider = withTaskModel(provider, nativeModel);
   }
   // Refuse up-front rather than dispatching work the node can't do — the
   // spawn would go wrong in some backend-specific way and the resulting
@@ -1360,6 +1438,7 @@ async function createTask(ctx, body, userId, { adopting = true } = {}) {
   }
   if (ctx.teamId) createStatements.push(q(ctx.db, 'INSERT INTO task_teams (task_id, team_id) VALUES (?, ?)', id, ctx.teamId));
   if (agentMode === 'multi') createStatements.push(q(ctx.db, 'INSERT INTO task_agent_modes (task_id, mode) VALUES (?, ?)', id, agentMode));
+  if (kind === 'native' && nativeModel) createStatements.push(q(ctx.db, 'INSERT INTO task_model_overrides (task_id, model) VALUES (?, ?)', id, nativeModel));
   try { await ctx.db.batch(createStatements); }
   catch { return err(409, 'this Claude session was connected concurrently; refresh and open the existing conversation'); }
   // Creating a task while viewing a project starts it shared with that
@@ -1658,6 +1737,7 @@ export async function api(ctx, method, pathname, body) {
     }
     task.teamIds = teamIds;
     task.backend = await taskBackend(ctx.db, task);
+    await attachModelOverrides(ctx.db, [task]);
     await attachAgentModes(ctx.db, [task]);
     await attachActivity(ctx, [task], await seenAtFor(ctx, userId, [taskId]));
     return ok({ task });
@@ -2133,7 +2213,18 @@ export async function api(ctx, method, pathname, body) {
     // mid-generation. modelProfileId null/'' = revert to the node-shared
     // default config from the owner's Settings.
     if (method === 'POST' && action === 'switch-model') {
-      const profileId = body?.modelProfileId || null;
+      let profileId = body?.modelProfileId || null;
+      // Same {native:{backend, model}} shape as task creation: switch to (or
+      // between models of) the node owner's official login.
+      let nativeModel = null;
+      if (body?.native) {
+        const nativeBackend = body.native.backend || DEFAULT_BACKEND;
+        if (!BACKENDS.includes(nativeBackend)) return err(400, `unknown backend: ${nativeBackend}`);
+        const refusal = await nativeRefusal(ctx.db, task.node_id, userId);
+        if (refusal) return err(409, refusal);
+        profileId = await ensureNativeProfile(ctx.db, userId, nativeBackend, ctx.now());
+        nativeModel = cleanModelName(body.native.model);
+      }
       let provider = null;
       let backend = DEFAULT_BACKEND;
       let kind = 'relay';
@@ -2149,8 +2240,10 @@ export async function api(ctx, method, pathname, body) {
       if (kind === 'native' && task.session_id && (await profileKind(ctx.db, task.model_profile_id)) !== 'native') {
         return err(409, '这个对话已经用中转站跑过,不能中途改用「本机账号」(会话记录不在同一个位置)。请新建一张卡。');
       }
-      if (kind === 'native' && !(await nodeSupports(ctx.db, task.node_id, FEATURE_NATIVE_AUTH))) {
-        return err(409, `节点 ${task.node_id} 的 executor 还不支持「本机账号」,请等它自动升级(约 2-3 分钟)后重试`);
+      if (kind === 'native') {
+        const refusal = await nativeRefusal(ctx.db, task.node_id, userId);
+        if (refusal) return err(409, refusal);
+        provider = withTaskModel(provider, nativeModel);
       }
       // Switching model profile now also switches agent CLI, and a session id
       // is not portable between them — `codex resume <claude-uuid>` can only
@@ -2173,6 +2266,13 @@ export async function api(ctx, method, pathname, body) {
       // for legacy/never-switched tasks, which hello_ok's re-assertion must
       // leave alone (see handleHello's comment).
       await q(ctx.db, 'UPDATE tasks SET model_profile_id = ?, updated_at = ? WHERE id = ?', profileId ?? '', ctx.now(), taskId).run();
+      if (kind === 'native' && nativeModel) {
+        await q(ctx.db,
+          `INSERT INTO task_model_overrides (task_id, model) VALUES (?, ?)
+           ON CONFLICT(task_id) DO UPDATE SET model = excluded.model`, taskId, nativeModel).run();
+      } else {
+        await q(ctx.db, 'DELETE FROM task_model_overrides WHERE task_id = ?', taskId).run();
+      }
       await dispatch(ctx, task.node_id, { t: 'set_provider_override', taskId, provider, backend });
       await broadcastTask(ctx, taskId);
       return ok({});
