@@ -59,6 +59,9 @@ export const api = {
     req('GET', `/api/nodes/${nodeId}/file?path=${encodeURIComponent(path)}`),
   writeNodeFile: (nodeId, path, content, expectedMtime) =>
     req('POST', `/api/nodes/${nodeId}/file`, { path, content, expectedMtime }),
+  // What this node already has that could be brought into the active scope —
+  // see inherit.jsx.
+  nodeInheritable: (nodeId) => req('GET', `/api/nodes/${nodeId}/inheritable`),
   listNodeSessions: (nodeId, path) => req('GET', `/api/nodes/${nodeId}/sessions?path=${encodeURIComponent(path)}`),
   switchSession: (taskId, sessionId) => req('POST', `/api/tasks/${taskId}/switch-session`, { sessionId }),
   // native = {backend, model}: the node's own official login with that model.
@@ -149,6 +152,9 @@ export const api = {
   // seq identifies the assistant reply to branch under; the new conversation
   // inherits everything up to and including the turn that reply belongs to.
   branchTask: (id, seq) => req('POST', `/api/tasks/${id}/branch`, { seq }),
+  // The whole conversation, copied into the scope you're in now (the copy is
+  // filed under the active project, like any new conversation).
+  copyTask: (id) => req('POST', `/api/tasks/${id}/branch`, { whole: true }),
   markDone: (id) => req('POST', `/api/tasks/${id}/done`, {}),
   lease: (id, lease) => req('POST', `/api/tasks/${id}/lease`, { lease }),
   archiveTask: (id) => req('POST', `/api/tasks/${id}/archive`, {}),

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { api } from './api.js';
 import { state, upsertTask, bump } from './store.js';
-import { SessionPicker } from './sessionpicker.jsx';
+import { InheritList } from './inherit.jsx';
 import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
 import { BACKEND_LABELS, NATIVE_MODELS, nativeBackendsFor, authModeOf } from './native-auth.js';
 
@@ -46,7 +46,6 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [baseBranch, setBaseBranch] = useState(''); // empty = auto-detect the repo's actual default branch
   const [permissionMode, setPermissionMode] = useState('bypassPermissions');
-  const [showSessionPicker, setShowSessionPicker] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   // Same composer affordances as an ongoing conversation (task.jsx) — the
   // first message is a message. A draft pane is created fresh per slot, so
@@ -147,7 +146,10 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
   // pane becomes a real persisted task instead of vanishing on refresh) —
   // any text already typed still goes along as the first message, but it's
   // no longer required when resuming.
-  const createNow = async (resumeSessionId, resumePreview) => {
+  // `resume` comes from the node-wide list (inherit.jsx): a session found
+  // anywhere on the machine carries its own directory and CLI, which win over
+  // whatever path the pane currently shows.
+  const createNow = async (resumeSessionId, resumePreview, resume = {}) => {
     const t = text.trim();
     const images = wireImages();
     // Images with no text is a complete first message ("这个报错怎么回事?" is
@@ -168,9 +170,10 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
         title: t ? deriveTitle(t) : fallbackTitle,
         spec: t || undefined, images: images.length ? images : undefined,
         nodeId: selectedNode.id,
-        repoUrl: path.trim() || null, baseBranch: baseBranch.trim() || null, permissionMode,
+        repoUrl: (resume.cwd ?? path.trim()) || null, baseBranch: baseBranch.trim() || null, permissionMode,
         ...(nativeMode ? { native: nativeChoice } : { modelProfileId: modelProfileId || undefined }),
         resumeSessionId: resumeSessionId || undefined,
+        resumeBackend: resumeSessionId ? (resume.backend || draftBackend) : undefined,
       });
       // Seed the store from the HTTP response *before* handing the pane
       // over — the WS 'task' broadcast for this creation is still in flight,
@@ -277,17 +280,6 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
             )}
           </div>
 
-          {/* ---- existing-session picker: resume a session created outside
-               AgentHub — picking one creates the task immediately ---- */}
-          {/* Adoption only discovers claude histories, and a session id belongs
-              to exactly one agent CLI — so with a Codex profile picked there is
-              nothing here to adopt. Say why instead of offering a button whose
-              every outcome is a 409. */}
-          {selectedNode && path.trim() && (draftBackend === 'codex'
-            ? <span className="muted">Codex 档案暂不支持接管已有会话(会话 ID 不通用)</span>
-            : <button type="button" className="ghost link" onClick={() => setShowSessionPicker(true)}>查看已有会话…</button>
-          )}
-
           {/* ---- model picker: the node's official login, or relay profiles ---- */}
           {(() => {
             const native = nativeMode || selectedProfile?.kind === 'native';
@@ -384,9 +376,18 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
         {showAdvanced && permissionMode === 'bypassPermissions' && (
           <div className="err">⚠️ 该任务将不经审批执行任何命令</div>
         )}
+        {/* Below the pickers rather than inside the chip row: it's a list,
+            and it needs the model choice above to say which sessions can be
+            adopted as-is. */}
+        <InheritList
+          node={selectedNode} draftBackend={draftBackend} busy={busy}
+          onAdoptSession={(s) => createNow(s.sessionId, s.preview, { cwd: s.cwd, backend: s.backend })}
+          onOpened={onCreated}
+          autoOpen={!recents.length && !topRepo}
+        />
         {!selectedNode && <div className="err">还没有可用节点,请先在左侧「+ 添加节点」</div>}
         {err && <div className="err">{err}</div>}
-        <div className="draft-empty muted">开始输入,发送第一条消息即可创建对话;或点击「查看已有会话…」直接恢复历史记录</div>
+        <div className="draft-empty muted">开始输入,发送第一条消息即可创建对话;或在上面「继续…已有的对话」里接着之前的聊</div>
       </div>
 
       <form
@@ -412,13 +413,6 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
         </div>
       </form>
 
-      {showSessionPicker && selectedNode && (
-        <SessionPicker
-          nodeId={selectedNode.id} path={path.trim()}
-          onPick={(sessionId, preview) => { setShowSessionPicker(false); createNow(sessionId, preview); }}
-          onClose={() => setShowSessionPicker(false)}
-        />
-      )}
     </div>
   );
 }

@@ -163,3 +163,22 @@ test('forkSession: refuses to produce an empty branch', t => {
     dropTrailingTurns: 1, sessionsRoot: f.sessions,
   }), /回合/);
 });
+
+test('listAllExternalSessions (codex): every cwd, newest first', async () => {
+  const { listAllExternalSessions } = await import('../packages/executor/src/codex-sessions.mjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-all-codex-'));
+  const write = (day, id, cwd, text, mtime) => {
+    const dir = path.join(root, '2026', '11', day);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `rollout-2026-11-${day}T10-00-00-${id}.jsonl`);
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: 'session_meta', payload: { id, cwd } }),
+      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } }),
+    ].join('\n') + '\n');
+    fs.utimesSync(file, mtime, mtime);
+  };
+  write('01', '11111111-1111-1111-1111-111111111111', '/q/a', '第一个', 1000);
+  write('02', '22222222-2222-2222-2222-222222222222', '/q/b', '第二个', 2000);
+  const all = listAllExternalSessions(root);
+  assert.deepEqual(all.map(s => [s.sessionId.slice(0, 8), s.cwd, s.preview]), [['22222222', '/q/b', '第二个'], ['11111111', '/q/a', '第一个']]);
+});

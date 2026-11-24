@@ -92,6 +92,10 @@ const claude = {
     return claudeTx.listExternalSessionsForPaths(paths, config.claudeProjectsRoot);
   },
 
+  listAllSessions(config, limit) {
+    return claudeTx.listAllExternalSessions(config.claudeProjectsRoot, limit);
+  },
+
   // The branch resumes in the same directory the source task works in — see
   // manager.mjs's _maybeStart, where a task that already has a session id
   // skips worktree creation and runs directly in that path.
@@ -159,6 +163,10 @@ const codex = {
 
   listSessions(config, paths) {
     return codexTx.listExternalSessionsForPaths(paths, codexExternalRoot(config));
+  },
+
+  listAllSessions(config, limit) {
+    return codexTx.listAllExternalSessions(codexExternalRoot(config), limit);
   },
 
   forkSession(config, t, { dropTrailingTurns, newSessionId, allowEmptyPrefix, expectedLastUserText, expectedLastUserImages, expectedLastUserTs, previousUserText, previousUserImages, inPlace = false }) {

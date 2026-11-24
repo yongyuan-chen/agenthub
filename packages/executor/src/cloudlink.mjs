@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { externalSessionHistoryPage, listExternalSessions, listExternalSessionsForPaths } from './sessions.mjs';
-import { backendFor } from './backends.mjs';
+import { backendFor, backendByName } from './backends.mjs';
 import { cliState, cliVersions } from './cli-upgrade.mjs';
 import { listDir, readFile, writeFile } from './files.mjs';
 import { PROTOCOL_VERSION, EXECUTOR_FEATURES } from '../../shared/protocol.mjs';
@@ -364,6 +364,22 @@ export class CloudLink {
           sessions: listExternalSessionsForPaths(msg.paths, this.config.claudeProjectsRoot),
         });
         break;
+      // Every session on this machine, both CLIs, any directory — newest
+      // first. Unlike the per-path lists above this one tags each entry with
+      // its backend: the cloud has to refuse adopting a codex session with a
+      // claude profile (session ids aren't portable between the two).
+      case 'list_node_sessions': {
+        const limit = Math.min(Math.max(Number(msg.limit) || 200, 1), 500);
+        const sessions = [];
+        for (const name of ['claude', 'codex']) {
+          let found = [];
+          try { found = backendByName(name).listAllSessions(this.config, limit); } catch { /* one CLI's store unreadable: still answer with the other */ }
+          for (const s of found) sessions.push({ ...s, backend: name });
+        }
+        sessions.sort((a, b) => b.mtime - a.mtime);
+        this._send({ t: 'list_node_sessions_result', requestId: msg.requestId, sessions: sessions.slice(0, limit) });
+        break;
+      }
       case 'read_project_session': {
         const page = externalSessionHistoryPage(msg.sessionId, msg.cwd, this.config.claudeProjectsRoot, {
           before: msg.before == null ? null : {

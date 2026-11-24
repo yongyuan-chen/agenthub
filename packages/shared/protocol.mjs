@@ -218,9 +218,14 @@ export const FEATURE_MULTI_AGENT = 'multi-agent';
 // node (official account, settings.json env, shell-exported keys) instead of
 // an AgentHub relay. An older node would read it as "no relay configured".
 export const FEATURE_NATIVE_AUTH = 'native-auth';
+// Answers list_node_sessions: every claude AND codex session on the machine,
+// regardless of directory (the new-chat pane's 「继续这台节点上的对话」).
+// An older node simply never replies, which would read as "no sessions" —
+// the cloud says "upgrade the node" instead.
+export const FEATURE_NODE_SESSIONS = 'node-sessions';
 export const EXECUTOR_FEATURES = [
   FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_CLI_UPGRADE,
-  FEATURE_MULTI_AGENT, FEATURE_MESSAGE_REWIND, FEATURE_NATIVE_AUTH,
+  FEATURE_MULTI_AGENT, FEATURE_MESSAGE_REWIND, FEATURE_NATIVE_AUTH, FEATURE_NODE_SESSIONS,
 ];
 
 // Caps for the file browser, shared so the executor and the cloud agree.

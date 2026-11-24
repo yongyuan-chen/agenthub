@@ -208,6 +208,45 @@ export function listExternalSessionsForPaths(targetPaths, projectsRoot = DEFAULT
   return sorted.slice(0, MAX_BATCH_SESSIONS).map(({ file, ...session }) => ({ ...session, preview: previewForFile(file) }));
 }
 
+// Every session on this machine, whatever directory it ran in — the new-chat
+// pane's 「继续这台节点上的对话」 list, which exists precisely because the
+// user doesn't know (or hasn't typed) a path yet. Ranked by mtime from a
+// stat-only pass first, and only the newest `limit` files are opened for their
+// cwd and preview: a long-lived box can have thousands of transcripts, and
+// reading each one's prefix would blow the cloud's RPC timeout.
+export function listAllExternalSessions(projectsRoot = DEFAULT_PROJECTS_ROOT(), limit = 200) {
+  if (!fs.existsSync(projectsRoot)) return [];
+  let projectDirs;
+  try { projectDirs = fs.readdirSync(projectsRoot, { withFileTypes: true }).filter(entry => entry.isDirectory()); }
+  catch { return []; }
+  const files = [];
+  for (const dir of projectDirs) {
+    const projectDir = path.join(projectsRoot, dir.name);
+    let entries;
+    try { entries = fs.readdirSync(projectDir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      const file = path.join(projectDir, entry.name);
+      let mtime = 0;
+      try { mtime = fs.statSync(file).mtimeMs; } catch { continue; }
+      files.push({ file, mtime });
+    }
+  }
+  files.sort((a, b) => b.mtime - a.mtime);
+  const out = [];
+  const seen = new Set();
+  for (const { file, mtime } of files) {
+    if (out.length >= limit) break;
+    const cwd = cwdOf(file);
+    if (!cwd) continue;   // no recorded cwd = nothing `claude --resume` could be pointed at
+    const sessionId = path.basename(file, '.jsonl');
+    if (seen.has(sessionId)) continue;
+    seen.add(sessionId);
+    out.push({ sessionId, cwd, path: cwd, mtime, preview: previewForFile(file) });
+  }
+  return out;
+}
+
 // Only ever show the most recent slice of a long history — a heavily-used
 // session can run into the tens of thousands of transcript lines, and
 // importing all of it would be slow to emit and unwieldy to scroll through.

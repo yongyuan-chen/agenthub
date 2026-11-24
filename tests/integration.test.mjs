@@ -6430,3 +6430,121 @@ test('multiagent: the subagent history comes back whole, even when the chat wind
   exec.manager.shutdown();
   exec.link.stop();
 });
+
+// ---- 「继续这台节点上已有的对话」: GET /api/nodes/:id/inheritable ----
+
+async function inheritFixture() {
+  const cloud = makeCloud();
+  const now = Date.now();
+  const run = (sql, ...args) => cloud.db.prepare(sql).bind(...args).run();
+  await run('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)', 'user-test', 'alice', 'x', now);
+  await run('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)', 'bob', 'bob', 'x', now);
+  for (const [id, name] of [['team-q', '量化'], ['team-r', '研发']]) {
+    await run('INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)', id, name, now);
+    await run('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)', id, 'user-test', 'owner', now);
+  }
+  await run('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)', 'team-q', 'bob', 'member', now);
+  await run("INSERT INTO nodes (id, token_hash, owner_user_id, status, created_at) VALUES (?, ?, ?, 'online', ?)", 'v2jpmg', 'h', 'user-test', now);
+  await run('INSERT INTO node_teams (node_id, team_id) VALUES (?, ?)', 'v2jpmg', 'team-q');
+  await run('INSERT INTO node_teams (node_id, team_id) VALUES (?, ?)', 'v2jpmg', 'team-r');
+  const task = async (id, { teams = [], owner = 'user-test', session = null, archived = null, at = now } = {}) => {
+    await run(`INSERT INTO tasks (id,title,spec,repo_url,node_id,owner_user_id,status,session_id,archived_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,'review',?,?,?,?)`, id, `T-${id}`, 'x', `/quant/${id}`, 'v2jpmg', owner, session, archived, at, at);
+    for (const t of teams) await run('INSERT INTO task_teams (task_id, team_id) VALUES (?, ?)', id, t);
+  };
+  await task('personal', { session: 'sess-personal', at: now + 3 });
+  await task('in-r', { teams: ['team-r'], session: 'sess-r', at: now + 2 });
+  await task('already-q', { teams: ['team-q'], session: 'sess-q' });
+  await task('archived', { archived: now });
+  await task('bobs', { owner: 'bob' });
+  cloud.ctx.listNodeSessions = async () => ({ sessions: [
+    { sessionId: 'sess-personal', cwd: '/quant/personal', backend: 'claude', preview: 'taken', mtime: now },
+    { sessionId: 'cli-claude', cwd: '/quant/alpha', backend: 'claude', preview: '因子回测', mtime: now + 5 },
+    { sessionId: 'cli-codex', cwd: '/quant/alpha', backend: 'codex', preview: '网格策略', mtime: now + 4 },
+  ] });
+  return { cloud, now, run };
+}
+
+test('inheritable: lists my conversations on the node that live elsewhere, plus unclaimed CLI sessions', async () => {
+  const { cloud, now, run } = await inheritFixture();
+  const q = { ...cloud.ctx, teamId: 'team-q' };
+
+  // An executor that predates the feature never answers list_node_sessions —
+  // say "upgrade" rather than "nothing here".
+  let res = await core.api(q, 'GET', '/api/nodes/v2jpmg/inheritable', {});
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.conversations.map(c => c.id), ['personal', 'in-r'],
+    'not the one already in 量化, not archived, not a teammate\'s');
+  assert.deepEqual(res.body.conversations.map(c => c.teams.map(t => t.name)), [[], ['研发']]);
+  assert.equal(res.body.sessionsState, 'upgrade');
+  assert.deepEqual(res.body.sessions, []);
+
+  await run('INSERT INTO node_features (node_id, features, updated_at) VALUES (?, ?, ?)', 'v2jpmg', JSON.stringify(['node-sessions']), now);
+  res = await core.api(q, 'GET', '/api/nodes/v2jpmg/inheritable', {});
+  assert.equal(res.body.sessionsState, 'ok');
+  assert.deepEqual(res.body.sessions.map(s => [s.sessionId, s.backend, s.cwd]),
+    [['cli-claude', 'claude', '/quant/alpha'], ['cli-codex', 'codex', '/quant/alpha']],
+    'a session some conversation already holds is not offered again');
+
+  res = await core.api({ ...q, listNodeSessions: async () => null }, 'GET', '/api/nodes/v2jpmg/inheritable', {});
+  assert.equal(res.body.sessionsState, 'offline');
+
+  // Personal scope offers the project conversations instead.
+  res = await core.api(cloud.ctx, 'GET', '/api/nodes/v2jpmg/inheritable', {});
+  assert.deepEqual(res.body.conversations.map(c => c.id).sort(), ['already-q', 'in-r']);
+});
+
+test('inheritable: a teammate sees neither the owner\'s conversations nor the machine\'s CLI sessions; outsiders are refused', async () => {
+  const { cloud, now, run } = await inheritFixture();
+  await run('INSERT INTO node_features (node_id, features, updated_at) VALUES (?, ?, ?)', 'v2jpmg', JSON.stringify(['node-sessions']), now);
+  let asked = false;
+  cloud.ctx.listNodeSessions = async () => { asked = true; return { sessions: [] }; };
+  const bob = { ...cloud.ctx, userId: 'bob', teamId: 'team-q' };
+  const res = await core.api(bob, 'GET', '/api/nodes/v2jpmg/inheritable', {});
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.conversations.map(c => c.id), ['bobs'], 'only his own');
+  assert.equal(res.body.sessionsState, 'not-owner');
+  assert.equal(asked, false, 'the owner\'s home directory is never even scanned for him');
+
+  const outsider = await core.api({ ...cloud.ctx, userId: 'bob', teamId: 'team-r' }, 'GET', '/api/nodes/v2jpmg/inheritable', {});
+  assert.equal(outsider.status, 403);
+  const notShared = await core.api({ ...cloud.ctx, userId: 'bob' }, 'GET', '/api/nodes/v2jpmg/inheritable', {});
+  assert.equal(notShared.status, 404, 'personal scope only reaches your own nodes');
+});
+
+test('inheritable: moving a personal conversation in, copying another project\'s, adopting a codex CLI session', async () => {
+  const { cloud, now, run } = await inheritFixture();
+  await run('INSERT INTO node_features (node_id, features, updated_at) VALUES (?, ?, ?)', 'v2jpmg', JSON.stringify(['node-sessions', 'session-fork']), now);
+  await run('INSERT INTO node_capabilities (node_id, protocol_version, backends, updated_at) VALUES (?, ?, ?, ?)',
+    'v2jpmg', PROTOCOL_VERSION, JSON.stringify(['claude', 'codex']), now);
+  const q = { ...cloud.ctx, teamId: 'team-q' };
+
+  // Move: adding a personal conversation to the project takes it out of 个人.
+  assert.equal((await core.api(q, 'POST', '/api/tasks/personal/teams/team-q', {})).status, 200);
+  const personalNow = await core.api(cloud.ctx, 'GET', '/api/tasks', {});
+  assert.ok(!personalNow.body.tasks.some(t => t.id === 'personal'));
+
+  // Copy: the whole conversation, filed under the project the request is made from.
+  const forks = [];
+  cloud.ctx.forkSession = async (...args) => { forks.push(args); return { ok: true, sessionId: args[4], cwd: '/quant/in-r', keptTurns: 3, anchorText: '' }; };
+  const copied = await core.api({ ...q, forkSession: cloud.ctx.forkSession }, 'POST', '/api/tasks/in-r/branch', { whole: true });
+  assert.equal(copied.status, 200, JSON.stringify(copied.body));
+  assert.equal(forks[0][3], 0, 'nothing dropped: the whole transcript');
+  assert.equal(copied.body.task.title, 'T-in-r (副本)');
+  const copyTeams = await cloud.db.prepare('SELECT team_id FROM task_teams WHERE task_id = ?').bind(copied.body.task.id).all();
+  assert.deepEqual((copyTeams.results ?? copyTeams).map(r => r.team_id), ['team-q']);
+  const originalTeams = await cloud.db.prepare('SELECT team_id FROM task_teams WHERE task_id = ?').bind('in-r').all();
+  assert.deepEqual((originalTeams.results ?? originalTeams).map(r => r.team_id), ['team-r'], 'the original stays where it was');
+
+  // Adopt: a codex session needs a codex conversation, and says so otherwise.
+  await run('INSERT INTO model_profiles (id, owner_user_id, name, is_default, created_at) VALUES (?, ?, ?, 0, ?)', 'p-cx', 'user-test', 'cx', now);
+  await run('INSERT INTO model_profile_backends (profile_id, backend) VALUES (?, ?)', 'p-cx', 'codex');
+  const wrong = await core.api(q, 'POST', '/api/tasks', { title: '网格策略', nodeId: 'v2jpmg', repoUrl: '/quant/alpha', resumeSessionId: 'cli-codex', resumeBackend: 'codex' });
+  assert.equal(wrong.status, 409);
+  assert.match(wrong.body.error, /codex/);
+  const adopted = await core.api(q, 'POST', '/api/tasks', { title: '网格策略', nodeId: 'v2jpmg', repoUrl: '/quant/alpha', resumeSessionId: 'cli-codex', resumeBackend: 'codex', modelProfileId: 'p-cx' });
+  assert.equal(adopted.status, 200, JSON.stringify(adopted.body));
+  assert.equal(adopted.body.task.session_id, 'cli-codex');
+  const after = await core.api(q, 'GET', '/api/nodes/v2jpmg/inheritable', {});
+  assert.deepEqual(after.body.sessions.map(s => s.sessionId), ['cli-claude'], 'an adopted session drops off the list');
+});

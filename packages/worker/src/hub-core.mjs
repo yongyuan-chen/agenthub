@@ -9,10 +9,11 @@
 //                                                      or the owner's personal channel if teamId is null)
 //   sendToNode(nodeId, msgObj)    -> boolean (true if delivered to a live socket)
 //   browseNode(nodeId, path)      -> Promise<{entries}|null> (cloud-initiated round trip; null on timeout/offline)
+//   listNodeSessions(nodeId)      -> Promise<{sessions}|null> (every claude/codex session on the node, tagged with backend)
 //   listSessions(nodeId, path)    -> Promise<{sessions}|null> (same shape, lists existing claude sessions for a path)
 //   push(payload, ownerUserId)    -> void    (web push fan-out, fire and forget)
 //   now()                         -> epoch ms
-import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_MESSAGE_REWIND, FEATURE_CLI_UPGRADE, FEATURE_MULTI_AGENT, FEATURE_NATIVE_AUTH, PROJECT_KINDS, DEFAULT_PROJECT_KIND, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
+import { userCanTransition, ulid, sha256Hex, MAX_IMAGES_PER_MESSAGE, MAX_ATTACHMENT_TOTAL_RAW_BYTES, ALLOWED_IMAGE_MIME_TYPES, PROTOCOL_VERSION, BACKENDS, DEFAULT_BACKEND, isValidClientMessageId, OUTBOUND_MESSAGE_TTL_MS, FEATURE_MESSAGE_ACK, FEATURE_TASK_IMAGES, FEATURE_FILE_IO, FEATURE_SESSION_FORK, FEATURE_MESSAGE_REWIND, FEATURE_CLI_UPGRADE, FEATURE_MULTI_AGENT, FEATURE_NATIVE_AUTH, FEATURE_NODE_SESSIONS, PROJECT_KINDS, DEFAULT_PROJECT_KIND, MAX_FILE_READ_BYTES } from '../../shared/protocol.mjs';
 import * as accounts from './accounts.mjs';
 import { hashPassword } from './auth.mjs';
 import { cachedCliVersions } from './cli-releases.mjs';
@@ -1326,6 +1327,10 @@ async function invalidateConversationSource(ctx, nodeId, sessionId, sourceId, ta
 // either backend and must not be refused for not being claude.
 async function createTask(ctx, body, userId, { adopting = true } = {}) {
   const { title, spec, repoUrl, baseBranch, nodeId, permissionMode, resumeSessionId } = body || {};
+  // Which CLI's store the adopted session lives in. Absent = claude, which is
+  // all the per-path picker ever offered; the node-wide list (GET
+  // /api/nodes/:id/inheritable) reports codex ones too, tagged.
+  const resumeBackend = BACKENDS.includes(body?.resumeBackend) ? body.resumeBackend : DEFAULT_BACKEND;
   let { modelProfileId } = body || {};
   // The first message of a new conversation can carry attachments exactly
   // like any later one (draftpane.jsx's composer is the same composer) —
@@ -1356,7 +1361,7 @@ async function createTask(ctx, body, userId, { adopting = true } = {}) {
   if (resumeSessionId) {
     const occupiedTask = await q(ctx.db, 'SELECT id FROM tasks WHERE node_id = ? AND session_id = ? AND COALESCE(repo_url,\'\') = ? LIMIT 1', nodeId, resumeSessionId, repoUrl || '').first();
     const occupiedClaim = await q(ctx.db, 'SELECT task_id FROM conversation_claims_v2 WHERE node_id = ? AND session_id = ? AND source_cwd = ?', nodeId, resumeSessionId, repoUrl || '').first();
-    if (occupiedTask || occupiedClaim) return err(409, 'this Claude session is already connected to an AgentHub conversation');
+    if (occupiedTask || occupiedClaim) return err(409, '这个会话已经接到另一个 AgentHub 对话上了,刷新后打开那个对话即可');
   }
   // {native:{backend, model}}: the official login on that node with a model
   // picked in the pane — resolves to the account's native profile for that
@@ -1411,8 +1416,8 @@ async function createTask(ctx, body, userId, { adopting = true } = {}) {
   // id — and a session id belongs to exactly one agent CLI's on-disk store.
   // The frontend filters the choices; reaching here means a stale page or a
   // direct API call.
-  if (adopting && resumeSessionId && backend !== 'claude') {
-    return err(409, `无法用 ${backend} 档案接管一个 claude 会话:会话 ID 不通用`);
+  if (adopting && resumeSessionId && backend !== resumeBackend) {
+    return err(409, `无法用 ${backend} 接管一个 ${resumeBackend} 会话:会话 ID 不通用,请先把模型切到 ${resumeBackend}`);
   }
   // Fixed here, from the project the conversation is created in — see
   // task_agent_modes in schema.sql.
@@ -2154,8 +2159,12 @@ export async function api(ctx, method, pathname, body) {
     // node — copying rows here would produce a conversation that looks right
     // and remembers nothing.
     if (method === 'POST' && action === 'branch') {
+      // whole: copy the entire conversation (「复制到本项目」 in the new-chat
+      // pane) rather than branch under one reply. The copy lands in the scope
+      // the request is made from — createTask files it under ctx.teamId.
+      const whole = body?.whole === true;
       const seq = Number(body?.seq);
-      if (!Number.isFinite(seq) || seq <= 0) return err(400, 'seq required');
+      if (!whole && (!Number.isFinite(seq) || seq <= 0)) return err(400, 'seq required');
       if (!task.session_id) return err(409, '这个对话还没有会话记录,跑完第一个回合后才能分支');
       if (!(await nodeSupports(ctx.db, task.node_id, FEATURE_SESSION_FORK))) {
         return err(409, `节点 ${task.node_id} 的 executor 还不支持分支,请等它自动升级(约 2-3 分钟)后重试`);
@@ -2164,7 +2173,7 @@ export async function api(ctx, method, pathname, body) {
       // conversation at its last 50 turns, so a D1 message's seq says nothing
       // about its position in the transcript — but "how many user turns came
       // after this point" is the same number on both sides.
-      const after = await q(ctx.db,
+      const after = whole ? { n: 0 } : await q(ctx.db,
         "SELECT COUNT(*) AS n FROM messages WHERE task_id = ? AND role = 'user' AND seq > ?", taskId, seq).first();
       const newSessionId = crypto.randomUUID();
       const fork = await ctx.forkSession?.(task.node_id, taskId, task.session_id, after?.n ?? 0, newSessionId);
@@ -2174,7 +2183,7 @@ export async function api(ctx, method, pathname, body) {
       // at a transcript that doesn't exist is a conversation that can never be
       // resumed and can only be deleted.
       const created = await createTask(ctx, {
-        title: `${task.title} (分支)`,
+        title: `${task.title} ${whole ? '(副本)' : '(分支)'}`,
         spec: '',
         repoUrl: fork.cwd,
         nodeId: task.node_id,
@@ -2187,7 +2196,8 @@ export async function api(ctx, method, pathname, body) {
       // changes come along — and both conversations editing at once will
       // collide. Reported rather than silently accepted; the frontend says so
       // before it navigates.
-      const warnings = [`分支与原对话共用工作目录 ${fork.cwd},两边同时干活会改到同一批文件。`];
+      const warnings = [`${whole ? '副本' : '分支'}与原对话共用工作目录 ${fork.cwd},两边同时干活会改到同一批文件。`];
+      if (whole) return ok({ task: created.body.task, warnings });
       // The turn we actually cut at, echoed back from the transcript. If it
       // doesn't match the user message the UI branched under, the two sides
       // disagree about turn counts (a retry, an unsent queued message) and the
@@ -2932,6 +2942,76 @@ export async function api(ctx, method, pathname, body) {
     if (result.conflict) return err(409, JSON.stringify({ conflict: true, mtime: result.mtime ?? null }));
     if (!result.ok) return err(400, result.error || 'write failed');
     return ok({ mtime: result.mtime ?? null, size: result.size ?? 0 });
+  }
+
+  // 「继续这台节点上的对话」 in the new-chat pane: everything on this node the
+  // caller could bring into the scope they're looking at, which is two kinds
+  // of thing —
+  //   conversations: the caller's own AgentHub conversations on this node that
+  //     aren't visible here (personal ones while in a project, or another
+  //     project's). Only the creator's: they're the only one who may move,
+  //     share or copy a conversation anyway (see the task route guard).
+  //   sessions: claude/codex CLI sessions on the machine that no AgentHub
+  //     conversation has picked up yet, any directory. Only for the node's
+  //     owner — it's their home directory, the same rule GET
+  //     /api/nodes/:id/sessions has always applied.
+  // A node added to a project is what triggers this (it brings the machine,
+  // not its history — see POST /api/nodes/:id/teams/:teamId), so the node
+  // only has to be usable here, not have any history here yet.
+  if (method === 'GET' && route[0] === 'nodes' && route.length === 3 && route[2] === 'inheritable') {
+    const nodeId = route[1];
+    if (!(await assertTeamMember(ctx, ctx.teamId))) return err(403, 'not a member of that team');
+    const node = ctx.teamId
+      ? await q(ctx.db, 'SELECT id, owner_user_id FROM nodes WHERE id = ? AND id IN (SELECT node_id FROM node_teams WHERE team_id = ?)', nodeId, ctx.teamId).first()
+      : await q(ctx.db, 'SELECT id, owner_user_id FROM nodes WHERE id = ? AND owner_user_id = ?', nodeId, userId).first();
+    if (!node) return err(404, 'node not found');
+
+    const taskRows = ctx.teamId
+      ? await q(ctx.db,
+          `SELECT * FROM tasks WHERE node_id = ? AND owner_user_id = ? AND archived_at IS NULL
+           AND id NOT IN (SELECT task_id FROM task_teams WHERE team_id = ?)
+           ORDER BY updated_at DESC LIMIT 200`, nodeId, userId, ctx.teamId).all()
+      : await q(ctx.db,
+          `SELECT * FROM tasks WHERE node_id = ? AND owner_user_id = ? AND archived_at IS NULL
+           AND id IN (SELECT task_id FROM task_teams)
+           ORDER BY updated_at DESC LIMIT 200`, nodeId, userId).all();
+    const tasks = taskRows.results ?? taskRows;
+    await attachTeamIds(ctx, tasks);
+    await attachTaskBackends(ctx.db, tasks);
+    const teamIds = [...new Set(tasks.flatMap(t => t.teamIds))];
+    const teamNames = new Map();
+    if (teamIds.length) {
+      const rows = await q(ctx.db, `SELECT id, name FROM teams WHERE id IN (${inClause(teamIds)})`, ...teamIds).all();
+      for (const row of rows.results ?? rows) teamNames.set(row.id, row.name);
+    }
+    const conversations = tasks.map(t => ({
+      id: t.id, title: t.title, repoUrl: t.repo_url, status: t.status, backend: t.backend,
+      updatedAt: t.updated_at, hasSession: !!t.session_id,
+      teams: t.teamIds.map(id => ({ id, name: teamNames.get(id) || id })),
+    }));
+
+    let sessions = [];
+    let sessionsState = 'ok';
+    if (node.owner_user_id !== userId) sessionsState = 'not-owner';
+    else if (!(await nodeSupports(ctx.db, nodeId, FEATURE_NODE_SESSIONS))) sessionsState = 'upgrade';
+    else {
+      const result = await ctx.listNodeSessions?.(nodeId);
+      if (!result) sessionsState = 'offline';
+      else {
+        // Any session id this node already has a conversation for is not
+        // "new": either it's listed above, or it's already visible here.
+        const [taskSessions, oldClaims, claims] = await Promise.all([
+          q(ctx.db, 'SELECT session_id FROM tasks WHERE node_id = ? AND session_id IS NOT NULL', nodeId).all(),
+          q(ctx.db, 'SELECT session_id FROM conversation_claims WHERE node_id = ?', nodeId).all(),
+          q(ctx.db, 'SELECT session_id FROM conversation_claims_v2 WHERE node_id = ?', nodeId).all(),
+        ]);
+        const taken = new Set([taskSessions, oldClaims, claims].flatMap(r => (r.results ?? r).map(x => x.session_id)));
+        sessions = (result.sessions || [])
+          .filter(x => x?.sessionId && x?.cwd && !taken.has(x.sessionId) && BACKENDS.includes(x.backend))
+          .map(x => ({ sessionId: x.sessionId, cwd: x.cwd, backend: x.backend, preview: x.preview || '(空会话)', mtime: x.mtime || 0 }));
+      }
+    }
+    return ok({ conversations, sessions, sessionsState });
   }
 
   if (method === 'GET' && route[0] === 'nodes' && route.length === 3 && route[2] === 'sessions') {

@@ -504,3 +504,22 @@ test('forkSession: dropTrailingTurns 0 copies everything; dropping every turn is
   assert.throws(() => forkSession({ sourceFile, cwd, newSessionId: 'branch-empty', dropTrailingTurns: 1, projectsRoot: root }), /回合/);
   assert.ok(!fs.existsSync(path.join(root, cwd.replace(/[^a-zA-Z0-9]/g, '-'), 'branch-empty.jsonl')));
 });
+
+test('listAllExternalSessions: every directory on the machine, newest first, bounded by limit', async () => {
+  const { listAllExternalSessions } = await import('../packages/executor/src/sessions.mjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ah-all-claude-'));
+  const write = (slug, id, cwd, text, mtime) => {
+    fs.mkdirSync(path.join(root, slug), { recursive: true });
+    const file = path.join(root, slug, `${id}.jsonl`);
+    fs.writeFileSync(file, JSON.stringify({ type: 'user', cwd, message: { role: 'user', content: text } }) + '\n');
+    fs.utimesSync(file, mtime, mtime);
+  };
+  write('-a', 's-old', '/a', '旧的', 1000);
+  write('-b', 's-new', '/b', '新的', 3000);
+  write('-a', 's-mid', '/a', '中间', 2000);
+  fs.writeFileSync(path.join(root, '-a', 'no-cwd.jsonl'), '{"type":"summary"}\n');
+  const all = listAllExternalSessions(root);
+  assert.deepEqual(all.map(s => [s.sessionId, s.cwd, s.preview]), [['s-new', '/b', '新的'], ['s-mid', '/a', '中间'], ['s-old', '/a', '旧的']]);
+  assert.deepEqual(listAllExternalSessions(root, 1).map(s => s.sessionId), ['s-new']);
+  assert.deepEqual(listAllExternalSessions(path.join(root, 'missing')), []);
+});

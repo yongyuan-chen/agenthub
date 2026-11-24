@@ -182,6 +182,30 @@ export function listExternalSessionsForPaths(targetPaths, sessionsRoot = DEFAULT
     .map(({ file, ...s }) => ({ ...s, preview: previewForFile(file) }));
 }
 
+// Whole-machine counterpart of the above, same contract as the claude one in
+// sessions.mjs: stat-only ranking, then cwd + preview for the newest `limit`.
+export function listAllExternalSessions(sessionsRoot = DEFAULT_SESSIONS_ROOT(), limit = 200) {
+  if (!fs.existsSync(sessionsRoot)) return [];
+  const files = [];
+  for (const file of walkRollouts(sessionsRoot)) {
+    let mtime = 0;
+    try { mtime = fs.statSync(file).mtimeMs; } catch { continue; }
+    files.push({ file, mtime });
+  }
+  files.sort((a, b) => b.mtime - a.mtime);
+  const out = [];
+  const seen = new Set();
+  for (const { file, mtime } of files) {
+    if (out.length >= limit) break;
+    const sessionId = sessionIdOfRollout(file);
+    const cwd = cwdOf(file);
+    if (!sessionId || !cwd || seen.has(sessionId)) continue;
+    seen.add(sessionId);
+    out.push({ sessionId, cwd, path: cwd, mtime, preview: previewForFile(file) });
+  }
+  return out;
+}
+
 const MAX_CONVO_TURNS = 50;
 export const MAX_IMPORT_EVENTS = 800;
 

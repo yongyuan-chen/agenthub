@@ -74,6 +74,9 @@ export class Hub {
       readFile: (nodeId, path) => this.askNode(nodeId, { t: 'read_file', path }, 20_000),
       writeFile: (nodeId, path, content, expectedMtime) =>
         this.askNode(nodeId, { t: 'write_file', path, content, expectedMtime }, 20_000),
+      // Whole machine, both CLIs — has to stat every transcript on the box.
+      listNodeSessions: (nodeId) => this.askNode(nodeId, { t: 'list_node_sessions' }, 15_000)
+        .then(r => (r ? { sessions: r.sessions || [] } : null)),
       listProjectSessions: (nodeId, paths) => this.askNode(nodeId, { t: 'list_project_sessions', paths }, 12_000)
         .then(r => (r ? { sessions: r.sessions || [] } : null)),
       readProjectSession: (nodeId, sessionId, cwd, options = {}) => this.askNode(nodeId, {
