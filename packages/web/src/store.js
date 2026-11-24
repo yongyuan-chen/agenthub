@@ -317,6 +317,11 @@ export function applyWsMessage(msg) {
       break;
     case 'node': upsertNode(msg.node); break;
     case 'msg': addMessage(msg.taskId, { seq: msg.seq, role: msg.role, content: msg.content, created_at: msg.ts }); break;
+    // A burst stored in one go (an adopted session's imported history) —
+    // one frame and one re-render instead of hundreds.
+    case 'msgs':
+      for (const m of msg.messages || []) addMessage(msg.taskId, { seq: m.seq, role: m.role, content: m.content, created_at: m.ts });
+      break;
     case 'messages_reset':
       if (Number.isSafeInteger(msg.resetSeq)) {
         if (msg.resetSeq <= (state.messageResetSeqs[msg.taskId] || 0)) return;

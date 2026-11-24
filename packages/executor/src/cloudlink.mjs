@@ -76,6 +76,10 @@ export class CloudLink {
     this._attemptFailLogged = 0;
     this._nativeAuthJson = null;  // last 本机账号 report the cloud accepted
     this.nativeAuthTimer = null;
+    // Set from hello_ok.cloudFeatures: the cloud takes {t:'evs'} frames.
+    this.cloudEvBatch = false;
+    this._evQueue = [];
+    this._evFlushScheduled = false;
   }
 
   // Which CLIs on this machine are already logged in / configured on their
@@ -210,6 +214,10 @@ export class CloudLink {
     this.ws = null;
     const wasConnected = this.connected;
     this.connected = false;
+    // Whatever was queued is still in the outbox unacked; the next hello_ok
+    // replays it. And the next cloud may not be the same build.
+    this._evQueue = [];
+    this.cloudEvBatch = false;
     clearInterval(this.hbTimer);
     clearTimeout(this.handshakeTimer);
     this.handshakeTimer = null;
@@ -280,13 +288,14 @@ export class CloudLink {
         if (msg.upgradeRequired) {
           console.error(`[link] 这个 executor 太旧了(协议 v${PROTOCOL_VERSION},云端要求 v${msg.upgradeRequired}),云端不会向它派发任务。请升级本机的 AgentHub daemon。`);
         }
+        this.cloudEvBatch = Array.isArray(msg.cloudFeatures) && msg.cloudFeatures.includes('ev-batch');
         // Replay everything the cloud hasn't absorbed yet, oldest first.
         const known = new Map((msg.tasks || []).map(x => [x.taskId, x.lastSeq]));
         const taskIds = new Set(this.db.allTasks().map(t => t.task_id));
         for (const taskId of taskIds) {
           const after = known.get(taskId) ?? 0;
           for (const row of this.db.unackedAfter(taskId, after, 2000)) {
-            this._send({ t: 'ev', taskId: row.task_id, seq: row.seq, ev: JSON.parse(row.payload) });
+            this.notifyEvent(row.task_id, row.seq, JSON.parse(row.payload));
           }
         }
         // Cloud is authoritative for these settings (see hub-core.mjs's
@@ -433,10 +442,45 @@ export class CloudLink {
   }
 
   // Called by the manager whenever a new event lands in the outbox.
+  //
+  // Against a cloud that takes batches, events emitted in the same tick go
+  // out as one {t:'evs'} frame — an adopted session's history is hundreds of
+  // emits in a single synchronous loop (manager.mjs _importHistory), and one
+  // frame per event made the cloud absorb them one D1 round trip at a time
+  // (see hub-core.mjs absorbEvents). A microtask, not a timer: that loop is
+  // synchronous, so everything it emits is queued before the flush runs, and
+  // a lone live event goes out with no added latency at all.
   notifyEvent(taskId, seq, ev) {
-    this._send({ t: 'ev', taskId, seq, ev });
+    if (!this.cloudEvBatch) { this._send({ t: 'ev', taskId, seq, ev }); return; }
+    this._evQueue.push({ taskId, seq, ev });
+    if (this._evFlushScheduled) return;
+    this._evFlushScheduled = true;
+    queueMicrotask(() => { this._evFlushScheduled = false; this._flushEvents(); });
+  }
+
+  _flushEvents() {
+    const queue = this._evQueue;
+    this._evQueue = [];
+    let items = [];
+    let bytes = 0;
+    const sendItems = () => {
+      if (!items.length) return;
+      if (items.length === 1) this._send({ t: 'ev', ...items[0].item });
+      else this._send({ t: 'evs', items: items.map(x => x.item) });
+      items = []; bytes = 0;
+    };
+    for (const item of queue) {
+      const size = JSON.stringify(item).length;
+      if (items.length && (items.length >= CloudLink.EV_BATCH_MAX_ITEMS || bytes + size > CloudLink.EV_BATCH_MAX_BYTES)) sendItems();
+      items.push({ item }); bytes += size;
+    }
+    sendItems();
   }
 }
 
 // Overridable so tests never spawn the real CLIs or a login shell.
 CloudLink.nativeAuthProbe = detectNativeAuth;
+// Per {t:'evs'} frame. Well under the WebSocket message cap, and small enough
+// that one batch of D1 writes stays quick on the cloud side.
+CloudLink.EV_BATCH_MAX_ITEMS = 200;
+CloudLink.EV_BATCH_MAX_BYTES = 256 * 1024;

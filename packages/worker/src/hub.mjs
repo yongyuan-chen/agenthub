@@ -240,6 +240,7 @@ export class Hub {
           try { ws.send(JSON.stringify({ t: 'hb_ack' })); } catch { /* socket's already dead, next hb cycle's watchdog will catch it */ }
         }
         else if (msg.t === 'ev') await core.absorbEvent(ctx, att.nodeId, msg);
+        else if (msg.t === 'evs') await core.absorbEvents(ctx, att.nodeId, msg.items);
         else if (msg.t === 'cli_versions') await core.handleCliVersions(ctx, att.nodeId, msg);
         else if (msg.t === 'native_auth') await core.handleNativeAuth(ctx, att.nodeId, msg);
       } catch (e) {

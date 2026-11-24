@@ -551,6 +551,73 @@ async function broadcastNode(ctx, nodeId, ownerUserId) {
 
 // ---------- executor uplink ----------
 
+export const CLOUD_FEATURE_EV_BATCH = 'ev-batch';
+const EV_BATCH_INSERT_CHUNK = 50;
+
+// Several events in one frame — what a node sends when it emits a burst, the
+// big one being an adopted session's imported history (up to ~800 messages).
+// One at a time, each message cost five serialized D1 round trips plus its
+// own ack and its own broadcast frame; found live: adopting a conversation
+// sat on 「加载历史」 for well over ten seconds while that trickled in.
+//
+// Plain messages are the whole cost, so only they take the fast path: one
+// task lookup, one reset-fence read and one project lookup per run, inserts
+// in D1 batches, one broadcast, one last_seq bump, one (cumulative — see the
+// executor's db.ack) ack. Anything with side effects beyond "store and show
+// this" — status, session, cost, a rewind, a user send that settles a
+// pending bubble — goes through absorbEvent unchanged, in order.
+export async function absorbEvents(ctx, nodeId, items) {
+  if (!Array.isArray(items)) return;
+  let i = 0;
+  while (i < items.length) {
+    const taskId = items[i]?.taskId;
+    let j = i;
+    while (j < items.length && items[j]?.taskId === taskId) j++;
+    await absorbTaskRun(ctx, nodeId, taskId, items.slice(i, j));
+    i = j;
+  }
+}
+
+const plainMsg = (ev) => ev?.k === 'msg' && !(ev.role === 'user' && ev.content?.clientMessageId);
+
+async function absorbTaskRun(ctx, nodeId, taskId, run) {
+  const task = await getTask(ctx, taskId);
+  if (!task || task.node_id !== nodeId) return; // stray events
+  let fence = null;      // reset_seq, read lazily once per stretch of plain messages
+  let teamIds = null;
+  let pending = [];
+  const flush = async () => {
+    if (!pending.length) return;
+    const batch = pending; pending = [];
+    if (fence === null) fence = (await q(ctx.db, 'SELECT reset_seq FROM task_message_resets WHERE task_id = ?', taskId).first())?.reset_seq ?? 0;
+    const now = ctx.now();
+    const rows = batch.filter(({ seq }) => seq > fence).map(({ seq, ev }) => ({ seq, role: ev.role, content: ev.content ?? {}, ts: ev.ts ?? now }));
+    const inserted = [];
+    for (let k = 0; k < rows.length; k += EV_BATCH_INSERT_CHUNK) {
+      const chunk = rows.slice(k, k + EV_BATCH_INSERT_CHUNK);
+      const results = await ctx.db.batch(chunk.map(r => q(ctx.db,
+        'INSERT OR IGNORE INTO messages (id, task_id, seq, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        `${taskId}:${r.seq}`, taskId, r.seq, r.role, JSON.stringify(r.content), r.ts)));
+      chunk.forEach((r, n) => { const res = results?.[n]; if ((res?.meta?.changes ?? res?.changes ?? 1) > 0) inserted.push(r); });
+    }
+    if (inserted.length) {
+      if (!teamIds) teamIds = await taskTeamIds(ctx, taskId);
+      fanOutToTeamsOrOwner(ctx, { t: 'msgs', taskId, messages: inserted }, task.owner_user_id, teamIds);
+    }
+    const maxSeq = Math.max(...batch.map(x => x.seq));
+    await q(ctx.db, 'UPDATE tasks SET last_seq = MAX(last_seq, ?) WHERE id = ?', maxSeq, taskId).run();
+    ctx.sendToNode(nodeId, { t: 'ack', taskId, seq: maxSeq });
+  };
+  for (const item of run) {
+    if (!Number.isSafeInteger(item?.seq)) continue;
+    if (plainMsg(item.ev)) { pending.push(item); continue; }
+    await flush();
+    await absorbEvent(ctx, nodeId, item);
+    fence = null;   // a messages_reset may just have moved it
+  }
+  await flush();
+}
+
 export async function absorbEvent(ctx, nodeId, { taskId, seq, ev }) {
   const task = await getTask(ctx, taskId);
   if (!task || task.node_id !== nodeId) return; // stray event
@@ -846,6 +913,10 @@ export async function handleHello(ctx, nodeId, msg) {
   ctx.sendToNode(nodeId, {
     t: 'hello_ok', tasks: replay, provider,
     cliLatest, cliAutoUpgrade: await autoUpgradeEnabled(ctx.db, nodeId),
+    // What this cloud accepts beyond the baseline protocol, so a newer node
+    // can use it without the cloud having to be deployed first (or the
+    // other way round). 'ev-batch': {t:'evs', items:[{taskId,seq,ev}...]}.
+    cloudFeatures: [CLOUD_FEATURE_EV_BATCH],
   });
 
   // Durable commands are persisted before first delivery and removed only

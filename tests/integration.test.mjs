@@ -65,6 +65,7 @@ function makeCloud() {
       if (msg.t === 'hello') await core.handleHello(ctx, nodeId, msg);
       else if (msg.t === 'hb') await core.handleHeartbeat(ctx, nodeId);
       else if (msg.t === 'ev') await core.absorbEvent(ctx, nodeId, msg);
+      else if (msg.t === 'evs') await core.absorbEvents(ctx, nodeId, msg.items);
       else if (msg.t === 'cli_versions') await core.handleCliVersions(ctx, nodeId, msg);
       else if (msg.t === 'durable_cmd_ack') await core.ackDurableCommand(ctx, nodeId, msg.commandKey);
     }).catch(e => { throw e; });
@@ -2530,7 +2531,18 @@ test('retry: explicit recovery options (permissionMode downgrade / allowRootBypa
     title: 'root bypass 场景', nodeId: 'mac-rootbypass', resumeSessionId: 'ext-rootbypass-1', repoUrl: resumeDir,
   });
   const taskId = res.body.task.id;
-  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'failed', 5000, 'failed');
+  // "Failed again" must mean the retry's own run has failed and the cloud has
+  // absorbed it: the status alone is still 'failed' from the previous attempt
+  // until the node's first event for the retry lands.
+  let seenSeq = 0;
+  const settledFailed = async () => {
+    const t = await core.getTask(cloud.ctx, taskId);
+    const local = exec.db.lastSeq(taskId);
+    const ok = local > seenSeq && t?.status === 'failed' && exec.db.getTask(taskId)?.status === 'failed' && t.last_seq === local;
+    if (ok) seenSeq = local;
+    return ok;
+  };
+  await until(settledFailed, 5000, 'failed');
 
   // Downgrading off bypassPermissions must land in both the cloud task row
   // (so the UI reflects it) and the executor's own local db (so the *next*
@@ -2542,14 +2554,14 @@ test('retry: explicit recovery options (permissionMode downgrade / allowRootBypa
 
   // Opting into IS_SANDBOX similarly persists locally (not just a one-shot
   // retry param) — it has to survive to every future spawn of this task.
-  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'failed', 5000, 'failed again');
+  await until(settledFailed, 5000, 'failed again');
   const bypass = await cloud.api('POST', `/api/tasks/${taskId}/retry`, { allowRootBypass: true });
   assert.equal(bypass.status, 200);
   await until(() => exec.db.getTask(taskId)?.allow_root_bypass === 1, 3000, 'root bypass flag set locally');
 
   // An unrecognized permissionMode value is silently ignored, not written —
   // this is a fixed enum on the CLI side, not free-form user input.
-  await until(async () => (await core.getTask(cloud.ctx, taskId))?.status === 'failed', 5000, 'failed a third time');
+  await until(settledFailed, 5000, 'failed a third time');
   const bogus = await cloud.api('POST', `/api/tasks/${taskId}/retry`, { permissionMode: 'sudo-everything' });
   assert.equal(bogus.status, 200);
   assert.equal((await core.getTask(cloud.ctx, taskId)).permission_mode, 'default', 'unrecognized value ignored, previous mode kept');
@@ -6547,4 +6559,44 @@ test('inheritable: moving a personal conversation in, copying another project\'s
   assert.equal(adopted.body.task.session_id, 'cli-codex');
   const after = await core.api(q, 'GET', '/api/nodes/v2jpmg/inheritable', {});
   assert.deepEqual(after.body.sessions.map(s => s.sessionId), ['cli-claude'], 'an adopted session drops off the list');
+});
+
+test('ev batching: a burst of events reaches the cloud as a few evs frames, stored in order and acked once per run', async () => {
+  const cloud = makeCloud();
+  const now = Date.now();
+  await cloud.db.prepare('INSERT INTO nodes (id, token_hash, owner_user_id, created_at) VALUES (?, ?, ?, ?)')
+    .bind('mac-burst', await sha256Hex('tok-mac-burst'), 'user-test', now).run();
+  const exec = makeExecutor(cloud, 'mac-burst', async (session, opts) => {
+    await sleep(5);
+    opts.onMessage({ type: 'result', subtype: 'success', total_cost_usd: 0, duration_ms: 1, num_turns: 1, is_error: false });
+    session.busy = false;
+  });
+  const frames = [];
+  const realNotify = exec.link._send.bind(exec.link);
+  exec.link._send = (obj) => { if (obj.t === 'ev' || obj.t === 'evs') frames.push(obj.t === 'evs' ? obj.items.length : 1); return realNotify(obj); };
+  exec.link.start();
+  await until(() => exec.link.connected && exec.link.cloudEvBatch, 2000, 'connected, cloud advertised ev-batch');
+
+  const res = await cloud.api('POST', '/api/tasks', { title: 'burst', spec: '开始', nodeId: 'mac-burst' });
+  const taskId = res.body.task.id;
+  await until(async () => {
+    const t = await core.getTask(cloud.ctx, taskId);
+    return t && t.status !== 'queued' && t.status !== 'running' && t.last_seq > 0 && t.last_seq === exec.db.lastSeq(taskId);
+  }, 5000, 'first turn settled');
+  frames.length = 0;
+  cloud.broadcasts.length = 0;
+  // What _importHistory does: hundreds of emits in one synchronous loop.
+  for (let i = 0; i < 450; i++) exec.manager.emit(taskId, { k: 'msg', role: i % 2 ? 'assistant' : 'user', content: { text: `历史 ${i}` } });
+  await until(async () => {
+    const t = await core.getTask(cloud.ctx, taskId);
+    return t.last_seq === exec.db.lastSeq(taskId);
+  }, 5000, 'burst absorbed');
+  assert.ok(frames.length <= 3, `450 events in ${frames.length} frames`);
+  const stored = await cloud.db.prepare("SELECT content FROM messages WHERE task_id = ? AND content LIKE '%历史%' ORDER BY seq").bind(taskId).all();
+  assert.deepEqual(stored.results.map(r => JSON.parse(r.content).text), Array.from({ length: 450 }, (_, i) => `历史 ${i}`));
+  const msgFrames = cloud.broadcasts.filter(b => b.t === 'msgs');
+  assert.equal(msgFrames.reduce((n, b) => n + b.messages.length, 0), 450, 'every stored message is broadcast, batched');
+  assert.ok(cloud.broadcasts.every(b => b.t !== 'msg'));
+  exec.manager.shutdown();
+  exec.link.stop();
 });
