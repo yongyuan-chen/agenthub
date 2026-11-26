@@ -103,7 +103,7 @@ function TeamSwitcher({ onSwitchTeam, onManageMembers, onCreateProject }) {
   );
 }
 
-export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect, user, pushState, onEnablePush, onOpenSettings, onLogout, onSwitchTeam, setupIncomplete, onResumeSetup, onCollapse }) {
+export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect, user, pushState, onEnablePush, onOpenSettings, onLogout, onSwitchTeam, onProjectCreated, setupIncomplete, onResumeSetup, onCollapse }) {
   const [showAddNode, setShowAddNode] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const [showNodeManage, setShowNodeManage] = useState(false);
@@ -288,7 +288,7 @@ export function Sidebar({ open, selectedTaskId, openPanes, onNewDraft, onSelect,
       {showArchived && <ArchivedModal onClose={() => setShowArchived(false)} />}
       {manageMembersTeam && <ProjectMembersModal teamId={manageMembersTeam.id} teamName={manageMembersTeam.name} currentUserId={user?.id} onClose={() => setManageMembersTeam(null)} />}
       {teamsModalTask && <TaskTeamsModal task={teamsModalTask} onClose={() => setTeamsModalTaskId(null)} />}
-      {showCreateProject && <CreateProjectModal onClose={() => setShowCreateProject(false)} onCreated={(teamId) => onSwitchTeam(teamId)} />}
+      {showCreateProject && <CreateProjectModal onClose={() => setShowCreateProject(false)} onCreated={(teamId) => (onProjectCreated ? onProjectCreated(teamId) : onSwitchTeam(teamId))} />}
     </>, document.body)}
     </>
   );

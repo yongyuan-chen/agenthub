@@ -433,7 +433,19 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
       return next;
     });
   };
-  const newDraft = () => addPane(`draft-${Math.random().toString(36).slice(2)}-${Date.now()}`);
+  const newDraftId = () => `draft-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+  const newDraft = () => addPane(newDraftId());
+  // A project that was just created has nothing in it yet, so the first thing
+  // anyone does there is start a conversation — open one straight away. Panes
+  // are kept per scope, and `scope` here is still the old one until the switch
+  // re-renders, so this writes into the new project's slot directly.
+  const openDraftIn = (teamId) => {
+    const key = scopeKey(teamId);
+    const id = newDraftId();
+    setPanesByScope(prev => ({ ...prev, [key]: [...(prev[key] || []), id] }));
+    setActivePaneByScope(prev => ({ ...prev, [key]: id }));
+    location.hash = '';
+  };
   const replacePane = (oldId, realId) => {
     setOpenPanes(p => {
       const at = p.indexOf(oldId);
@@ -498,6 +510,7 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
         onOpenSettings={onOpenSettings}
         onLogout={onLogout}
         onSwitchTeam={(teamId) => { onSwitchTeam(teamId); setNavOpen(false); setSwitcherOpen(false); setSwitcherQuery(''); }}
+        onProjectCreated={(teamId) => { onSwitchTeam(teamId); openDraftIn(teamId); setNavOpen(false); }}
         setupIncomplete={setupIncomplete}
         onResumeSetup={onResumeSetup}
         onCollapse={toggleSidebar}

@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { api } from './api.js';
+import { AddNodeModal, NodeManageModal } from './board.jsx';
 import { state, upsertTask, bump } from './store.js';
 import { InheritList } from './inherit.jsx';
 import { useAttachments, AttachmentStrip, AttachButton, imageFilesFromPaste } from './composer.jsx';
@@ -9,6 +11,67 @@ import { BACKEND_LABELS, NATIVE_MODELS, nativeBackendsFor, authModeOf } from './
 // making the user open a dropdown — most accounts have a handful of nodes
 // and model profiles, so a dropdown is needless friction for the common case.
 const INLINE_THRESHOLD = 4;
+
+// Node management right where it's needed. A project starts with no machine
+// in it, and the new-chat pane is the first thing it shows — so this is where
+// "add one of my nodes to this project", "install a new machine" and the node
+// manager live, instead of making people find them in the sidebar first.
+function DraftNodeTools({ userId, startOpen, onJoined }) {
+  const teamId = state.activeTeamId;
+  const [open, setOpen] = useState(startOpen);
+  const [mine, setMine] = useState(null);   // all of my nodes, for "add to project"
+  const [modal, setModal] = useState(null); // 'add' | 'manage'
+  const [busy, setBusy] = useState('');
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    if (!open || !teamId) return;
+    api.myNodes().then(r => setMine(r.nodes || [])).catch(e => setErr(e.message));
+  }, [open, teamId]);
+
+  // Already in this project = already in the scoped node list.
+  const candidates = (mine || []).filter(n => !state.nodes.has(n.id));
+  const join = async (node) => {
+    setBusy(node.id); setErr('');
+    try {
+      await api.addNodeTeam(node.id, teamId);
+      state.nodes.set(node.id, { ...node, teamIds: [...(node.teamIds || []), teamId] });
+      bump();
+      onJoined(node.id);
+      setOpen(false);
+    } catch (e) { setErr(e.message); }
+    setBusy('');
+  };
+  const openModal = (which) => { setOpen(false); setModal(which); };
+
+  return (
+    <div className="chip-with-picker">
+      <button type="button" className="path-chip" onClick={() => setOpen(o => !o)}>＋ 节点</button>
+      {open && (
+        <div className="path-picker draft-node-tools">
+          {teamId && (
+            <>
+              <div className="muted path-picker-heading">把我的节点加入这个项目</div>
+              {mine === null && !err && <div className="muted path-picker-heading">加载中…</div>}
+              {mine !== null && !candidates.length && <div className="muted path-picker-heading">你的节点都已经在这个项目里了</div>}
+              {candidates.map(n => (
+                <button type="button" key={n.id} className="path-picker-item" disabled={busy === n.id} onClick={() => join(n)}>
+                  <i className={`dot ${n.status === 'online' ? 'online' : ''}`} /> {n.name || n.id}
+                  <span className="muted">{busy === n.id ? '加入中…' : '加入'}</span>
+                </button>
+              ))}
+            </>
+          )}
+          <button type="button" className="path-picker-item" onClick={() => openModal('add')}>＋ 安装一台新机器…</button>
+          <button type="button" className="path-picker-item" onClick={() => openModal('manage')}>⚙ 节点管理…</button>
+          {err && <div className="err path-picker-heading">{err}</div>}
+        </div>
+      )}
+      {modal === 'add' && <AddNodeModal onClose={() => setModal(null)} />}
+      {modal === 'manage' && createPortal(<NodeManageModal user={{ id: userId }} onClose={() => setModal(null)} />, document.body)}
+    </div>
+  );
+}
 
 function deriveTitle(text) {
   const line = text.split('\n')[0].trim();
@@ -156,7 +219,7 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
     // often the screenshot alone), so it's enough on its own to create.
     if (!t && !images.length && !resumeSessionId) return;
     if (attachmentError) return;
-    if (!selectedNode) { setErr('还没有可用节点,请先在左侧「+ 添加节点」'); return; }
+    if (!selectedNode) { setErr('还没有可用节点:点上面的「＋ 节点」加入或安装一台'); return; }
     setBusy(true); setErr('');
     // Resuming with nothing typed uses the session's own first-message
     // preview as the title (a real name, same as any other conversation
@@ -222,7 +285,11 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
                   <i className={`dot ${n.status === 'online' ? 'online' : ''}`} /> {n.name || n.id}
                 </button>
               ))}
-              {!nodes.length && <span className="muted">还没有节点,请先在左侧「+ 添加节点」</span>}
+              {!nodes.length && (
+                <span className="muted">
+                  {state.activeTeamId ? '这个项目还没有节点:把你已有的节点加进来,或者安装一台新机器 →' : '还没有节点,先安装一台机器 →'}
+                </span>
+              )}
             </div>
           ) : (
             <div className="chip-with-picker">
@@ -241,6 +308,7 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
               )}
             </div>
           )}
+          <DraftNodeTools userId={userId} startOpen={!nodes.length} onJoined={pickNode} />
 
           {/* ---- path picker: recent/default + autocomplete custom path ---- */}
           <div className="chip-with-picker">
@@ -385,7 +453,6 @@ export function DraftPane({ onCreated, onClose, maximized, onToggleMaximize, onO
           onOpened={onCreated}
           autoOpen={!recents.length && !topRepo}
         />
-        {!selectedNode && <div className="err">还没有可用节点,请先在左侧「+ 添加节点」</div>}
         {err && <div className="err">{err}</div>}
         <div className="draft-empty muted">开始输入,发送第一条消息即可创建对话;或在上面「继续…已有的对话」里接着之前的聊</div>
       </div>

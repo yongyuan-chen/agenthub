@@ -20,7 +20,14 @@ export function ConnectPage({ code }) {
     api.nodeAuthStatus(code)
       .then(r => { if (r.ok) setInfo(r); else setLoadErr(r.error || '找不到这个连接请求'); })
       .catch(e => setLoadErr(e.message));
-    api.myTeams().then(r => setTeams(r.teams || [])).catch(() => {});
+    api.myTeams().then(r => {
+      const list = r.teams || [];
+      setTeams(list);
+      // Default to the project this browser was last looking at: someone who
+      // hit 「安装一台新机器」 from a project's new-chat pane means that project.
+      const active = localStorage.getItem('agenthub_active_team');
+      if (active && list.some(t => t.id === active)) setTeamId(active);
+    }).catch(() => {});
   }, [code]);
 
   const connect = async () => {

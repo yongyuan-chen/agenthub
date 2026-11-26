@@ -584,6 +584,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--brand); }
 .auth-badge { font-weight: 600; cursor: help; align-self: center; }
 .auth-native { color: var(--green); border-color: rgba(63, 138, 82, .35); background: rgba(63, 138, 82, .1); }
 .auth-api { color: var(--purple); border-color: rgba(109, 90, 168, .35); background: rgba(109, 90, 168, .1); }
+/* New-chat pane's 「＋ 节点」 menu — draftpane.jsx's DraftNodeTools. */
+.draft-node-tools { min-width: 240px; }
+.path-picker-heading { font-size: 12px; padding: 6px 10px 2px; }
 .model-chip.clickable { cursor: pointer; }
 .model-chip.clickable:hover { border-color: rgba(var(--brand-rgb), .5); color: var(--brand-deep); }
 .model-picker {
