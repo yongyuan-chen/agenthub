@@ -248,7 +248,6 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
   const jumpedScopesRef = useRef(new Set());
   useEffect(() => {
     if (openPanes.length || !state.loaded || !layoutLoaded) return;
-    if ((scope in panesByScope) || jumpedScopesRef.current.has(scope)) return;
     // Only block on a taskId that the effect above *just* claimed for this
     // exact scope (see claimedRef) — not merely "a taskId happens to be in
     // the URL." Switching scope never touches the URL, so right after a
@@ -260,8 +259,19 @@ export function AppShell({ taskId, user, pushState, onEnablePush, onOpenSettings
     // scope's task by then, making a naive "is it resolved yet" check
     // permanently ambiguous instead of just "not ours."
     if (taskId && claimedRef.current.taskId === taskId && claimedRef.current.scope === scope) return;
+    // A scope with no conversations at all (typically a project that was just
+    // made, or one nobody has used yet): the only thing to do there is start
+    // one, so open a new chat instead of a placeholder telling you to click
+    //「+ 新对话」. Once per scope per page load — closing it leaves the
+    // scope empty rather than popping it straight back.
+    if (!tasks.some(t => !t.archived_at)) {
+      if (jumpedScopesRef.current.has(scope)) return;
+      jumpedScopesRef.current.add(scope);
+      addPane(newDraftId());
+      return;
+    }
+    if ((scope in panesByScope) || jumpedScopesRef.current.has(scope)) return;
     const visible = tasks.filter(t => !t.archived_at);
-    if (!visible.length) return; // nothing here yet — leave the "还没有对话" placeholder as-is
     jumpedScopesRef.current.add(scope);
     const latest = [...visible].sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0))[0];
     location.hash = `#/task/${latest.id}`;

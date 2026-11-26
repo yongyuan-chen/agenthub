@@ -3278,6 +3278,13 @@ export async function api(ctx, method, pathname, body) {
   if (method === 'POST' && route[0] === 'teams' && route.length === 1) {
     const name = String(body?.name || '').trim();
     if (!name) return err(400, 'name required');
+    // Two tabs with the same name in your project strip are indistinguishable
+    // — found live: two "ba" projects created 7s apart, the second because the
+    // first one gave no sign of having worked.
+    const clash = await q(ctx.db,
+      `SELECT 1 FROM teams JOIN team_members m ON m.team_id = teams.id
+       WHERE m.user_id = ? AND lower(teams.name) = lower(?) LIMIT 1`, userId, name).first();
+    if (clash) return err(409, `你已经有一个叫「${name}」的项目了,换个名字吧`);
     const kind = requestedKind(body?.kind);
     const id = ulid(ctx.now());
     await q(ctx.db, 'INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)', id, name, ctx.now()).run();
